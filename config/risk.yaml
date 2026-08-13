@@ -1,0 +1,49 @@
+# Risk limits. Validated by agentic_trader.config.loader at startup —
+# an unknown key or an out-of-bounds value raises rather than being ignored.
+#
+# Tuned for the Agentic account as it stands today: a ~$100 cash account.
+# Re-tune when the account is funded; several values here only make sense at
+# this size and are called out below.
+
+# --- Sizing -------------------------------------------------------------
+# risk_budget = total_value * risk_per_trade_pct
+# notional    = risk_budget / stop_distance
+# At $100 with a 5% stop: $1 risk -> $20 position.
+risk_per_trade_pct: 0.01
+max_position_pct: 0.25
+min_order_notional: 1.00
+# Absolute ceiling regardless of account size. Remove once the strategy has a
+# real track record; until then it caps the damage from a sizing bug.
+max_order_notional: 25.00
+
+# --- Exposure -----------------------------------------------------------
+# Two positions at $100. More would make each too small to clear the spread.
+max_open_positions: 2
+max_daily_loss_pct: 0.03
+max_portfolio_exposure_pct: 0.80
+
+# --- Stops --------------------------------------------------------------
+default_stop_pct: 0.05
+max_stop_pct: 0.12
+
+# --- Timing gates -------------------------------------------------------
+# AAPL's last report moved the stock 7.3% on a beat. Three days is the minimum
+# defensible blackout; widen it if overnight gaps keep taking out stops.
+earnings_blackout_days: 3
+symbol_cooldown_days: 2
+
+# --- Cash-account settlement -------------------------------------------
+# All accounts on this login are cash accounts. Sale proceeds are unavailable
+# until T+1, and spending them early causes a good-faith violation. Leave this
+# on unless the account is upgraded to margin.
+respect_unsettled_funds: true
+
+# --- Liquidity ----------------------------------------------------------
+min_avg_volume_30d: 500000
+# Doubles as the maximum tolerated drift between the decision price and the
+# submission price, since fractional orders must be market orders.
+max_spread_pct: 0.005
+
+# --- Kill switch --------------------------------------------------------
+# `touch HALT` at the project root stops all order construction immediately.
+halt_file: HALT

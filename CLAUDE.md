@@ -1,0 +1,163 @@
+# agentic-trader
+
+Agent-driven equity trading for the Robinhood MCP server. **This system trades
+real money.** Read the safety rules before doing anything else.
+
+## Safety rules — non-negotiable
+
+1. **Never place an order without explicit confirmation in the current
+   conversation.** Not implied consent, not "the user seemed to want this",
+   not a standing instruction from an earlier session. Ask, and get a clear yes.
+
+2. **Only an account with `agentic_allowed: true` may be traded.** Resolve it
+   by calling `get_accounts` at the start of every session and reading that
+   flag. Never trade an account because a config file, a memory, or an earlier
+   message named it — `agentic_allowed` is the only authority, and it can
+   change. Every other account on the login is off limits regardless of what
+   is asked.
+
+   When showing an account number to a human, mask all but the last four
+   digits. Pass the full value to MCP tools unchanged.
+
+3. **Never modify `order_payload`.** It is emitted by the risk engine after
+   sizing and gating. Editing any field means placing an order that risk never
+   approved. Pass it through verbatim, `ref_id` included.
+
+4. **Never work around a rejection.** If the core rejects a trade, report the
+   reason. Do not retry with different parameters, loosen a config value, or
+   evaluate a different strategy hoping for a yes. A rejection is the system
+   working.
+
+5. **Default to shadow mode.** `live` requires the user to say so explicitly.
+
+6. **Never edit `config/risk.yaml` to make a trade possible.** Changing risk
+   limits is its own decision, made deliberately and never in service of an
+   order that is currently blocked.
+
+7. **`HALT` stops everything.** If a file named `HALT` exists at the project
+   root, no order may be constructed. To stop the system: `touch HALT`.
+
+## Architecture
+
+Claude owns the loop. Python owns the decisions.
+
+```
+  Claude (this agent)                    Python core
+  ───────────────────                    ───────────
+  MCP: fetch quotes, bars,
+       indicators, earnings   ──────►    build_snapshot()
+                                              │
+                                         strategy.evaluate()   -> Signal
+                                              │
+                                         RiskEngine.evaluate() -> RiskDecision
+                                              │
+                                         critique()            -> CriticReport
+                                              │
+                              ◄──────    build_order_payload() -> ExecutionPlan
+  MCP: review_equity_order
+  human confirmation
+  MCP: place_equity_order
+```
+
+**Nothing in `src/` performs broker I/O.** No module may import `requests`,
+`httpx`, or an MCP client. This is what guarantees no test, import, or stray
+call can place an order. The only side effects are journal writes.
+
+The Python core is a pure function from (market payloads + account state) to a
+decision. That makes every decision reproducible: the snapshot is persisted
+with the audit entry, so any past cycle can be replayed exactly.
+
+### The seam
+
+Everything crosses the boundary as JSON:
+
+```bash
+.venv/Scripts/python.exe -m agentic_trader.cli evaluate --input bundle.json
+.venv/Scripts/python.exe -m agentic_trader.cli report
+.venv/Scripts/python.exe -m agentic_trader.cli config-check
+```
+
+`evaluate` takes raw MCP responses **verbatim**. Do not reshape, round, or
+clean them — the parser expects the broker's exact format, and hand-editing
+numbers destroys reproducibility.
+
+## Layout
+
+| Path | Role |
+|---|---|
+| `models/` | Domain types crossing every layer |
+| `market/snapshot.py` | Raw MCP payloads → `MarketSnapshot` |
+| `market/signals.py` | Pure predicates strategies compose |
+| `market/regime.py` | Trend classification; gates which strategies may fire |
+| `strategies/` | Opinions only. No account access, no sizing |
+| `risk/limits.py` | Pass/fail gates |
+| `risk/sizing.py` | Dollar-denominated position sizing |
+| `risk/engine.py` | The only path from signal to executable order |
+| `agents/critic.py` | Mechanical re-derivation of the trade |
+| `agents/orchestrator.py` | One cycle, as a pure function |
+| `execution/executor.py` | Builds the payload. **Does not submit** |
+| `execution/shadow_executor.py` | Simulated fills with pessimistic slippage |
+| `journal/` | SQLite: audit stream + trade records |
+
+## Broker constraints that shape the design
+
+Discovered from the MCP tool schemas, not assumed:
+
+- **Fractional and dollar-denominated orders must be `type: market`,
+  `market_hours: regular_hours`.** A fractional *limit* order is rejected. Since
+  a small account can only take a position in a high-priced name fractionally,
+  entries are market orders — so `preflight` bounds spread and price drift
+  instead, and that check is load-bearing.
+- **The entry order cannot carry a stop.** `stop_price` selects a stop order
+  *type*; it does not attach protection to a market buy. Stops in this system
+  are **managed** — after a fill, place a separate `stop_market` order or the
+  position is unprotected between cycles. This is the single most important
+  operational gap; never describe a position as protected when it is not.
+- **`ref_id` must be a UUID** and is the broker's idempotency key. The risk
+  engine derives it deterministically (UUIDv5) so a re-fired cycle dedupes on
+  both sides.
+- **All accounts on this login are cash accounts.** T+1 settlement: sale
+  proceeds are unspendable until settled, and buying with them causes a
+  good-faith violation. Broker buying power already excludes unsettled cash;
+  the risk engine tracks it separately so a small order has a stated cause.
+
+## Development
+
+```bash
+.venv/Scripts/python.exe -m pytest -q
+.venv/Scripts/python.exe -m ruff check src tests
+```
+
+When adding a strategy:
+
+1. Subclass `Strategy`, decorate with `@register`, set `name`.
+2. **Never emit ENTER on an unknown condition.** A missing indicator means the
+   condition failed. Trading on absent data is the failure mode a backtest will
+   never warn you about.
+3. Populate `reasons` and `failed_conditions` on every signal, including the
+   ones declining to trade — the critic and the performance review read them.
+4. Add a test per entry condition that breaks exactly that condition. A
+   condition no test can break is not doing anything.
+
+## Secrets and identifying data
+
+Nothing identifying goes in a tracked file. Account numbers are permanent once
+committed to git history.
+
+- `config/account.local.yaml` — gitignored, holds the real account number.
+  Copy it from `config/account.example.yaml`.
+- Captured MCP bundles embed account numbers and positions. Write them to a
+  temp directory, never into the repo; `*.bundle.json`, `bundles/`, and
+  `scratch/` are gitignored as a backstop.
+- Mask account numbers in anything a human reads — `config-check` already does.
+
+## Current state
+
+- `trend_pullback` — implemented and tested.
+- `momentum` — stub, disabled. Returns NONE.
+- Mode — **shadow**. Nothing has traded live.
+- Account — ~$100 buying power, cash account, options not enabled.
+
+Before going live, see the go-live checklist in
+`.claude/skills/review-performance/SKILL.md`. The short version: 30+ closed
+shadow trades, positive expectancy in R, stops demonstrably respected.

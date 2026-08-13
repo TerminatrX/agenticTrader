@@ -1,0 +1,19 @@
+# Normalize line endings. Without this, a repo authored on Windows and touched
+# on any other machine produces whole-file diffs that hide the real change.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary — never munge, never diff.
+*.db     binary
+*.sqlite binary
+*.png    binary
+*.jpg    binary
+*.ico    binary
+
+# Keep generated/vendored files out of diff noise and language stats.
+*.lock    -diff
+data/**   linguist-generated

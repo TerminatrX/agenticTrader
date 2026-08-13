@@ -1,0 +1,44 @@
+# Strategy registry. `params` override the DEFAULTS dict on each strategy class.
+# A strategy absent from this file is disabled regardless of registration.
+
+strategies:
+  trend_pullback:
+    enabled: true
+    universe:
+      # Large, liquid names where a market order is unlikely to be punished —
+      # which matters because fractional orders cannot be limit orders.
+      - AAPL
+      - MSFT
+      - NVDA
+      - GOOGL
+      - AMZN
+    params:
+      # RSI band defining "pulled back but not capitulating". The floor exists
+      # to avoid buying genuine breakdowns; below 30 the trend premise usually
+      # is not intact regardless of what the moving averages still say.
+      rsi_floor: 30.0
+      rsi_ceiling: 45.0
+
+      # Reject pullbacks deeper than this below the 20-day. Past roughly 12%
+      # the move stops being a pullback and starts being a trend change.
+      max_pullback_pct: 0.12
+
+      # Initial stop. The strategy tightens this toward the 50-day when that
+      # sits closer, since the average is where the thesis actually fails.
+      stop_pct: 0.05
+
+      # Target as a multiple of initial risk.
+      target_r_multiple: 2.0
+
+      # Exit when momentum reaches this RSI.
+      exit_rsi: 72.0
+
+      # Entries below this confidence downgrade to WATCH instead of ENTER.
+      min_confidence: 0.5
+
+  momentum:
+    # Stub — see src/agentic_trader/strategies/momentum.py. Keep disabled until
+    # implemented; the stub returns NONE and would only add noise.
+    enabled: false
+    universe: []
+    params: {}

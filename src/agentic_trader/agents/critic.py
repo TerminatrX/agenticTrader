@@ -1,0 +1,219 @@
+"""Adversarial review of a proposed trade — the deterministic half.
+
+The critique is split across two layers on purpose. This module holds the
+checks that are mechanical and therefore worth making unskippable: arithmetic
+that must reconcile, data that must be fresh, patterns that are objectively
+present in the journal. The `critique-trade` skill holds the judgement calls
+that genuinely need a model — is this thesis actually supported, does the
+reasoning contain a rationalization, is there context the data does not show.
+
+Putting the mechanical checks here means the agent cannot talk itself past
+them, which is the entire point of having a critic. An LLM asked to review its
+own trade will agree with itself far more often than it should; a function that
+recomputes the risk and finds a mismatch will not.
+
+Findings are severity-tagged. BLOCK is fatal. CONCERN is surfaced for a human
+and, in a fully autonomous run, should also block — nothing here fires on
+weak evidence.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from decimal import Decimal
+from enum import StrEnum
+
+from agentic_trader.config import RiskConfig
+from agentic_trader.market.regime import Regime, classify_regime
+from agentic_trader.models import (
+    AccountState,
+    MarketSnapshot,
+    RiskDecision,
+    Side,
+    Signal,
+)
+
+
+class CriticVerdict(StrEnum):
+    PASS = "pass"
+    CONCERN = "concern"
+    BLOCK = "block"
+
+
+@dataclass
+class CriticReport:
+    verdict: CriticVerdict = CriticVerdict.PASS
+    blocks: list[str] = field(default_factory=list)
+    concerns: list[str] = field(default_factory=list)
+    observations: list[str] = field(default_factory=list)
+
+    def block(self, reason: str) -> None:
+        self.verdict = CriticVerdict.BLOCK
+        self.blocks.append(reason)
+
+    def concern(self, reason: str) -> None:
+        if self.verdict is not CriticVerdict.BLOCK:
+            self.verdict = CriticVerdict.CONCERN
+        self.concerns.append(reason)
+
+    def observe(self, note: str) -> None:
+        self.observations.append(note)
+
+    @property
+    def approved(self) -> bool:
+        return self.verdict is not CriticVerdict.BLOCK
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "verdict": self.verdict.value,
+            "blocks": self.blocks,
+            "concerns": self.concerns,
+            "observations": self.observations,
+        }
+
+
+def critique(
+    decision: RiskDecision,
+    signal: Signal,
+    snapshot: MarketSnapshot,
+    account: AccountState,
+    config: RiskConfig,
+    *,
+    recent_symbol_trades: int = 0,
+    now: datetime | None = None,
+) -> CriticReport:
+    """Re-derive the trade independently and report anything that fails to reconcile."""
+    report = CriticReport()
+
+    if not decision.is_executable or decision.intent is None:
+        report.observe(f"nothing to critique: decision is {decision.decision.value}")
+        return report
+
+    intent = decision.intent
+    current = now or datetime.now(UTC)
+
+    # --- Internal consistency --------------------------------------------
+    # A mismatch here means two layers disagree about what is being ordered,
+    # which is a bug, not a judgement call.
+
+    if intent.symbol != signal.symbol:
+        report.block(f"intent symbol {intent.symbol} does not match signal {signal.symbol}")
+
+    if signal.side is not None and intent.side is not signal.side:
+        report.block(
+            f"intent side {intent.side.value} contradicts signal side {signal.side.value}"
+        )
+
+    if (
+        intent.side is Side.BUY
+        and intent.stop_price is not None
+        and intent.stop_price >= intent.reference_price
+    ):
+        report.block(
+            f"stop {intent.stop_price} is at or above entry {intent.reference_price} "
+            "— this position cannot lose money in the intended direction"
+        )
+
+    # --- Risk arithmetic, recomputed from scratch -------------------------
+
+    if intent.side is Side.BUY and intent.stop_price is not None:
+        implied_risk = intent.notional * (
+            (intent.reference_price - intent.stop_price) / intent.reference_price
+        )
+        budget = account.total_value * config.risk_per_trade_pct
+        # A small tolerance absorbs rounding to cents; anything beyond it means
+        # the sizing math and the config disagree.
+        if implied_risk > budget * Decimal("1.05"):
+            report.block(
+                f"position risks {implied_risk:.2f} against a budget of {budget:.2f} "
+                f"({config.risk_per_trade_pct:.1%} of {account.total_value:.2f})"
+            )
+        else:
+            report.observe(f"risk check: {implied_risk:.2f} against {budget:.2f} budget")
+
+    if intent.notional > account.buying_power:
+        report.block(
+            f"notional {intent.notional:.2f} exceeds buying power {account.buying_power:.2f}"
+        )
+
+    concentration = intent.notional / account.total_value if account.total_value else Decimal("0")
+    if concentration > config.max_position_pct:
+        report.block(
+            f"position is {concentration:.1%} of the account, above the "
+            f"{config.max_position_pct:.1%} ceiling"
+        )
+    elif concentration > config.max_position_pct * Decimal("0.9"):
+        report.concern(f"position is {concentration:.1%} of the account — near the ceiling")
+
+    # --- Data quality -----------------------------------------------------
+
+    age_seconds = (current - snapshot.captured_at).total_seconds()
+    if age_seconds > 900:
+        report.block(f"snapshot is {age_seconds / 60:.0f} minutes old — refuse to trade on it")
+    elif age_seconds > 300:
+        report.concern(f"snapshot is {age_seconds / 60:.0f} minutes old")
+
+    if snapshot.indicators.as_of is not None:
+        indicator_age = (current.date() - snapshot.indicators.as_of.date()).days
+        if indicator_age > 4:
+            report.concern(
+                f"indicators computed through {snapshot.indicators.as_of.date()} "
+                f"({indicator_age}d ago) — stale relative to the live price"
+            )
+
+    missing = [
+        name
+        for name, value in (
+            ("RSI", snapshot.indicators.rsi_14),
+            ("MACD", snapshot.indicators.macd_hist),
+            ("SMA20", snapshot.indicators.sma_20),
+            ("SMA50", snapshot.indicators.sma_50),
+            ("SMA200", snapshot.indicators.sma_200),
+        )
+        if value is None
+    ]
+    if missing:
+        report.block(f"missing indicators the strategy claims to use: {', '.join(missing)}")
+
+    # --- Thesis coherence -------------------------------------------------
+
+    regime = classify_regime(snapshot)
+    if intent.side is Side.BUY and not regime.allows_long_entry:
+        report.block(f"long entry in a {regime.value} regime contradicts the strategy premise")
+    elif regime is Regime.UNKNOWN:
+        report.concern("regime could not be classified — trading without trend context")
+
+    if intent.side is Side.BUY and signal.confidence < 0.5:
+        report.concern(f"confidence {signal.confidence:.2f} is weak for a new position")
+
+    if not signal.reasons:
+        report.block("signal carries no stated reasons — an unexplainable trade is not reviewable")
+
+    # --- Behavioural patterns ---------------------------------------------
+
+    if recent_symbol_trades >= 3:
+        report.concern(
+            f"{recent_symbol_trades} recent trades in {intent.symbol} — "
+            "check for revenge trading or an over-fitted setup"
+        )
+
+    if snapshot.earnings is not None:
+        days_out = snapshot.earnings.days_until(current.date())
+        if 0 <= days_out <= 10:
+            note = (
+                f"earnings in {days_out}d ({snapshot.earnings.report_date}, "
+                f"{'confirmed' if snapshot.earnings.verified else 'tentative'})"
+            )
+            report.concern(f"{note} — plan the exit before the report")
+
+    gap = snapshot.previous_close
+    if gap is not None and gap > 0:
+        move = abs(snapshot.last_price - gap) / gap
+        if move > Decimal("0.05"):
+            report.concern(
+                f"price moved {move:.1%} from the prior close — "
+                "indicators computed before this move may no longer describe the setup"
+            )
+
+    return report

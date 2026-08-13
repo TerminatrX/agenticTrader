@@ -1,0 +1,225 @@
+"""Turn an approved `RiskDecision` into an exact broker payload — and stop there.
+
+This module builds the argument dict for the `place_equity_order` MCP tool and
+returns it. It does not submit. Submission is the agent's job, because the MCP
+tools are exposed to the agent rather than to this process, and keeping the
+only irreversible action outside the library means no unit test, import, or
+stray function call can ever put money at risk.
+
+Three broker constraints drive the payload shape, all of them discovered from
+the tool schema rather than assumed:
+
+1. **Dollar-denominated and fractional orders must be market orders**, in
+   regular hours only. A fractional *limit* order is rejected outright. Since a
+   small account can only take a position in a high-priced name fractionally,
+   the default entry is a market order — which means no price protection, so
+   `preflight` checks the spread and quote freshness instead. That check is
+   load-bearing, not decorative.
+
+2. **`ref_id` must be a UUID** and is the broker's own idempotency key. We pass
+   the deterministic key from the risk engine, so a retry deduplicates on both
+   sides.
+
+3. **The entry order cannot carry its own stop.** `stop_price` on this endpoint
+   selects a stop *order type*; it does not attach a protective stop to a
+   market buy. The stop in a `TradeIntent` is therefore a managed level: after
+   a fill, the system must either place a separate stop order or enforce the
+   level on subsequent cycles. Treating it as broker-native is the mistake this
+   docstring exists to prevent.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any, Literal
+
+from agentic_trader.models import MarketSnapshot, RiskDecision, Side, TradeIntent
+
+MAX_FRACTIONAL_DP = Decimal("0.000001")  # Broker allows 6 decimal places.
+
+
+class PreflightError(RuntimeError):
+    """Raised when a decision must not become an order."""
+
+
+OrderPayload = dict[str, Any]
+
+
+@dataclass
+class ExecutionPlan:
+    """A ready-to-submit order plus everything a human needs to approve it."""
+
+    payload: OrderPayload
+    intent: TradeIntent
+    mode: Literal["live", "shadow"]
+    estimated_cost: Decimal
+    managed_stop: Decimal | None = None
+    managed_target: Decimal | None = None
+    warnings: list[str] = field(default_factory=list)
+    preflight_notes: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        verb = self.intent.side.value.upper()
+        return (
+            f"{verb} {self.intent.symbol} ${self.intent.notional:.2f} "
+            f"(~{self.intent.estimated_quantity:.6f} sh @ ~{self.intent.reference_price:.2f}) "
+            f"[{self.mode}]"
+        )
+
+
+def preflight(
+    decision: RiskDecision,
+    snapshot: MarketSnapshot,
+    *,
+    max_spread_pct: Decimal,
+    max_quote_age_seconds: int = 120,
+    now: datetime | None = None,
+    known_client_keys: set[str] | None = None,
+) -> list[str]:
+    """Last line of defence before an order exists. Raises rather than warns.
+
+    Everything checked here is specific to the moment of submission — staleness,
+    spread, duplicate keys — which is exactly what the risk engine, evaluated
+    earlier in the cycle, cannot know.
+    """
+    if not decision.is_executable or decision.intent is None:
+        raise PreflightError(
+            f"decision is {decision.decision.value}; there is nothing to execute"
+        )
+
+    intent = decision.intent
+    notes: list[str] = []
+
+    if known_client_keys and intent.client_key in known_client_keys:
+        raise PreflightError(
+            f"client_key {intent.client_key} was already submitted — refusing to "
+            "place a duplicate order"
+        )
+
+    if not snapshot.tradable:
+        raise PreflightError(f"symbol not tradable: {snapshot.staleness_note}")
+
+    current = now or datetime.now(UTC)
+    age = (current - snapshot.captured_at).total_seconds()
+    if age > max_quote_age_seconds:
+        raise PreflightError(
+            f"snapshot is {age:.0f}s old (limit {max_quote_age_seconds}s) — "
+            "re-fetch the quote before submitting a market order"
+        )
+    notes.append(f"snapshot age {age:.0f}s")
+
+    # A market order with a wide spread is how a small account donates money.
+    drift = abs(snapshot.last_price - intent.reference_price) / intent.reference_price
+    if drift > max_spread_pct:
+        raise PreflightError(
+            f"price moved {drift:.2%} from the decision reference "
+            f"({intent.reference_price:.2f} -> {snapshot.last_price:.2f}), "
+            f"exceeding {max_spread_pct:.2%} — re-evaluate rather than chase"
+        )
+    notes.append(f"price drift {drift:.2%} within tolerance")
+
+    return notes
+
+
+def build_order_payload(
+    decision: RiskDecision,
+    snapshot: MarketSnapshot,
+    account_number: str,
+    *,
+    max_spread_pct: Decimal = Decimal("0.005"),
+    mode: Literal["live", "shadow"] = "shadow",
+    use_dollar_amount: bool = True,
+    known_client_keys: set[str] | None = None,
+    now: datetime | None = None,
+) -> ExecutionPlan:
+    """Build the `place_equity_order` arguments for an approved decision.
+
+    `use_dollar_amount=True` sends a notional and lets the broker compute
+    shares. That is the right default for entries. For exits it is wrong — the
+    goal there is to close a known share count exactly, so the quantity form is
+    used regardless.
+    """
+    notes = preflight(
+        decision,
+        snapshot,
+        max_spread_pct=max_spread_pct,
+        known_client_keys=known_client_keys,
+        now=now,
+    )
+    intent = decision.intent
+    assert intent is not None  # preflight guarantees this
+
+    payload: OrderPayload = {
+        "account_number": account_number,
+        "symbol": intent.symbol,
+        "side": intent.side.value,
+        # Fractional and dollar-denominated orders are market-only, regular
+        # hours only. Both are enforced by the broker; setting them explicitly
+        # keeps the rejection reason obvious if that ever changes.
+        "type": "market",
+        "market_hours": "regular_hours",
+        "time_in_force": "gfd",
+        "ref_id": intent.client_key,
+    }
+
+    if intent.side is Side.SELL or not use_dollar_amount:
+        quantity = intent.estimated_quantity.quantize(MAX_FRACTIONAL_DP)
+        payload["quantity"] = f"{quantity:f}"
+    else:
+        payload["dollar_amount"] = f"{intent.notional:.2f}"
+
+    warnings = list(decision.warnings)
+    warnings.append(
+        "market order: no price protection. Preflight bounded the drift, but the "
+        "fill may still differ from the reference price."
+    )
+    if intent.stop_price is not None:
+        warnings.append(
+            f"stop {intent.stop_price:.2f} is MANAGED, not broker-native — this order "
+            "does not carry it. Place a separate stop order after the fill, or the "
+            "position is unprotected between cycles."
+        )
+
+    return ExecutionPlan(
+        payload=payload,
+        intent=intent,
+        mode=mode,
+        estimated_cost=intent.notional,
+        managed_stop=intent.stop_price,
+        managed_target=intent.target_price,
+        warnings=warnings,
+        preflight_notes=notes,
+    )
+
+
+def build_review_payload(plan: ExecutionPlan) -> OrderPayload:
+    """Arguments for `review_equity_order`, which mirrors place minus `ref_id`.
+
+    Reviewing before placing is the default workflow the broker expects, and it
+    surfaces cost and alerts the agent should show a human before committing.
+    """
+    return {k: v for k, v in plan.payload.items() if k != "ref_id"}
+
+
+def describe_plan(plan: ExecutionPlan) -> str:
+    """Human-readable block for the approval prompt."""
+    lines = [
+        plan.summary(),
+        f"  strategy   : {plan.intent.strategy}",
+        f"  confidence : {plan.intent.confidence:.2f}",
+        f"  notional   : ${plan.estimated_cost:.2f}",
+    ]
+    if plan.managed_stop is not None:
+        risk = plan.estimated_cost * (
+            (plan.intent.reference_price - plan.managed_stop) / plan.intent.reference_price
+        )
+        lines.append(f"  stop       : {plan.managed_stop:.2f} (managed, risking ~${risk:.2f})")
+    if plan.managed_target is not None:
+        lines.append(f"  target     : {plan.managed_target:.2f}")
+    for reason in plan.intent.rationale:
+        lines.append(f"  + {reason}")
+    for warning in plan.warnings:
+        lines.append(f"  ! {warning}")
+    return "\n".join(lines)

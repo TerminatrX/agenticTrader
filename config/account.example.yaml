@@ -1,0 +1,26 @@
+# Broker account identity — TEMPLATE.
+#
+# Copy this to `account.local.yaml` and fill in your real values:
+#
+#     cp config/account.example.yaml config/account.local.yaml
+#
+# `account.local.yaml` is gitignored and must stay that way. Account numbers
+# are identifying information; once committed they are permanent in git
+# history, so they live in a local file that never leaves your machine.
+#
+# This file is optional. The system works without it — the orchestrating agent
+# resolves the account at runtime via the `get_accounts` MCP tool, which is the
+# authoritative source. Setting it here only saves a lookup and records intent.
+
+# The account to trade. Must be one with `agentic_allowed: true`; anything else
+# is rejected by the broker.
+account_number: "REPLACE_ME"
+
+# Cash accounts settle T+1: sale proceeds are unspendable until settled, and
+# spending them early causes a good-faith violation. Leave true unless the
+# account has margin.
+is_cash_account: true
+
+# Optional label, for logs and prompts only. Never used to select an account —
+# eligibility comes from `agentic_allowed`, never from a nickname.
+nickname: null
