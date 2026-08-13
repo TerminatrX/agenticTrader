@@ -262,6 +262,13 @@ def build_snapshot(
         extras["market_cap"] = _dec(fundamental_entry.get("market_cap"), "market_cap")
         extras["high_52w"] = _dec(fundamental_entry.get("high_52_weeks"), "high_52_weeks")
         extras["low_52w"] = _dec(fundamental_entry.get("low_52_weeks"), "low_52_weeks")
+        # Free-text from the broker (e.g. "Electronic Technology"). Used only
+        # for grouping, so its exact taxonomy does not matter — only that the
+        # same name maps to the same bucket consistently.
+        sector = fundamental_entry.get("sector")
+        extras["sector"] = str(sector).strip() if sector else None
+        industry = fundamental_entry.get("industry")
+        extras["industry"] = str(industry).strip() if industry else None
 
     return MarketSnapshot(
         symbol=symbol,

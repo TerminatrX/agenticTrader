@@ -48,6 +48,14 @@ class AuditEntry(BaseModel):
     confidence: float = 0.0
     signal_strength: str | None = None
 
+    # The critic's effect on sizing, recorded as a pair so the gap is
+    # measurable. Equal values mean the critic did not move the position.
+    original_confidence: float | None = None
+    adjusted_confidence: float | None = None
+
+    thesis: str | None = None
+    invalidation_reason: str | None = None
+
     reasons: list[str] = Field(default_factory=list)
     failed_conditions: list[str] = Field(default_factory=list)
     risk_breaches: list[str] = Field(default_factory=list)
@@ -80,6 +88,12 @@ class TradeRecord(BaseModel):
     target_price: Decimal | None = None
     entry_rationale: list[str] = Field(default_factory=list)
 
+    # What the trade believed, and what would prove it wrong. Recorded at entry
+    # so a post-mortem reads the reasoning as it stood, not as it is remembered.
+    thesis: str | None = None
+    invalidation_reason: str | None = None
+    sector: str | None = None
+
     closed_at: datetime | None = None
     exit_price: Decimal | None = None
     exit_reason: str | None = None
@@ -104,6 +118,16 @@ class TradeRecord(BaseModel):
         if risk_per_share <= 0:
             return None
         return ((self.exit_price - self.entry_price) / risk_per_share).quantize(Decimal("0.01"))
+
+    @property
+    def planned_risk_reward(self) -> Decimal | None:
+        """Reward-to-risk as planned at entry, for comparison against realized R."""
+        if self.stop_price is None or self.target_price is None:
+            return None
+        risk = self.entry_price - self.stop_price
+        if risk <= 0:
+            return None
+        return ((self.target_price - self.entry_price) / risk).quantize(Decimal("0.01"))
 
     @property
     def holding_days(self) -> int | None:

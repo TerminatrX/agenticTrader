@@ -28,7 +28,7 @@ from agentic_trader.models import (
     Signal,
     TradeIntent,
 )
-from agentic_trader.risk.limits import check_limits
+from agentic_trader.risk.limits import LimitCheck, check_limits
 from agentic_trader.risk.sizing import exit_notional, size_position
 
 # Stable namespace for deterministic order keys. Never change this value:
@@ -104,22 +104,69 @@ class RiskEngine:
                 breached_limits=gates.breaches,
                 warnings=gates.warnings,
                 notes=gates.notes,
+                trip_kill_switch=gates.trip_kill_switch,
             )
 
         if signal.side is Side.SELL:
             return self._build_exit(signal, account, gates, today)
-        return self._build_entry(signal, account, gates, today)
+        return self._build_entry(
+            signal, account, gates, today, sector=snapshot.sector, confidence_override=None
+        )
+
+    def resize(
+        self,
+        decision: RiskDecision,
+        signal: Signal,
+        snapshot: MarketSnapshot,
+        account: AccountState,
+        adjusted_confidence: float,
+        *,
+        as_of: date | None = None,
+    ) -> RiskDecision:
+        """Re-size an already-approved entry at a lower confidence.
+
+        Used once per cycle after critic review. The gates are not re-run: they
+        already passed, and a smaller order cannot breach a limit a larger one
+        satisfied. The caller must guarantee `adjusted_confidence` is not above
+        the original — this method does not police that, and
+        `agents.orchestrator` asserts the resulting notional did not grow.
+        """
+        if decision.intent is None or decision.intent.side is not Side.BUY:
+            return decision
+
+        gates = LimitCheck(
+            warnings=list(decision.warnings),
+            notes=list(decision.notes),
+            trip_kill_switch=decision.trip_kill_switch,
+        )
+        return self._build_entry(
+            signal,
+            account,
+            gates,
+            as_of or datetime.now(UTC).date(),
+            sector=snapshot.sector,
+            confidence_override=adjusted_confidence,
+        )
 
     # ---------------------------------------------------------------- entries
 
-    def _build_entry(self, signal, account, gates, today) -> RiskDecision:
-        sizing = size_position(signal, account, self.config)
+    def _build_entry(
+        self, signal, account, gates, today, *, sector, confidence_override
+    ) -> RiskDecision:
+        sizing = size_position(
+            signal,
+            account,
+            self.config,
+            sector=sector,
+            confidence_override=confidence_override,
+        )
         if not sizing.approved:
             return RiskDecision(
                 decision=Decision.REJECTED,
                 breached_limits=[sizing.rejection_reason or "sizing rejected the order"],
                 warnings=gates.warnings,
                 notes=[*gates.notes, *sizing.caps_applied],
+                trip_kill_switch=gates.trip_kill_switch,
             )
 
         intent = TradeIntent(
@@ -134,9 +181,14 @@ class RiskEngine:
             stop_price=signal.stop_price,
             target_price=signal.target_price,
             reference_price=signal.reference_price,
-            confidence=signal.confidence,
+            confidence=(
+                signal.confidence if confidence_override is None else confidence_override
+            ),
             rationale=signal.reasons,
             created_at=datetime.now(UTC),
+            thesis=signal.thesis,
+            invalidation_reason=signal.invalidation_reason,
+            sector=sector,
         )
 
         notes = [
@@ -149,6 +201,13 @@ class RiskEngine:
             f"implied quantity {intent.estimated_quantity:.6f} shares "
             f"at {intent.reference_price:.2f} (fractional order)",
         ]
+        if intent.estimated_max_loss is not None:
+            notes.append(
+                f"modeled loss to stop {intent.estimated_max_loss:.2f} "
+                f"(not a floor — managed stop, market entry, gap risk)"
+            )
+        if intent.risk_reward_ratio is not None:
+            notes.append(f"reward-to-risk {intent.risk_reward_ratio:.2f}")
 
         # "Resized" is reserved for the case where something other than the
         # risk formula itself shrank the order, since that is the signal a
@@ -160,6 +219,7 @@ class RiskEngine:
             approved_notional=sizing.notional,
             warnings=gates.warnings,
             notes=notes,
+            trip_kill_switch=gates.trip_kill_switch,
         )
 
     # ----------------------------------------------------------------- exits
@@ -194,6 +254,8 @@ class RiskEngine:
             confidence=signal.confidence,
             rationale=signal.reasons,
             created_at=datetime.now(UTC),
+            thesis=signal.thesis,
+            invalidation_reason=signal.invalidation_reason,
         )
 
         notes = [*gates.notes]
@@ -209,4 +271,5 @@ class RiskEngine:
             approved_notional=notional,
             warnings=gates.warnings,
             notes=notes,
+            trip_kill_switch=gates.trip_kill_switch,
         )

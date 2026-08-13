@@ -58,6 +58,13 @@ class Signal(BaseModel):
     stop_price: Decimal | None = None
     target_price: Decimal | None = None
 
+    # Human-readable intent. `reasons` records which conditions fired;
+    # these two record what the trade actually believes and what would
+    # prove it wrong. The critic and any later post-mortem read these —
+    # without them a review is reconstruction rather than recall.
+    thesis: str | None = None
+    invalidation_reason: str | None = None
+
     reasons: list[str] = Field(default_factory=list)
     failed_conditions: list[str] = Field(default_factory=list)
     metrics: dict[str, Any] = Field(default_factory=dict)
@@ -72,6 +79,20 @@ class Signal(BaseModel):
             return None
         return (self.reference_price - self.stop_price) / self.reference_price
 
+    @property
+    def risk_reward_ratio(self) -> Decimal | None:
+        """Reward per unit of risk, from entry to target against entry to stop.
+
+        None when either level is missing, which callers must treat as
+        "unknown" and refuse to trade on rather than as "acceptable".
+        """
+        if self.stop_price is None or self.target_price is None or not self.reference_price:
+            return None
+        risk = self.reference_price - self.stop_price
+        if risk <= 0:
+            return None
+        return (self.target_price - self.reference_price) / risk
+
 
 class Position(BaseModel):
     """An open position, as reconciled from the broker rather than assumed."""
@@ -83,9 +104,19 @@ class Position(BaseModel):
     average_cost: Decimal
     market_value: Decimal | None = None
 
+    # Populated from fundamentals when available. `None` means unknown, which
+    # the sector-exposure gate reports rather than silently treating as zero
+    # exposure — an unknown sector under-counts concentration.
+    sector: str | None = None
+
     @property
     def cost_basis(self) -> Decimal:
         return self.quantity * self.average_cost
+
+    @property
+    def exposure(self) -> Decimal:
+        """Current value, falling back to cost when the mark is unavailable."""
+        return self.market_value if self.market_value is not None else self.cost_basis
 
 
 class AccountState(BaseModel):
@@ -120,6 +151,22 @@ class AccountState(BaseModel):
     def open_position_count(self) -> int:
         return len([p for p in self.positions if p.quantity > 0])
 
+    def sector_exposure(self, sector: str) -> Decimal:
+        """Total value held in one sector. Case-insensitive match."""
+        target = sector.strip().casefold()
+        return sum(
+            (p.exposure for p in self.positions if (p.sector or "").strip().casefold() == target),
+            Decimal("0"),
+        )
+
+    def positions_missing_sector(self) -> list[str]:
+        """Held symbols whose sector is unknown.
+
+        Surfaced by the exposure gate: each one is concentration the gate
+        cannot see, so the check is weaker than it appears.
+        """
+        return [p.symbol for p in self.positions if p.quantity > 0 and not p.sector]
+
 
 class TradeIntent(BaseModel):
     """A concrete proposed order, before risk review.
@@ -147,6 +194,11 @@ class TradeIntent(BaseModel):
     rationale: list[str] = Field(default_factory=list)
     created_at: datetime | None = None
 
+    # Carried through from the signal. See `Signal.thesis`.
+    thesis: str | None = None
+    invalidation_reason: str | None = None
+    sector: str | None = None
+
     @property
     def estimated_quantity(self) -> Decimal:
         """Fractional share count. Robinhood supports fractional equity orders,
@@ -154,6 +206,37 @@ class TradeIntent(BaseModel):
         trading in the hundreds of dollars."""
         price = self.limit_price or self.reference_price
         return self.notional / price
+
+    @property
+    def estimated_max_loss(self) -> Decimal | None:
+        """Modeled loss if the stop is hit — **not** a floor on what can be lost.
+
+        Three things can make the real loss larger, and all three are live here:
+
+        - The stop is *managed*, not broker-native. This order does not carry
+          it, so between cycles there is nothing enforcing the level at all.
+        - Entries are market orders (fractional orders cannot be limit orders),
+          so the fill can be worse than the reference price.
+        - An overnight gap can open straight through the level.
+
+        Treat this as the intended risk of the setup, never as a guarantee.
+        """
+        if self.stop_price is None or not self.reference_price:
+            return None
+        distance = (self.reference_price - self.stop_price) / self.reference_price
+        if distance <= 0:
+            return None
+        return (self.notional * distance).quantize(Decimal("0.01"))
+
+    @property
+    def risk_reward_ratio(self) -> Decimal | None:
+        """Reward per unit of risk. None when either level is missing."""
+        if self.stop_price is None or self.target_price is None or not self.reference_price:
+            return None
+        risk = self.reference_price - self.stop_price
+        if risk <= 0:
+            return None
+        return ((self.target_price - self.reference_price) / risk).quantize(Decimal("0.01"))
 
 
 class RiskDecision(BaseModel):
@@ -168,6 +251,12 @@ class RiskDecision(BaseModel):
     breached_limits: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+    # Set when losses breached the sticky kill-switch threshold. The engine
+    # only reports it — writing the HALT file is done by the caller, so this
+    # module stays free of side effects. Unlike the daily-loss limit, which
+    # resets tomorrow, tripping this requires a human to clear HALT.
+    trip_kill_switch: bool = False
 
     @property
     def is_executable(self) -> bool:

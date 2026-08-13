@@ -53,8 +53,19 @@ def size_position(
     config: RiskConfig,
     *,
     scale_by_confidence: bool = True,
+    sector: str | None = None,
+    confidence_override: float | None = None,
 ) -> SizingResult:
-    """Compute the dollar notional for an entry signal."""
+    """Compute the dollar notional for an entry signal.
+
+    `sector` enables the sector-headroom cap; without it that limit cannot be
+    enforced here and the gate in `risk.limits` only warns.
+
+    `confidence_override` re-sizes with an adjusted confidence after critic
+    review. It may only ever *lower* the effective confidence — the caller is
+    responsible for clamping, and `agents.orchestrator` asserts the resulting
+    notional did not grow.
+    """
     stop_distance = signal.stop_distance_pct
 
     if stop_distance is None or stop_distance <= 0:
@@ -91,10 +102,15 @@ def size_position(
 
     # Conviction may shrink a position but never grow it beyond what the stop
     # already justified.
-    if scale_by_confidence and signal.confidence > 0:
-        scaled = notional * Decimal(str(signal.confidence))
+    effective_confidence = (
+        signal.confidence if confidence_override is None else confidence_override
+    )
+    if scale_by_confidence and effective_confidence > 0:
+        scaled = notional * Decimal(str(effective_confidence))
         if scaled < notional:
-            caps.append(f"confidence {signal.confidence:.2f} scaled {notional:.2f} -> {scaled:.2f}")
+            caps.append(
+                f"confidence {effective_confidence:.2f} scaled {notional:.2f} -> {scaled:.2f}"
+            )
             notional = scaled
             binding = "confidence"
 
@@ -102,6 +118,16 @@ def size_position(
 
     if config.max_order_notional is not None:
         apply_cap(config.max_order_notional, "max_order_notional")
+
+    # Remaining room in this sector before the concentration cap. Enforced here
+    # rather than only warned about in `risk.limits`, since the gate runs
+    # before a notional exists.
+    if sector:
+        headroom = (
+            account.total_value * config.max_sector_exposure_pct
+            - account.sector_exposure(sector)
+        )
+        apply_cap(max(headroom, Decimal("0")), f"sector_exposure[{sector}]")
 
     # Buying power is the hard wall. On a cash account it already excludes
     # unsettled proceeds, so no separate subtraction is needed here — see the

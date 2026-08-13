@@ -29,6 +29,9 @@ class LimitCheck:
     breaches: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Reported, never acted on here — this module performs no I/O. The caller
+    # writes the HALT file.
+    trip_kill_switch: bool = False
 
     def breach(self, reason: str) -> None:
         self.passed = False
@@ -62,6 +65,28 @@ def check_limits(
         result.breach("HALT file present — trading disabled")
         return result  # Nothing else is worth evaluating.
 
+    # The sticky kill switch outranks every other entry gate. It is evaluated
+    # early so a catastrophic day stops new risk regardless of what is proposed.
+    #
+    # It deliberately does NOT block exits. The switch fires automatically, and
+    # an automatic control that strands you in losing positions until a human
+    # notices is worse than the loss that triggered it. HALT still stops the
+    # next cycle outright — by then a human is in the loop.
+    kill_threshold = -(account.total_value * config.kill_switch_daily_loss_pct)
+    if account.realized_pnl_today <= kill_threshold:
+        result.trip_kill_switch = True
+        if is_entry:
+            result.breach(
+                f"KILL SWITCH: realized loss {account.realized_pnl_today:.2f} breached "
+                f"{kill_threshold:.2f} ({config.kill_switch_daily_loss_pct:.1%} of "
+                "account). Writing HALT — a human must clear it before trading resumes."
+            )
+            return result
+        result.warn(
+            f"KILL SWITCH tripped ({account.realized_pnl_today:.2f}); allowing this exit, "
+            "but HALT is being written and no new entries will be permitted"
+        )
+
     if not snapshot.tradable:
         result.breach(f"symbol not tradable: {snapshot.staleness_note or 'unknown reason'}")
 
@@ -86,13 +111,15 @@ def check_limits(
             f"(max {config.max_open_positions})"
         )
 
-    exposure = sum((p.market_value or p.cost_basis) for p in account.positions)
+    exposure = sum((p.exposure for p in account.positions), Decimal("0"))
     max_exposure = account.total_value * config.max_portfolio_exposure_pct
     if exposure >= max_exposure:
         result.breach(
             f"portfolio exposure {exposure:.2f} at or above cap {max_exposure:.2f} "
             f"({config.max_portfolio_exposure_pct:.0%})"
         )
+
+    _check_sector_exposure(signal, snapshot, account, config, result)
 
     # --- Symbol-level gates ----------------------------------------------
 
@@ -152,6 +179,22 @@ def check_limits(
             "— setup too loose to size responsibly"
         )
 
+    # --- Reward -----------------------------------------------------------
+
+    ratio = signal.risk_reward_ratio
+    if ratio is None:
+        result.breach(
+            "signal carries no target; reward-to-risk cannot be evaluated"
+        )
+    elif ratio < config.min_risk_reward:
+        result.breach(
+            f"reward-to-risk {ratio:.2f} below minimum {config.min_risk_reward:.2f} "
+            f"(entry {signal.reference_price}, stop {signal.stop_price}, "
+            f"target {signal.target_price})"
+        )
+    else:
+        result.note(f"reward-to-risk {ratio:.2f} (minimum {config.min_risk_reward:.2f})")
+
     # --- Cash and settlement ---------------------------------------------
 
     if account.buying_power <= 0:
@@ -168,6 +211,57 @@ def check_limits(
         )
 
     return result
+
+
+def _check_sector_exposure(
+    signal: Signal,
+    snapshot: MarketSnapshot,
+    account: AccountState,
+    config: RiskConfig,
+    result: LimitCheck,
+) -> None:
+    """Cap combined exposure to any one sector.
+
+    Guards the failure where several nominally independent positions turn out
+    to be the same bet. Sizing is not known at gate time, so the check uses the
+    per-position ceiling as the worst case the order could reach — a config
+    validator keeps that ceiling at or below the sector cap, so the comparison
+    is meaningful rather than automatically fatal.
+    """
+    sector = snapshot.sector
+    cap = account.total_value * config.max_sector_exposure_pct
+
+    unknown_holdings = account.positions_missing_sector()
+    if unknown_holdings:
+        result.warn(
+            f"sector unknown for held {', '.join(unknown_holdings)} — "
+            "concentration is under-counted"
+        )
+
+    if not sector:
+        result.warn(
+            f"sector unknown for {signal.symbol}; exposure cap "
+            f"({config.max_sector_exposure_pct:.0%}) not enforced for this entry"
+        )
+        return
+
+    held = account.sector_exposure(sector)
+    worst_case = held + account.total_value * config.max_position_pct
+
+    if held >= cap:
+        result.breach(
+            f"sector '{sector}' exposure {held:.2f} already at or above cap {cap:.2f} "
+            f"({config.max_sector_exposure_pct:.0%} of account)"
+        )
+    elif worst_case > cap:
+        # Not fatal: sizing may land well under the ceiling. Flag it so a small
+        # fill has a stated cause.
+        result.warn(
+            f"sector '{sector}' at {held:.2f} of {cap:.2f} cap; this entry may be "
+            "capped by sector exposure"
+        )
+    else:
+        result.note(f"sector '{sector}' exposure {held:.2f} of {cap:.2f} cap")
 
 
 def _check_exit_specific(signal: Signal, account: AccountState, result: LimitCheck) -> None:

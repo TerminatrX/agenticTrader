@@ -22,6 +22,32 @@ max_open_positions: 2
 max_daily_loss_pct: 0.03
 max_portfolio_exposure_pct: 0.80
 
+# Combined exposure to any one sector. This BINDS IMMEDIATELY with the current
+# universe — AAPL, MSFT, NVDA, GOOGL, AMZN are all one sector, so a single
+# position at the 25% ceiling consumes the entire sector budget and the second
+# is blocked. That is the control working; the fix is a more diversified
+# universe, not a looser cap.
+max_sector_exposure_pct: 0.25
+
+# --- Reward -------------------------------------------------------------
+# Minimum reward-to-risk from entry to target.
+#
+# Note this is inert for trend_pullback, which builds its target as
+# entry + risk x target_r_multiple (2.0), so its ratio is always exactly 2.0.
+# The gate matters for strategies whose targets come from structure. Raising
+# this above 2.0 would block every trend_pullback entry rather than improving
+# selectivity.
+min_risk_reward: 2.0
+
+# --- Kill switch (sticky) ----------------------------------------------
+# Different in kind from max_daily_loss_pct, not just degree:
+#   max_daily_loss_pct (3%)      blocks new entries, resets tomorrow
+#   kill_switch_daily_loss_pct   writes HALT, stays until a human clears it
+# Must exceed max_daily_loss_pct or the soft limit becomes dead code.
+# Exits remain permitted when tripped — stranding open positions would be
+# worse than the loss that triggered it.
+kill_switch_daily_loss_pct: 0.06
+
 # --- Stops --------------------------------------------------------------
 default_stop_pct: 0.05
 max_stop_pct: 0.12

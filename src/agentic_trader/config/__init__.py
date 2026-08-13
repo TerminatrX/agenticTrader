@@ -12,6 +12,9 @@ from agentic_trader.config.loader import (
     load_config,
     load_risk_config,
     load_strategy_config,
+    risk_fingerprint,
+    verify_risk_lock,
+    write_risk_lock,
 )
 
 __all__ = [
@@ -26,4 +29,7 @@ __all__ = [
     "load_config",
     "load_risk_config",
     "load_strategy_config",
+    "risk_fingerprint",
+    "verify_risk_lock",
+    "write_risk_lock",
 ]

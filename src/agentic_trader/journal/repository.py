@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS audit (
     reference_price TEXT,
     confidence      REAL NOT NULL DEFAULT 0,
     signal_strength TEXT,
+    original_confidence REAL,
+    adjusted_confidence REAL,
+    thesis          TEXT,
+    invalidation_reason TEXT,
     reasons         TEXT NOT NULL DEFAULT '[]',
     failed_conditions TEXT NOT NULL DEFAULT '[]',
     risk_breaches   TEXT NOT NULL DEFAULT '[]',
@@ -58,6 +62,9 @@ CREATE TABLE IF NOT EXISTS trades (
     stop_price      TEXT,
     target_price    TEXT,
     entry_rationale TEXT NOT NULL DEFAULT '[]',
+    thesis          TEXT,
+    invalidation_reason TEXT,
+    sector          TEXT,
     closed_at       TEXT,
     exit_price      TEXT,
     exit_reason     TEXT
@@ -65,6 +72,33 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_open   ON trades(closed_at);
 """
+
+
+# Columns added after the first schema shipped. `CREATE TABLE IF NOT EXISTS`
+# leaves an existing table untouched, so a journal created before these fields
+# existed would otherwise fail on insert with a confusing "no such column".
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "audit": {
+        "original_confidence": "REAL",
+        "adjusted_confidence": "REAL",
+        "thesis": "TEXT",
+        "invalidation_reason": "TEXT",
+    },
+    "trades": {
+        "thesis": "TEXT",
+        "invalidation_reason": "TEXT",
+        "sector": "TEXT",
+    },
+}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Additive-only migration. Never drops or rewrites existing data."""
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, sql_type in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 class JournalRepository:
@@ -75,6 +109,7 @@ class JournalRepository:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            _add_missing_columns(conn)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -94,9 +129,11 @@ class JournalRepository:
                 """INSERT INTO audit (
                     cycle_id, occurred_at, symbol, strategy, outcome,
                     reference_price, confidence, signal_strength,
+                    original_confidence, adjusted_confidence,
+                    thesis, invalidation_reason,
                     reasons, failed_conditions, risk_breaches, critic_notes,
                     snapshot_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     entry.cycle_id,
                     entry.occurred_at.isoformat(),
@@ -106,6 +143,10 @@ class JournalRepository:
                     _s(entry.reference_price),
                     entry.confidence,
                     entry.signal_strength,
+                    entry.original_confidence,
+                    entry.adjusted_confidence,
+                    entry.thesis,
+                    entry.invalidation_reason,
                     json.dumps(entry.reasons),
                     json.dumps(entry.failed_conditions),
                     json.dumps(entry.risk_breaches),
@@ -135,8 +176,9 @@ class JournalRepository:
                     """INSERT INTO trades (
                         client_key, symbol, strategy, mode, opened_at,
                         entry_price, quantity, notional, stop_price, target_price,
-                        entry_rationale, closed_at, exit_price, exit_reason
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        entry_rationale, thesis, invalidation_reason, sector,
+                        closed_at, exit_price, exit_reason
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         trade.client_key,
                         trade.symbol,
@@ -149,6 +191,9 @@ class JournalRepository:
                         _s(trade.stop_price),
                         _s(trade.target_price),
                         json.dumps(trade.entry_rationale),
+                        trade.thesis,
+                        trade.invalidation_reason,
+                        trade.sector,
                         trade.closed_at.isoformat() if trade.closed_at else None,
                         _s(trade.exit_price),
                         trade.exit_reason,
@@ -318,6 +363,9 @@ def _trade_from_row(row: sqlite3.Row) -> TradeRecord:
         stop_price=_d(row["stop_price"]),
         target_price=_d(row["target_price"]),
         entry_rationale=json.loads(row["entry_rationale"] or "[]"),
+        thesis=row["thesis"],
+        invalidation_reason=row["invalidation_reason"],
+        sector=row["sector"],
         closed_at=datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None,
         exit_price=_d(row["exit_price"]),
         exit_reason=row["exit_reason"],

@@ -30,12 +30,24 @@ real money.** Read the safety rules before doing anything else.
 
 5. **Default to shadow mode.** `live` requires the user to say so explicitly.
 
-6. **Never edit `config/risk.yaml` to make a trade possible.** Changing risk
-   limits is its own decision, made deliberately and never in service of an
-   order that is currently blocked.
+6. **Never change risk limits.** `config/risk.yaml` and `config/risk.lock` are
+   enforced, not merely requested — a `PreToolUse` hook
+   (`.claude/hooks/guard_risk_config.py`) denies edits to them and denies
+   running `lock-risk`. Do not attempt to work around it. If a limit genuinely
+   needs to move, that is a human decision: they edit the file and run
+   `python -m agentic_trader.cli lock-risk --confirm` themselves.
+
+   A second, independent layer verifies a SHA-256 baseline of the effective
+   risk values on every config load, so a change made by any route — including
+   one this hook never sees — stops the system until a human re-locks it.
 
 7. **`HALT` stops everything.** If a file named `HALT` exists at the project
    root, no order may be constructed. To stop the system: `touch HALT`.
+
+   The kill switch writes it automatically when realized daily losses breach
+   `kill_switch_daily_loss_pct`. If you find a HALT file you did not expect,
+   **do not delete it** — read it, then tell the user. It records which cycle
+   tripped it and when.
 
 ## Architecture
 
@@ -90,7 +102,7 @@ numbers destroys reproducibility.
 | `market/signals.py` | Pure predicates strategies compose |
 | `market/regime.py` | Trend classification; gates which strategies may fire |
 | `strategies/` | Opinions only. No account access, no sizing |
-| `risk/limits.py` | Pass/fail gates |
+| `risk/limits.py` | Pass/fail gates, incl. sector cap and kill switch |
 | `risk/sizing.py` | Dollar-denominated position sizing |
 | `risk/engine.py` | The only path from signal to executable order |
 | `agents/critic.py` | Mechanical re-derivation of the trade |
@@ -98,6 +110,34 @@ numbers destroys reproducibility.
 | `execution/executor.py` | Builds the payload. **Does not submit** |
 | `execution/shadow_executor.py` | Simulated fills with pessimistic slippage |
 | `journal/` | SQLite: audit stream + trade records |
+
+## Risk controls
+
+Beyond sizing, six gates can stop a trade. All are configured in
+`config/risk.yaml` and validated at startup.
+
+| Control | Behaviour |
+|---|---|
+| `max_daily_loss_pct` | Blocks new entries. Resets tomorrow. |
+| `kill_switch_daily_loss_pct` | **Sticky.** Writes HALT; a human must clear it. Exits still allowed. |
+| `max_sector_exposure_pct` | Caps combined exposure to one sector. Also caps sizing. |
+| `min_risk_reward` | Rejects setups whose target does not justify the stop. |
+| `max_open_positions`, `max_portfolio_exposure_pct` | Portfolio-level ceilings. |
+| Earnings blackout, cooldown, liquidity, max stop width | Per-symbol gates. |
+
+Two behaviours worth knowing before they surprise you:
+
+- **The sector cap binds immediately.** The configured universe is all one
+  sector, so one position at the ceiling blocks the next. The fix is a more
+  diversified universe, never a looser cap.
+- **`min_risk_reward` never fires for `trend_pullback`**, which builds its
+  target at exactly 2R. It guards future strategies whose targets come from
+  structure. Raising it above 2.0 blocks every entry rather than improving
+  selectivity.
+
+The critic may reduce a trade's confidence, which shrinks the position, but it
+can never raise it — confidence multiplies notional, and letting a model
+enlarge a position is the one coupling this design forbids.
 
 ## Broker constraints that shape the design
 

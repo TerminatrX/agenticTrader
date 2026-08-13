@@ -10,6 +10,8 @@ permissive.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,34 @@ class RiskConfig(BaseModel):
     )
     max_portfolio_exposure_pct: Decimal = Field(
         default=Decimal("0.80"), gt=0, le=Decimal("1.0"),
+    )
+    max_sector_exposure_pct: Decimal = Field(
+        default=Decimal("0.25"), gt=0, le=Decimal("1.0"),
+        description=(
+            "Ceiling on combined exposure to any one sector. Guards the case "
+            "where several 'independent' positions are the same bet."
+        ),
+    )
+
+    # --- Reward ----------------------------------------------------------
+    min_risk_reward: Decimal = Field(
+        default=Decimal("2.0"), gt=0, le=Decimal("20"),
+        description=(
+            "Minimum reward-to-risk from entry to target. Note that a strategy "
+            "deriving its target as a fixed R multiple always satisfies this by "
+            "construction; the gate binds for strategies whose targets come "
+            "from structure."
+        ),
+    )
+
+    # --- Kill switch (sticky) --------------------------------------------
+    kill_switch_daily_loss_pct: Decimal = Field(
+        default=Decimal("0.06"), gt=0, le=Decimal("0.50"),
+        description=(
+            "Realized daily loss that writes HALT and stops the system until a "
+            "human clears it. Distinct in kind from max_daily_loss_pct, which "
+            "blocks new entries and resets tomorrow."
+        ),
     )
 
     # --- Stops ------------------------------------------------------------
@@ -114,6 +144,24 @@ class RiskConfig(BaseModel):
             raise ValueError(
                 "risk_per_trade_pct must be well below max_position_pct; "
                 "otherwise every trade is capped by the position ceiling"
+            )
+        # A kill switch that fires before the soft limit makes the soft limit
+        # dead code — the system would halt outright where it should merely
+        # have stopped opening new positions.
+        if self.kill_switch_daily_loss_pct <= self.max_daily_loss_pct:
+            raise ValueError(
+                f"kill_switch_daily_loss_pct ({self.kill_switch_daily_loss_pct}) must "
+                f"exceed max_daily_loss_pct ({self.max_daily_loss_pct}); otherwise the "
+                "sticky halt fires first and the daily limit never applies"
+            )
+        # A per-position ceiling above the sector ceiling cannot be reached
+        # whenever the sector is known, which makes sizing behaviour depend on
+        # whether fundamentals happened to load. Surface it as a config error.
+        if self.max_position_pct > self.max_sector_exposure_pct:
+            raise ValueError(
+                f"max_position_pct ({self.max_position_pct}) exceeds "
+                f"max_sector_exposure_pct ({self.max_sector_exposure_pct}); a single "
+                "position could never reach its ceiling once its sector is known"
             )
         return self
 
@@ -192,11 +240,93 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return raw
 
 
-def load_risk_config(path: Path) -> RiskConfig:
+def risk_fingerprint(config: RiskConfig) -> str:
+    """SHA-256 over the *effective* risk values.
+
+    Hashes the validated model dump rather than the file bytes, so comments,
+    key order, and CRLF/LF differences are all invisible, while any change to a
+    value that actually governs behaviour changes the hash.
+    """
+    canonical = json.dumps(config.model_dump(mode="json"), sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def write_risk_lock(config: RiskConfig, path: Path) -> str:
+    """Record the current risk values as the approved baseline.
+
+    Stores the values alongside the hash so a later mismatch can name exactly
+    which limit moved instead of merely reporting that something did.
+    """
+    fingerprint = risk_fingerprint(config)
+    path.write_text(
+        json.dumps(
+            {
+                "algorithm": "sha256",
+                "fingerprint": fingerprint,
+                "values": config.model_dump(mode="json"),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return fingerprint
+
+
+def _describe_risk_drift(locked: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    changes: list[str] = []
+    for key in sorted(set(locked) | set(current)):
+        before, after = locked.get(key, "<absent>"), current.get(key, "<absent>")
+        if before != after:
+            changes.append(f"  {key}: {before} -> {after}")
+    return changes
+
+
+def verify_risk_lock(config: RiskConfig, lock_path: Path) -> None:
+    """Raise unless the risk config matches its recorded baseline.
+
+    This is the half of risk-config protection that survives outside the agent
+    harness — a deny hook constrains this agent, while the lock catches any
+    edit from any source. Loosening a limit becomes a deliberate two-step act
+    (edit, then re-lock) with both steps visible in git history.
+
+    A missing lock file is not an error: it means the baseline has not been
+    established yet. Only a *mismatch* is fatal.
+    """
+    if not lock_path.exists():
+        return
+
     try:
-        return RiskConfig(**_read_yaml(path))
+        locked = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Risk lock at {lock_path} is unreadable: {exc}") from exc
+
+    current = risk_fingerprint(config)
+    if locked.get("fingerprint") == current:
+        return
+
+    drift = _describe_risk_drift(locked.get("values", {}), config.model_dump(mode="json"))
+    detail = "\n".join(drift) if drift else "  (no value differences; lock file may be stale)"
+    raise ConfigError(
+        f"config/risk.yaml does not match its approved baseline ({lock_path.name}).\n"
+        f"Changed:\n{detail}\n\n"
+        "Risk limits must not change silently. Review the diff, and if the change "
+        "is intended, re-lock deliberately:\n"
+        "    python -m agentic_trader.cli lock-risk --confirm\n"
+        "The trading agent must never run that command."
+    )
+
+
+def load_risk_config(path: Path, lock_path: Path | None = None) -> RiskConfig:
+    try:
+        config = RiskConfig(**_read_yaml(path))
     except ValidationError as exc:
         raise ConfigError(f"Invalid risk config at {path}:\n{exc}") from exc
+
+    if lock_path is not None:
+        verify_risk_lock(config, lock_path)
+    return config
 
 
 def load_strategy_config(path: Path) -> StrategyConfig:
@@ -241,7 +371,7 @@ def load_config(project_root: Path | None = None) -> AppConfig:
     root = project_root or find_project_root()
     config_dir = root / "config"
     return AppConfig(
-        risk=load_risk_config(config_dir / "risk.yaml"),
+        risk=load_risk_config(config_dir / "risk.yaml", config_dir / "risk.lock"),
         strategies=load_strategy_config(config_dir / "strategies.yaml"),
         project_root=root,
         account=load_account_config(config_dir / "account.local.yaml"),

@@ -107,6 +107,11 @@ class MarketSnapshot(BaseModel):
     high_52w: Decimal | None = None
     low_52w: Decimal | None = None
 
+    # Drives the sector-exposure cap. `None` means fundamentals were absent or
+    # did not carry it — the gate reports that rather than assuming diversity.
+    sector: str | None = None
+    industry: str | None = None
+
     # Set when the quote is stale or the symbol is not actively trading.
     tradable: bool = True
     staleness_note: str | None = None

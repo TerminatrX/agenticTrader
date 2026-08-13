@@ -48,14 +48,29 @@ class CriticReport:
     concerns: list[str] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
 
+    # Cumulative downward adjustment to confidence, always <= 0.
+    #
+    # Confidence multiplies notional in `risk.sizing`, so this value moves real
+    # position size. It is clamped to be non-positive precisely because an
+    # adjustment that could *raise* confidence would let a language model
+    # enlarge a position — the one coupling this architecture exists to
+    # prevent. The model may veto or shrink. It may never amplify.
+    confidence_adjustment: float = 0.0
+
     def block(self, reason: str) -> None:
         self.verdict = CriticVerdict.BLOCK
         self.blocks.append(reason)
 
-    def concern(self, reason: str) -> None:
+    def concern(self, reason: str, confidence_penalty: float = 0.0) -> None:
         if self.verdict is not CriticVerdict.BLOCK:
             self.verdict = CriticVerdict.CONCERN
         self.concerns.append(reason)
+        if confidence_penalty:
+            self.penalize(confidence_penalty)
+
+    def penalize(self, amount: float) -> None:
+        """Reduce confidence by `amount` (given as a positive magnitude)."""
+        self.confidence_adjustment -= abs(amount)
 
     def observe(self, note: str) -> None:
         self.observations.append(note)
@@ -64,12 +79,17 @@ class CriticReport:
     def approved(self) -> bool:
         return self.verdict is not CriticVerdict.BLOCK
 
+    def adjusted_confidence(self, original: float) -> float:
+        """Apply the adjustment, clamped so it can only ever lower confidence."""
+        return max(0.0, min(original, original + self.confidence_adjustment))
+
     def to_dict(self) -> dict[str, object]:
         return {
             "verdict": self.verdict.value,
             "blocks": self.blocks,
             "concerns": self.concerns,
             "observations": self.observations,
+            "confidence_adjustment": round(self.confidence_adjustment, 4),
         }
 
 
@@ -144,7 +164,9 @@ def critique(
             f"{config.max_position_pct:.1%} ceiling"
         )
     elif concentration > config.max_position_pct * Decimal("0.9"):
-        report.concern(f"position is {concentration:.1%} of the account — near the ceiling")
+        report.concern(
+            f"position is {concentration:.1%} of the account — near the ceiling", 0.05
+        )
 
     # --- Data quality -----------------------------------------------------
 
@@ -152,14 +174,15 @@ def critique(
     if age_seconds > 900:
         report.block(f"snapshot is {age_seconds / 60:.0f} minutes old — refuse to trade on it")
     elif age_seconds > 300:
-        report.concern(f"snapshot is {age_seconds / 60:.0f} minutes old")
+        report.concern(f"snapshot is {age_seconds / 60:.0f} minutes old", 0.10)
 
     if snapshot.indicators.as_of is not None:
         indicator_age = (current.date() - snapshot.indicators.as_of.date()).days
         if indicator_age > 4:
             report.concern(
                 f"indicators computed through {snapshot.indicators.as_of.date()} "
-                f"({indicator_age}d ago) — stale relative to the live price"
+                f"({indicator_age}d ago) — stale relative to the live price",
+                0.10,
             )
 
     missing = [
@@ -182,7 +205,7 @@ def critique(
     if intent.side is Side.BUY and not regime.allows_long_entry:
         report.block(f"long entry in a {regime.value} regime contradicts the strategy premise")
     elif regime is Regime.UNKNOWN:
-        report.concern("regime could not be classified — trading without trend context")
+        report.concern("regime could not be classified — trading without trend context", 0.15)
 
     if intent.side is Side.BUY and signal.confidence < 0.5:
         report.concern(f"confidence {signal.confidence:.2f} is weak for a new position")
@@ -195,7 +218,8 @@ def critique(
     if recent_symbol_trades >= 3:
         report.concern(
             f"{recent_symbol_trades} recent trades in {intent.symbol} — "
-            "check for revenge trading or an over-fitted setup"
+            "check for revenge trading or an over-fitted setup",
+            0.10,
         )
 
     if snapshot.earnings is not None:
@@ -205,7 +229,7 @@ def critique(
                 f"earnings in {days_out}d ({snapshot.earnings.report_date}, "
                 f"{'confirmed' if snapshot.earnings.verified else 'tentative'})"
             )
-            report.concern(f"{note} — plan the exit before the report")
+            report.concern(f"{note} — plan the exit before the report", 0.15)
 
     gap = snapshot.previous_close
     if gap is not None and gap > 0:
@@ -213,7 +237,8 @@ def critique(
         if move > Decimal("0.05"):
             report.concern(
                 f"price moved {move:.1%} from the prior close — "
-                "indicators computed before this move may no longer describe the setup"
+                "indicators computed before this move may no longer describe the setup",
+                0.20,
             )
 
     return report

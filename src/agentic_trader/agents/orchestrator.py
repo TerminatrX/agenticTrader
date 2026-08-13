@@ -61,6 +61,11 @@ class CycleResult:
     audit: AuditEntry | None = None
     errors: list[str] = field(default_factory=list)
 
+    # Both recorded so the critic's effect on position size is measurable
+    # rather than invisible — the performance review reads the gap between them.
+    original_confidence: float | None = None
+    adjusted_confidence: float | None = None
+
     @property
     def should_submit(self) -> bool:
         """True only when every gate agreed and the mode is live.
@@ -162,6 +167,35 @@ def run_cycle(
     if not report.approved:
         return finish(CycleOutcome.REJECTED_BY_CRITIC)
 
+    # --- 3b. Bounded re-size -----------------------------------------------
+    # The critic reviews a concrete sized order, so its confidence adjustment
+    # arrives after sizing. Re-size exactly once so the adjustment reaches the
+    # position, then verify it only ever shrank. Gates are not re-run: a
+    # smaller order cannot breach a limit the larger one already satisfied.
+
+    result.original_confidence = signal.confidence
+    adjusted = report.adjusted_confidence(signal.confidence)
+    result.adjusted_confidence = adjusted
+
+    if adjusted < signal.confidence:
+        before = decision.approved_notional
+        resized = engine.resize(
+            decision, signal, snapshot, account, adjusted, as_of=current.date()
+        )
+        if resized.is_executable and resized.approved_notional is not None:
+            # An LLM must never be able to enlarge a position. If this ever
+            # fires it is a logic error, not a market condition.
+            assert resized.approved_notional <= before, (
+                f"critic re-size grew the order: {before} -> {resized.approved_notional}"
+            )
+            decision = resized
+            result.risk_decision = decision
+        else:
+            # Shrinking pushed the order under the minimum notional. That is a
+            # rejection, not a silent fall back to the original size.
+            result.risk_decision = resized
+            return finish(CycleOutcome.REJECTED_BY_RISK)
+
     # --- 4. Payload -------------------------------------------------------
 
     try:
@@ -202,6 +236,9 @@ def run_cycle(
             stop_price=fill.managed_stop,
             target_price=fill.managed_target,
             entry_rationale=signal.reasons,
+            thesis=signal.thesis,
+            invalidation_reason=signal.invalidation_reason,
+            sector=snapshot.sector,
         )
         return finish(CycleOutcome.SHADOW_FILLED)
 
@@ -222,6 +259,10 @@ def _build_audit(
         reference_price=snapshot.reference_price,
         confidence=signal.confidence if signal else 0.0,
         signal_strength=signal.strength.value if signal else None,
+        original_confidence=result.original_confidence,
+        adjusted_confidence=result.adjusted_confidence,
+        thesis=signal.thesis if signal else None,
+        invalidation_reason=signal.invalidation_reason if signal else None,
         reasons=list(signal.reasons) if signal else [],
         failed_conditions=([*signal.failed_conditions] if signal else []) + result.errors,
         risk_breaches=list(decision.breached_limits) if decision else [],

@@ -184,9 +184,37 @@ class TrendPullbackStrategy(Strategy):
             reference_price=price,
             stop_price=stop_price,
             target_price=target_price,
+            thesis=self._thesis(snapshot, depth),
+            invalidation_reason=self._invalidation(snapshot, stop_price, rsi_floor),
             reasons=reasons,
             failed_conditions=failed,
             metrics=metrics,
+        )
+
+    # ---------------------------------------------------------------- intent
+
+    def _thesis(self, snapshot: MarketSnapshot, depth: Decimal | None) -> str:
+        """One sentence a human can evaluate months later without the metrics."""
+        ind = snapshot.indicators
+        return (
+            f"{snapshot.symbol} remains in an uptrend — price {snapshot.reference_price:.2f} "
+            f"holds above its 200-day ({_fmt(ind.sma_200)}) with the 50-day "
+            f"({_fmt(ind.sma_50)}) above it — and has pulled back {_pct(depth)} to the "
+            f"20-day ({_fmt(ind.sma_20)}) while momentum stops deteriorating "
+            f"(MACD histogram {_fmt(ind.macd_hist)}, improving from "
+            f"{_fmt(ind.macd_hist_prev)}). Buying the discount, not the breakdown."
+        )
+
+    def _invalidation(
+        self, snapshot: MarketSnapshot, stop_price: Decimal, rsi_floor: float
+    ) -> str:
+        """What would make this wrong — stated before it happens, not after."""
+        ind = snapshot.indicators
+        return (
+            f"A close below the 50-day ({_fmt(ind.sma_50)}) breaks the uptrend premise "
+            f"this trade rests on; the stop at {stop_price:.2f} enforces that. RSI back "
+            f"below {rsi_floor:g}, or the MACD histogram resuming its decline, means the "
+            "pullback became a breakdown and the setup was misread."
         )
 
     # ------------------------------------------------------------------- exit

@@ -29,6 +29,11 @@ config/account.yaml
 .env.*
 !.env.example
 
+# Machine-local Claude Code settings (personal permission grants, overrides).
+# `.claude/settings.json` IS tracked — it carries the risk-config guard hook,
+# and that protection should travel with the repo.
+.claude/settings.local.json
+
 # Captured MCP payloads may embed account identifiers and position data.
 *.bundle.json
 bundles/

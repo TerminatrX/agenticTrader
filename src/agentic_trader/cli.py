@@ -38,13 +38,20 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from agentic_trader.agents.orchestrator import CycleResult, run_cycle
-from agentic_trader.config import ConfigError, load_config
+from agentic_trader.config import (
+    ConfigError,
+    find_project_root,
+    load_config,
+    load_risk_config,
+    risk_fingerprint,
+    write_risk_lock,
+)
 from agentic_trader.journal import JournalRepository
 from agentic_trader.market.regime import classify_regime
 from agentic_trader.market.snapshot import SnapshotError, build_snapshot
@@ -170,6 +177,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         return _fail(f"cycle failed: {exc!r}", EXIT_ERROR)
 
+    # The kill switch is the one place this CLI acts rather than reports. The
+    # risk engine detects the breach and stays pure; writing HALT here means
+    # the next cycle stops before evaluating anything, and only a human
+    # deleting the file resumes trading.
+    if result.risk_decision is not None and result.risk_decision.trip_kill_switch:
+        _write_halt(config, result, dry_run=args.dry_run)
+
     if repo is not None and not args.dry_run:
         try:
             if result.audit is not None:
@@ -185,6 +199,28 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
     _emit(_render_result(result, snapshot_regime=classify_regime(snapshot).value))
     return EXIT_OK
+
+
+def _write_halt(config: Any, result: CycleResult, *, dry_run: bool) -> None:
+    """Write the HALT file so no further cycle can construct an order."""
+    if dry_run:
+        result.errors.append("KILL SWITCH tripped (HALT not written: --dry-run)")
+        return
+    try:
+        config.halt_path.write_text(
+            f"Kill switch tripped by cycle {result.cycle_id} on {result.symbol} "
+            f"at {datetime.now(UTC).isoformat()}.\n\n"
+            "Trading is disabled until this file is deleted. Review the day's "
+            "realized losses and the journal before removing it.\n",
+            encoding="utf-8",
+        )
+        result.errors.append(f"KILL SWITCH tripped — HALT written to {config.halt_path}")
+    except OSError as exc:
+        # Failing to write HALT is severe: the guard silently would not exist.
+        result.errors.append(
+            f"KILL SWITCH tripped but HALT could not be written ({exc}) — "
+            "stop the system manually"
+        )
 
 
 def _render_result(result: CycleResult, *, snapshot_regime: str) -> dict[str, Any]:
@@ -322,6 +358,55 @@ def cmd_strategies(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_lock_risk(args: argparse.Namespace) -> int:
+    """Record the current risk values as the approved baseline.
+
+    THIS IS A HUMAN COMMAND. The trading agent must never run it — doing so
+    would let it edit a limit and immediately bless the edit, which defeats the
+    entire purpose of the lock. `--confirm` is required so it cannot happen by
+    reflex, and `.claude/settings.json` denies it at the harness level.
+    """
+    root = Path(args.project_root) if args.project_root else find_project_root()
+    config_dir = root / "config"
+    lock_path = config_dir / "risk.lock"
+
+    # Load without verifying, since the whole point is to replace the baseline.
+    try:
+        risk = load_risk_config(config_dir / "risk.yaml")
+    except ConfigError as exc:
+        return _fail(str(exc))
+
+    current = risk_fingerprint(risk)
+    previous = None
+    if lock_path.exists():
+        try:
+            previous = json.loads(lock_path.read_text(encoding="utf-8")).get("fingerprint")
+        except (OSError, json.JSONDecodeError):
+            previous = None
+
+    if previous == current:
+        _emit({"ok": True, "changed": False, "fingerprint": current,
+               "note": "risk config already matches its lock"})
+        return EXIT_OK
+
+    if not args.confirm:
+        _emit({
+            "ok": False,
+            "changed": False,
+            "error": "risk config differs from its lock; re-run with --confirm to approve",
+            "previous_fingerprint": previous,
+            "current_fingerprint": current,
+            "values": risk.model_dump(mode="json"),
+        })
+        return EXIT_BAD_INPUT
+
+    fingerprint = write_risk_lock(risk, lock_path)
+    _emit({"ok": True, "changed": True, "fingerprint": fingerprint,
+           "lock_file": str(lock_path),
+           "note": "commit this lock file alongside the risk.yaml change"})
+    return EXIT_OK
+
+
 # ----------------------------------------------------------------------- main
 
 
@@ -352,6 +437,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("strategies", help="List registered strategies.")
     st.set_defaults(func=cmd_strategies)
+
+    lk = sub.add_parser(
+        "lock-risk",
+        help="HUMAN ONLY. Approve the current risk values as the new baseline.",
+    )
+    lk.add_argument("--confirm", action="store_true", help="Required to write the lock.")
+    lk.set_defaults(func=cmd_lock_risk)
 
     return parser
 
