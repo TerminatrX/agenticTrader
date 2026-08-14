@@ -18,10 +18,27 @@ from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
 
 from agentic_trader.execution.executor import ExecutionPlan
-from agentic_trader.models import Side
+from agentic_trader.models import ProtectionState, Side
 
 CENTS = Decimal("0.01")
 SHARE_DP = Decimal("0.000001")
+
+# Protection states this executor can actually produce. Declared by the
+# implementation rather than by the domain enum, because "what exists" and
+# "what this build reaches" are different questions and only the second one
+# changes as work lands.
+#
+# PROTECTED is absent on purpose: shadow mode never places a stop order, so
+# claiming a simulated position was covered would manufacture exactly the false
+# assurance the protection tracking exists to remove. FAILED, TRIGGERED, and
+# CANCELLED belong to the unimplemented broker lifecycle.
+SHADOW_PRODUCIBLE_STATES = frozenset(
+    {
+        ProtectionState.NOT_REQUIRED,
+        ProtectionState.UNAVAILABLE,
+        ProtectionState.PENDING,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +56,7 @@ class ShadowFill:
     strategy: str
     managed_stop: Decimal | None = None
     managed_target: Decimal | None = None
+    protection: ProtectionState = ProtectionState.NOT_REQUIRED
 
     def to_row(self) -> dict[str, object]:
         return {
@@ -53,6 +71,7 @@ class ShadowFill:
             "strategy": self.strategy,
             "managed_stop": str(self.managed_stop) if self.managed_stop is not None else None,
             "managed_target": str(self.managed_target) if self.managed_target is not None else None,
+            "protection": self.protection.value,
         }
 
 
@@ -72,6 +91,18 @@ class ShadowExecutor:
     def submit(self, plan: ExecutionPlan, *, now: datetime | None = None) -> ShadowFill:
         intent = plan.intent
         reference = intent.reference_price
+
+        if plan.protection not in SHADOW_PRODUCIBLE_STATES:
+            # A state this executor cannot legitimately reach means either the
+            # live lifecycle leaked in or a new state was added without
+            # deciding what shadow does with it. Both are bugs, and a shadow
+            # record carrying a state shadow never earned would corrupt exactly
+            # the history this mode exists to build.
+            raise ValueError(
+                f"shadow executor cannot produce protection state "
+                f"{plan.protection.value!r}; expected one of "
+                f"{sorted(s.value for s in SHADOW_PRODUCIBLE_STATES)}"
+            )
 
         # Slippage always works against the trade, in both directions.
         direction = Decimal("1") if intent.side is Side.BUY else Decimal("-1")
@@ -97,4 +128,5 @@ class ShadowExecutor:
             strategy=intent.strategy,
             managed_stop=plan.managed_stop,
             managed_target=plan.managed_target,
+            protection=plan.protection,
         )

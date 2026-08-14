@@ -266,18 +266,52 @@ Layer 1 constrains this agent; layer 2 catches everything. Neither is meant to
 stop a determined human, and layer 1 is a speed bump rather than a boundary —
 the lock is the boundary.
 
-**Known gap:** the entry order cannot carry a broker-native stop. Stops here are
-*managed*, and only half of that is currently implemented:
+**Known gap: positions cannot be protected at this account size.**
 
-- **Done** — the strategy enforces the stop each cycle. It exits when the live
-  price is at or below the level, and also when a bar's *low* touched it even if
-  price recovered, since a resting order would have filled there. The level
-  comes from the open trade record in the journal, which is the only place it is
-  written down.
-- **Not done** — no `stop_market` order is placed at the broker after a fill.
-  Between cycles the position is genuinely unprotected, and an overnight gap can
-  exceed the modeled loss. This is why `estimated_max_loss` is named a *modeled*
-  loss and not a floor, and it is the last thing to close before live trading.
+The entry order cannot carry a broker-native stop, so stops here are *managed* —
+a separate `stop_market` order has to follow the fill. Investigating whether the
+MCP could place one turned up a harder constraint than "not implemented yet":
+
+> Fractional quantities are accepted **only on `type=market`**, and a
+> `stop_market` order is not `type=market`. So a fractional position cannot
+> carry a resting stop at all.
+
+That binds because of how sizing works. `notional = risk_budget / stop_distance`
+is about $20 today, so a position is whole shares only for a stock under roughly
+$20 — and the universe trades at $250+. **Every position this account can take
+is unprotectable.**
+
+Note what that threshold depends on, though: `stop_distance`. Today it is a flat
+5%, but once stops are ATR-scaled it varies per symbol and per regime — a $0.50
+stop on a $1 risk budget affords a $2 notional, a $2.00 stop affords $0.50. So
+"trade cheaper stocks" is *not* established as the answer, and forcing a price
+ceiling into the scanner to accommodate a $100 test account would distort which
+setups the strategy sees. The honest sequencing is: find what the strategy
+actually wants, then ask what capital that requires under whole-share
+protection. A $100 account may simply be adequate for shadow validation and
+inadequate for protected execution, which is a fine answer.
+
+What exists instead:
+
+- The strategy enforces the stop each cycle — exiting when the live price is at
+  or below the level, and when a bar's *low* touched it even if price recovered,
+  since a resting order would have filled there.
+- `ProtectionState` records the truth per position, and `UNAVAILABLE` is
+  distinct from `FAILED`: one is a standing property of the account, the other
+  an incident.
+- Shadow mode may carry an unprotectable position and journals why. **Live and
+  approval execution refuse it structurally** — no configuration reaches that
+  check.
+
+This is why `estimated_max_loss` is a *modeled* loss and not a floor.
+
+**On confidence:** the restriction is `SCHEMA_DOCUMENTED`, not
+`EMPIRICALLY_VERIFIED`. `review_equity_order` previewed a fractional
+`stop_market` sell without complaint — but it also accepted a short sale in an
+account holding none of the symbol, so it appears not to validate order
+parameters at all. Confirming the rule would mean placing a real order, which
+this project will not do to settle a question. `execution/capabilities.py` tracks
+that distinction per capability rather than burying it in a comment.
 
 ## Layout
 
@@ -307,23 +341,41 @@ config/
 
 In rough priority order:
 
-1. **Place the protective `stop_market` order after a fill** — the remaining
-   half of the managed-stop gap, and the only item here that touches the
-   live-order path. The strategy now acts on a breached stop, but between
-   cycles nothing at the broker does.
-2. **ATR-scaled stops**, replacing the flat percentage. `atr_14` is already
-   parsed into the model but no skill fetches it and nothing reads it.
-3. **Market-level regime** from SPY, so the strategy stops buying pullbacks
-   into a falling market.
-4. **A more diversified universe**, which the sector cap now demands.
-5. **Universe scanner**, `ApprovalExecutor` recording who approved what, and
-   normalized `agent_decisions` / `daily_performance` journal tables.
+1. **ATR-scaled stops**, replacing the flat percentage. `atr_14` is already
+   parsed into the model but no skill fetches it and nothing reads it. This
+   comes first because it changes `stop_distance`, and therefore changes what
+   "affordable as whole shares" even means.
+2. **Market-level regime** from SPY/QQQ — journalled only at first, with rules
+   derived from observed expectancy per regime rather than assumed up front.
+3. **A more diversified universe and a scanner**, which the sector cap already
+   demands. Robinhood exposes `run_scan` and `get_scanner_filter_specs`
+   server-side, which may replace much of a hand-built scanner. Deliberately
+   *not* constrained by a price ceiling chosen to suit the current account.
+4. **Then, with (1) and (3) known:** how much capital this strategy needs for
+   whole-share broker protection. Answering it earlier would be guessing.
+5. **The protective-stop lifecycle** — submit, confirm acceptance, record the
+   broker order id, monitor, reconcile on restart. Gated on (4), since until
+   positions can be whole shares it could never leave its first state. Note
+   there is no replace/modify tool, so moving a stop means cancel-then-place
+   with an unprotected window in between.
+6. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
+   spread, slippage and stop-gap modelling, and a baseline-vs-critic A/B to
+   establish whether the critic actually improves expectancy.
+7. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
+   test suite (see safety rule 8).
 
 ## Status
 
 Shadow mode. `trend_pullback` implemented and tested; `momentum` stubbed.
 **No live trades placed.**
 
-107 tests, ruff clean. Test coverage is weighted toward the negative cases —
+133 tests, ruff clean. Test coverage is weighted toward the negative cases —
 every risk gate has a test proving it *blocks*, because a limit that silently
 fails open is worse than no limit at all.
+
+**That number is not evidence of live readiness**, and is deliberately not
+offered as any. A green suite shows the code does what it was written to do. It
+says nothing about whether the strategy has an edge, whether shadow fills
+resemble real ones, whether the system survives a restart mid-position, or
+whether its view of the account matches the broker's. None of those are
+established yet.

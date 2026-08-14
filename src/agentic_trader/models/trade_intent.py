@@ -38,6 +38,66 @@ class Decision(StrEnum):
     REJECTED = "rejected"
 
 
+class ProtectionState(StrEnum):
+    """Whether a position's stop actually rests at the broker.
+
+    Stops in this system are *managed*: the entry order cannot carry one, so a
+    separate stop order has to follow the fill. This enum records whether that
+    ever happened, because "the strategy has a stop level" and "the position is
+    protected" are different claims and only one of them survives a gap.
+
+    The whole enum is declared even though the current build cannot reach most
+    of it. The domain describes the world rather than the build, and an enum
+    that grows as implementation catches up would make journalled history
+    inconsistent across versions. Which states a given executor can actually
+    produce is that executor's business to declare.
+    """
+
+    NOT_REQUIRED = "not_required"
+    """An exit, or an intent carrying no stop. Nothing to protect."""
+
+    UNAVAILABLE = "unavailable"
+    """The broker structurally cannot protect a position of this shape — today,
+    a fractional quantity. Distinct from FAILED: this is a standing property of
+    the account and instrument, not an incident, and no retry will fix it."""
+
+    PENDING = "pending"
+    """Protection is required and the broker appears structurally capable of it,
+    but **protection has not been established**.
+
+    PENDING does *not* mean an order was submitted, and does not mean the broker
+    holds a stop. Nothing has been sent. In the current build every whole-share
+    entry lands here, because stop submission is not implemented at all.
+
+    When the lifecycle is built, the moment of "request attempted" deserves its
+    own state rather than being folded in here — the difference between "we have
+    not asked" and "we asked and do not yet know" matters during recovery. Until
+    then, read PENDING as strictly *unprotected*. The live allowlist enforces
+    that reading: PENDING cannot trade outside shadow."""
+
+    PROTECTED = "protected"
+    """The broker accepted a resting stop order. The only state that means the
+    position is actually covered while nothing is watching it."""
+
+    FAILED = "failed"
+    """Submission was attempted and rejected. An incident, unlike UNAVAILABLE."""
+
+    TRIGGERED = "triggered"
+    """The resting stop filled."""
+
+    CANCELLED = "cancelled"
+    """The resting stop was cancelled and not replaced."""
+
+
+# The only states under which a position may be carried outside shadow mode.
+# Everything else — UNAVAILABLE, PENDING, FAILED, and any state added later —
+# fails closed. Written as an allowlist rather than a denylist so a new state
+# defaults to blocking rather than to trading.
+LIVE_PERMITTED_PROTECTION = frozenset(
+    {ProtectionState.NOT_REQUIRED, ProtectionState.PROTECTED}
+)
+
+
 class Signal(BaseModel):
     """A strategy's read on one symbol.
 

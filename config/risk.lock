@@ -1,7 +1,8 @@
 {
   "algorithm": "sha256",
-  "fingerprint": "7dbebdc0bd58a86c768ce51b415cd1552b824757625e4d61313d917bec7f3866",
+  "fingerprint": "5f52fe55e7982f48f140736eebec42963f9469cebc8e73a76c1ff0b470a44ff2",
   "values": {
+    "allow_unprotected_shadow_entries": true,
     "default_stop_pct": "0.05",
     "earnings_blackout_days": 3,
     "halt_file": "HALT",

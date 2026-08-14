@@ -35,7 +35,15 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 
-from agentic_trader.models import MarketSnapshot, RiskDecision, Side, TradeIntent
+from agentic_trader.execution.capabilities import ROBINHOOD_MCP, BrokerCapabilities
+from agentic_trader.models import (
+    LIVE_PERMITTED_PROTECTION,
+    MarketSnapshot,
+    ProtectionState,
+    RiskDecision,
+    Side,
+    TradeIntent,
+)
 
 MAX_FRACTIONAL_DP = Decimal("0.000001")  # Broker allows 6 decimal places.
 
@@ -60,6 +68,13 @@ class ExecutionPlan:
     warnings: list[str] = field(default_factory=list)
     preflight_notes: list[str] = field(default_factory=list)
 
+    # Whether this position will actually be covered by a resting broker order,
+    # and which capability profile that judgement was made against. The profile
+    # ref is stored so a decision stays readable after the profile moves on.
+    protection: ProtectionState = ProtectionState.NOT_REQUIRED
+    protection_note: str = ""
+    capability_profile: str = ""
+
     def summary(self) -> str:
         verb = self.intent.side.value.upper()
         return (
@@ -67,6 +82,40 @@ class ExecutionPlan:
             f"(~{self.intent.estimated_quantity:.6f} sh @ ~{self.intent.reference_price:.2f}) "
             f"[{self.mode}]"
         )
+
+
+def assess_protection(
+    intent: TradeIntent,
+    *,
+    capabilities: BrokerCapabilities = ROBINHOOD_MCP,
+) -> tuple[ProtectionState, str]:
+    """Decide whether this order's position can be covered by a resting stop.
+
+    Returns the state and the reason, never raising — the caller decides what
+    the state is permitted to mean, which differs between shadow and live.
+    """
+    if intent.side is not Side.BUY or intent.stop_price is None:
+        return (
+            ProtectionState.NOT_REQUIRED,
+            "exit order" if intent.side is not Side.BUY else "intent carries no stop",
+        )
+
+    feasibility = capabilities.protection_feasibility(intent.estimated_quantity)
+
+    if feasibility.protectable is True:
+        # Reachable, but nothing submits it yet: the stop lifecycle is not
+        # implemented. PENDING rather than PROTECTED, because a position whose
+        # stop was never placed is not protected however placeable it was.
+        return (
+            ProtectionState.PENDING,
+            f"{feasibility.reason}; stop placement is not implemented, so the "
+            "position is not yet covered",
+        )
+
+    # `None` (capability unknown) lands here with FALSE, deliberately. Unknown
+    # protection is not protection, and it must gate exactly as a known-absent
+    # capability does.
+    return ProtectionState.UNAVAILABLE, feasibility.reason
 
 
 def preflight(
@@ -167,6 +216,8 @@ def build_order_payload(
     mode: Literal["live", "shadow"] = "shadow",
     use_dollar_amount: bool = True,
     known_client_keys: set[str] | None = None,
+    allow_unprotected_shadow_entries: bool = True,
+    capabilities: BrokerCapabilities = ROBINHOOD_MCP,
     now: datetime | None = None,
 ) -> ExecutionPlan:
     """Build the `place_equity_order` arguments for an approved decision.
@@ -186,6 +237,26 @@ def build_order_payload(
     )
     intent = decision.intent
     assert intent is not None  # preflight guarantees this
+
+    protection, protection_note = assess_protection(intent, capabilities=capabilities)
+
+    # Two gates, and the order matters. The structural one comes first and no
+    # configuration reaches it: outside shadow, a position that is not provably
+    # covered is refused, full stop. The config key can only tighten shadow
+    # behaviour — it can never admit an unprotected live entry.
+    if protection not in LIVE_PERMITTED_PROTECTION:
+        if mode != "shadow":
+            raise PreflightError(
+                f"protection state is {protection.value} and mode is {mode!r} — "
+                f"refusing to open a position that is not provably protected. "
+                f"{protection_note}"
+            )
+        if not allow_unprotected_shadow_entries:
+            raise PreflightError(
+                f"protection state is {protection.value} and "
+                f"allow_unprotected_shadow_entries is disabled. {protection_note}"
+            )
+    notes.append(f"protection {protection.value}: {protection_note}")
 
     payload: OrderPayload = {
         "account_number": account_number,
@@ -217,6 +288,11 @@ def build_order_payload(
             "does not carry it. Place a separate stop order after the fill, or the "
             "position is unprotected between cycles."
         )
+    if protection is ProtectionState.UNAVAILABLE:
+        warnings.append(
+            f"POSITION CANNOT BE PROTECTED: {protection_note}. The managed stop is "
+            "checked once per cycle and nothing enforces it in between."
+        )
 
     return ExecutionPlan(
         payload=payload,
@@ -227,6 +303,9 @@ def build_order_payload(
         managed_target=intent.target_price,
         warnings=warnings,
         preflight_notes=notes,
+        protection=protection,
+        protection_note=protection_note,
+        capability_profile=capabilities.profile_ref,
     )
 
 

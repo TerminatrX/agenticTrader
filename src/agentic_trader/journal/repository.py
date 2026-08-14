@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from agentic_trader.journal.models import AuditEntry, CycleOutcome, TradeRecord
+from agentic_trader.models import ProtectionState
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit (
@@ -71,6 +72,41 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_open   ON trades(closed_at);
+
+-- Resting protective stop orders at the broker. Created now and populated only
+-- with what the current build knows, so the stop lifecycle lands later as
+-- inserts rather than as a migration against live trading history.
+--
+-- `state` is a ProtectionState. The three quantity columns are separate on
+-- purpose: requested and accepted can differ when a broker partially accepts,
+-- and reconciling filled against accepted is how a partially-closed position
+-- gets noticed. `last_reconciled_at` separates "believed protected" from
+-- "confirmed protected as of a known time" — the question restart recovery
+-- asks. `supersedes_protective_order_id` carries cancel-and-replace lineage;
+-- no replacement behaviour exists yet, so it stays NULL.
+CREATE TABLE IF NOT EXISTS protective_orders (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_client_key    TEXT NOT NULL,
+    broker_order_id     TEXT,
+    state               TEXT NOT NULL,
+    stop_price          TEXT,
+    requested_quantity  TEXT,
+    accepted_quantity   TEXT,
+    filled_quantity     TEXT,
+    capability_profile  TEXT,
+    failure_reason      TEXT,
+    submitted_at        TEXT,
+    accepted_at         TEXT,
+    triggered_at        TEXT,
+    cancelled_at        TEXT,
+    updated_at          TEXT NOT NULL,
+    last_reconciled_at  TEXT,
+    supersedes_protective_order_id INTEGER REFERENCES protective_orders(id)
+);
+CREATE INDEX IF NOT EXISTS idx_protective_trade ON protective_orders(trade_client_key);
+CREATE INDEX IF NOT EXISTS idx_protective_state ON protective_orders(state);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_protective_broker_order
+    ON protective_orders(broker_order_id) WHERE broker_order_id IS NOT NULL;
 """
 
 
@@ -83,11 +119,15 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "adjusted_confidence": "REAL",
         "thesis": "TEXT",
         "invalidation_reason": "TEXT",
+        "protection_state": "TEXT",
+        "capability_profile": "TEXT",
     },
     "trades": {
         "thesis": "TEXT",
         "invalidation_reason": "TEXT",
         "sector": "TEXT",
+        "protection_state": "TEXT",
+        "capability_profile": "TEXT",
     },
 }
 
@@ -131,9 +171,10 @@ class JournalRepository:
                     reference_price, confidence, signal_strength,
                     original_confidence, adjusted_confidence,
                     thesis, invalidation_reason,
+                    protection_state, capability_profile,
                     reasons, failed_conditions, risk_breaches, critic_notes,
                     snapshot_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     entry.cycle_id,
                     entry.occurred_at.isoformat(),
@@ -147,6 +188,8 @@ class JournalRepository:
                     entry.adjusted_confidence,
                     entry.thesis,
                     entry.invalidation_reason,
+                    entry.protection_state.value if entry.protection_state else None,
+                    entry.capability_profile,
                     json.dumps(entry.reasons),
                     json.dumps(entry.failed_conditions),
                     json.dumps(entry.risk_breaches),
@@ -177,8 +220,9 @@ class JournalRepository:
                         client_key, symbol, strategy, mode, opened_at,
                         entry_price, quantity, notional, stop_price, target_price,
                         entry_rationale, thesis, invalidation_reason, sector,
+                        protection_state, capability_profile,
                         closed_at, exit_price, exit_reason
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         trade.client_key,
                         trade.symbol,
@@ -194,6 +238,8 @@ class JournalRepository:
                         trade.thesis,
                         trade.invalidation_reason,
                         trade.sector,
+                        trade.protection_state.value,
+                        trade.capability_profile,
                         trade.closed_at.isoformat() if trade.closed_at else None,
                         _s(trade.exit_price),
                         trade.exit_reason,
@@ -343,6 +389,8 @@ def _audit_row(row: sqlite3.Row) -> dict[str, Any]:
         "reference_price": row["reference_price"],
         "confidence": row["confidence"],
         "signal_strength": row["signal_strength"],
+        "protection_state": row["protection_state"],
+        "capability_profile": row["capability_profile"],
         "reasons": json.loads(row["reasons"] or "[]"),
         "failed_conditions": json.loads(row["failed_conditions"] or "[]"),
         "risk_breaches": json.loads(row["risk_breaches"] or "[]"),
@@ -366,6 +414,11 @@ def _trade_from_row(row: sqlite3.Row) -> TradeRecord:
         thesis=row["thesis"],
         invalidation_reason=row["invalidation_reason"],
         sector=row["sector"],
+        # Rows written before this column existed read as NULL. They predate
+        # protection tracking entirely, so NOT_REQUIRED is the honest default —
+        # not a claim they were protected.
+        protection_state=ProtectionState(row["protection_state"] or ProtectionState.NOT_REQUIRED),
+        capability_profile=row["capability_profile"],
         closed_at=datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None,
         exit_price=_d(row["exit_price"]),
         exit_reason=row["exit_reason"],

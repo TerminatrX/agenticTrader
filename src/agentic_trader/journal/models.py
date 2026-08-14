@@ -22,6 +22,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agentic_trader.models import ProtectionState
+
 
 class CycleOutcome(StrEnum):
     NO_SIGNAL = "no_signal"
@@ -55,6 +57,14 @@ class AuditEntry(BaseModel):
 
     thesis: str | None = None
     invalidation_reason: str | None = None
+
+    # Whether the position this cycle would open could be covered by a resting
+    # broker stop, and the capability profile that judgement was made against.
+    # `None` when the cycle produced no order. The profile ref matters because
+    # capability understanding changes: without it you cannot later tell an
+    # unprotectable position from one the system did not yet know how to protect.
+    protection_state: ProtectionState | None = None
+    capability_profile: str | None = None
 
     reasons: list[str] = Field(default_factory=list)
     failed_conditions: list[str] = Field(default_factory=list)
@@ -93,6 +103,13 @@ class TradeRecord(BaseModel):
     thesis: str | None = None
     invalidation_reason: str | None = None
     sector: str | None = None
+
+    # Was this position ever actually covered by a resting broker stop? Kept on
+    # the trade rather than only in `protective_orders` so the question is a
+    # read on the record that already exists, and so a position that never had
+    # a protective order at all is still answerable.
+    protection_state: ProtectionState = ProtectionState.NOT_REQUIRED
+    capability_profile: str | None = None
 
     closed_at: datetime | None = None
     exit_price: Decimal | None = None

@@ -7,9 +7,11 @@ from agentic_trader.models.market_snapshot import (
     MarketSnapshot,
 )
 from agentic_trader.models.trade_intent import (
+    LIVE_PERMITTED_PROTECTION,
     AccountState,
     Decision,
     Position,
+    ProtectionState,
     RiskDecision,
     Side,
     Signal,
@@ -18,6 +20,7 @@ from agentic_trader.models.trade_intent import (
 )
 
 __all__ = [
+    "LIVE_PERMITTED_PROTECTION",
     "AccountState",
     "Bar",
     "Decision",
@@ -25,6 +28,7 @@ __all__ = [
     "Indicators",
     "MarketSnapshot",
     "Position",
+    "ProtectionState",
     "RiskDecision",
     "Side",
     "Signal",

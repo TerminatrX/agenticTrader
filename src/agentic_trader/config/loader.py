@@ -136,6 +136,18 @@ class RiskConfig(BaseModel):
         ),
     )
 
+    # --- Protection -------------------------------------------------------
+    allow_unprotected_shadow_entries: bool = Field(
+        default=True,
+        description=(
+            "Whether SHADOW mode may open a position the broker cannot cover "
+            "with a resting stop. Scoped to shadow by name and by design: live "
+            "and approval execution refuse an unprotected entry structurally, "
+            "and no configuration value can override that. This key can only "
+            "make shadow stricter, never make live permissive."
+        ),
+    )
+
     # --- Kill switch ------------------------------------------------------
     halt_file: str = Field(
         default="HALT",

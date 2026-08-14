@@ -207,6 +207,7 @@ def run_cycle(
             account.account_number,
             max_spread_pct=config.risk.max_spread_pct,
             max_price_drift_pct=config.risk.max_price_drift_pct,
+            allow_unprotected_shadow_entries=config.risk.allow_unprotected_shadow_entries,
             mode="live" if mode == "live" else "shadow",
             known_client_keys=known_client_keys,
             now=current,
@@ -242,6 +243,8 @@ def run_cycle(
             thesis=signal.thesis,
             invalidation_reason=signal.invalidation_reason,
             sector=snapshot.sector,
+            protection_state=fill.protection,
+            capability_profile=plan.capability_profile,
         )
         return finish(CycleOutcome.SHADOW_FILLED)
 
@@ -253,7 +256,10 @@ def _build_audit(
 ) -> AuditEntry:
     signal = result.signal
     decision = result.risk_decision
+    plan = result.plan
     return AuditEntry(
+        protection_state=plan.protection if plan is not None else None,
+        capability_profile=plan.capability_profile if plan is not None else None,
         cycle_id=result.cycle_id,
         occurred_at=occurred_at,
         symbol=result.symbol,

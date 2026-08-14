@@ -81,3 +81,13 @@ max_price_drift_pct: 0.005
 # --- Kill switch --------------------------------------------------------
 # `touch HALT` at the project root stops all order construction immediately.
 halt_file: HALT
+
+# --- Protection ---------------------------------------------------------
+# Whether SHADOW mode may open a position the broker cannot cover with a
+# resting stop. At $100 with a $250+ universe every position is fractional and
+# therefore unprotectable, so `false` halts shadow trading entirely.
+#
+# Scoped to shadow by name and by design. Live and approval execution refuse an
+# unprotected entry structurally — no config value reaches that check. This key
+# can only make shadow stricter, never make live permissive.
+allow_unprotected_shadow_entries: true

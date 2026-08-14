@@ -49,6 +49,25 @@ real money.** Read the safety rules before doing anything else.
    **do not delete it** — read it, then tell the user. It records which cycle
    tripped it and when.
 
+8. **LIVE READINESS IS NOT DEFINED BY TEST COUNT.** Passing unit and
+   integration tests proves software behavior, not trading profitability or
+   safe behavior under live-market, broker, network, liquidity, gap, and
+   model-failure conditions. `ApprovalExecutor` must not be enabled solely
+   because the software test suite is green.
+
+   A green suite means the code does what it was written to do. It says nothing
+   about whether the strategy has an edge, whether shadow fills resemble real
+   ones, whether the system survives a restart mid-position, or whether its view
+   of the account matches the broker's. Never present a test count as evidence
+   for going live, and never let a passing suite be the argument that closes
+   that discussion.
+
+9. **An unprotected position may exist only in shadow.** Live and approval
+   execution refuse an entry whose `ProtectionState` is anything other than
+   `NOT_REQUIRED` or `PROTECTED`, structurally — no config key, flag, or
+   argument reaches that check. `allow_unprotected_shadow_entries` governs
+   shadow alone and can only make it stricter.
+
 ## Architecture
 
 Claude owns the loop. Python owns the decisions.
@@ -162,8 +181,23 @@ Discovered from the MCP tool schemas, not assumed:
   are **managed**, and only half-enforced today: `trend_pullback` exits when the
   live price or a bar low breaches the level recorded in the journal, but **no
   `stop_market` order is placed at the broker**, so between cycles the position
-  is genuinely unprotected. This is the single most important operational gap;
-  never describe a position as protected when it is not.
+  is genuinely unprotected. Never describe a position as protected when it is
+  not.
+- **A fractional position cannot carry a resting stop at all.** The schema
+  allows fractional quantities *only* on `type=market`, and a `stop_market`
+  order is not `type=market`. Since sizing gives
+  `notional = risk_budget / stop_distance` (~$20 today), a position is whole
+  shares only for a stock trading under about $20 — so at this account size
+  every position is unprotectable. This is a capital-and-universe problem, not
+  a coding one. Do not attempt to work around it by rounding a position up to
+  one share: that silently multiplies the risk budget by 15x or more.
+
+  The restriction is `SCHEMA_DOCUMENTED`, not `EMPIRICALLY_VERIFIED` —
+  `review_equity_order` accepted a fractional `stop_market` preview without
+  complaint, but it also accepted a short sale in an account holding none of
+  the symbol, so it appears not to validate order parameters. Confirming it
+  would require placing a real order. **Do not.** The uncertainty is recorded in
+  `execution/capabilities.py` as evidence, and the restriction is honoured.
 - **`ref_id` must be a UUID** and is the broker's idempotency key. The risk
   engine derives it deterministically (UUIDv5) so a re-fired cycle dedupes on
   both sides.
