@@ -226,6 +226,32 @@ class TrendPullbackStrategy(Strategy):
 
         reasons: list[str] = []
 
+        # The stop comes first, and is checked against the LIVE price rather
+        # than the last completed bar. Everything else in this strategy reasons
+        # from `reference_price` to stay consistent with the indicators, but a
+        # protective stop is not an indicator — it is a level that either has or
+        # has not been breached right now, and waiting for the bar to close is
+        # how a 5% stop becomes a 9% loss.
+        stop = context.active_stop
+        if stop is not None:
+            if snapshot.last_price <= stop:
+                reasons.append(
+                    f"STOP BREACHED: price {snapshot.last_price:.2f} at or below "
+                    f"stop {stop:.2f} — exit now"
+                )
+            else:
+                # The stop here is managed, not resting at the broker. A bar
+                # that pierced the level and recovered would still have taken a
+                # real stop order out, so the position is treated as stopped
+                # rather than quietly held at a level we said we would not hold.
+                bar = snapshot.last_bar
+                if bar is not None and bar.low <= stop:
+                    reasons.append(
+                        f"STOP BREACHED intrabar: low {bar.low:.2f} touched stop "
+                        f"{stop:.2f} (close {bar.close:.2f}) — a resting stop "
+                        "would have filled"
+                    )
+
         # The premise was "uptrend intact". Losing the 50-day says it is not.
         if ind.sma_50 is not None and price < ind.sma_50:
             reasons.append(f"price {price:.2f} closed below SMA50 {ind.sma_50:.2f} — thesis broken")
@@ -233,14 +259,25 @@ class TrendPullbackStrategy(Strategy):
         if ind.rsi_14 is not None and ind.rsi_14 >= float(p("exit_rsi")):
             reasons.append(f"RSI {ind.rsi_14:.1f} at/above exit threshold {float(p('exit_rsi')):g}")
 
+        metrics = {
+            "rsi_14": ind.rsi_14,
+            "active_stop": float(stop) if stop is not None else None,
+            "last_price": float(snapshot.last_price),
+        }
+
         if not reasons:
+            note = (
+                "holding: no exit condition met"
+                if stop is not None
+                else "holding: no exit condition met (no stop on record to check)"
+            )
             return Signal(
                 symbol=snapshot.symbol,
                 strategy=self.name,
                 strength=SignalStrength.NONE,
                 reference_price=price,
-                reasons=["holding: no exit condition met"],
-                metrics={"rsi_14": ind.rsi_14},
+                reasons=[note],
+                metrics=metrics,
             )
 
         return Signal(
@@ -250,8 +287,9 @@ class TrendPullbackStrategy(Strategy):
             side=Side.SELL,
             confidence=1.0,
             reference_price=price,
+            stop_price=stop,
             reasons=reasons,
-            metrics={"rsi_14": ind.rsi_14},
+            metrics=metrics,
         )
 
     # ------------------------------------------------------------- confidence

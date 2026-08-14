@@ -97,6 +97,20 @@ class MarketSnapshot(BaseModel):
     last_price: Decimal
     previous_close: Decimal | None = None
 
+    # When the broker's venue printed the trade `last_price` came from — not
+    # when we built this object. `captured_at` cannot answer "is this quote
+    # stale?", because it is set to `now()` at construction and so is always
+    # fresh by definition. `None` means the payload carried no timestamp, which
+    # callers must treat as unknown rather than as recent.
+    quote_as_of: datetime | None = None
+
+    # Top of book, and when it was printed. Tracked separately from the trade
+    # time: outside regular hours a quote can carry a recent book and a stale
+    # last print, or the reverse.
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+    book_as_of: datetime | None = None
+
     bars: list[Bar] = Field(default_factory=list)
     indicators: Indicators = Field(default_factory=Indicators)
     earnings: EarningsEvent | None = None
@@ -132,3 +146,32 @@ class MarketSnapshot(BaseModel):
         """
         bar = self.last_bar
         return bar.close if bar is not None else self.last_price
+
+    @property
+    def spread_pct(self) -> Decimal | None:
+        """Bid/ask spread as a fraction of the mid, or None when unknowable.
+
+        Returns `None` — never `Decimal("0")` — for an unusable book. The broker
+        documents zero bid/ask as its "no book" sentinel, and a crossed or
+        locked book (ask <= bid) is data we cannot interpret. Reporting any of
+        those as a zero spread would pass the tightest possible check on the
+        worst possible information, which is the failure mode the spread gate
+        exists to prevent. Callers must treat None as "refuse", not "fine".
+        """
+        if self.bid is None or self.ask is None:
+            return None
+        if self.bid <= 0 or self.ask <= 0 or self.ask <= self.bid:
+            return None
+        mid = (self.bid + self.ask) / Decimal("2")
+        return (self.ask - self.bid) / mid
+
+    def quote_age_seconds(self, now: datetime) -> float | None:
+        """Seconds since the venue printed this price. None when unknown.
+
+        This is the real freshness question for a market order. Contrast
+        `captured_at`, which only measures how long ago this process assembled
+        the snapshot.
+        """
+        if self.quote_as_of is None:
+            return None
+        return (now - self.quote_as_of).total_seconds()

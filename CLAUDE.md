@@ -143,16 +143,27 @@ enlarge a position is the one coupling this design forbids.
 
 Discovered from the MCP tool schemas, not assumed:
 
+- **The quote carries two prices, and the newer one wins.** `get_equity_quotes`
+  returns `last_trade_price` (regular session) and `last_non_reg_trade_price`
+  (extended hours), each with its own `venue_*_time`. Outside regular hours the
+  extended print is the live one, and reading only `last_trade_price` quotes a
+  price hours stale. There is **no `updated_at`** — every timestamp is
+  per-field, and `bid_price`/`ask_price` of `0` mean "no book", not a zero
+  spread. `build_snapshot` handles all of this; do not re-derive it in prose.
 - **Fractional and dollar-denominated orders must be `type: market`,
   `market_hours: regular_hours`.** A fractional *limit* order is rejected. Since
   a small account can only take a position in a high-priced name fractionally,
-  entries are market orders — so `preflight` bounds spread and price drift
-  instead, and that check is load-bearing.
+  entries are market orders — so `preflight` bounds quote age, real bid/ask
+  spread, and price drift separately, and all three are load-bearing. Each
+  refuses on *unknown*: a missing timestamp or an unusable book blocks the
+  order rather than passing.
 - **The entry order cannot carry a stop.** `stop_price` selects a stop order
   *type*; it does not attach protection to a market buy. Stops in this system
-  are **managed** — after a fill, place a separate `stop_market` order or the
-  position is unprotected between cycles. This is the single most important
-  operational gap; never describe a position as protected when it is not.
+  are **managed**, and only half-enforced today: `trend_pullback` exits when the
+  live price or a bar low breaches the level recorded in the journal, but **no
+  `stop_market` order is placed at the broker**, so between cycles the position
+  is genuinely unprotected. This is the single most important operational gap;
+  never describe a position as protected when it is not.
 - **`ref_id` must be a UUID** and is the broker's idempotency key. The risk
   engine derives it deterministically (UUIDv5) so a re-fired cycle dedupes on
   both sides.

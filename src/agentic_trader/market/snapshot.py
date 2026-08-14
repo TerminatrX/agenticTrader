@@ -69,6 +69,45 @@ def _float(value: Any) -> float | None:
         return None
 
 
+def _positive(value: Decimal | None) -> Decimal | None:
+    """Treat non-positive prices as absent.
+
+    The broker's quote guide says to drop bid/ask when zero: zero is its "no
+    book right now" sentinel, not a real price. Carrying it through would make
+    an absent book look like an infinitely tight one.
+    """
+    return value if value is not None and value > 0 else None
+
+
+def _select_last_price(q: dict[str, Any]) -> tuple[Decimal | None, datetime | None]:
+    """Pick the current price the way the broker documents it.
+
+    The quote carries two prints — the regular-session `last_trade_price` and
+    the extended-hours `last_non_reg_trade_price` — each with its own venue
+    timestamp, and the more recent one is the live price. Reading only the
+    regular print means that after the close we quote a price hours old while
+    the book has moved on; the returned timestamp is what makes that detectable
+    downstream, so price and clock always come from the same print.
+    """
+    candidates = [
+        (_dec(q.get("last_trade_price"), "last_trade_price"), _dt(q.get("venue_last_trade_time"))),
+        (
+            _dec(q.get("last_non_reg_trade_price"), "last_non_reg_trade_price"),
+            _dt(q.get("venue_last_non_reg_trade_time")),
+        ),
+    ]
+    priced = [(p, t) for p, t in candidates if p is not None]
+    if not priced:
+        return None, None
+
+    timed = [(p, t) for p, t in priced if t is not None]
+    if timed:
+        return max(timed, key=lambda pair: pair[1])
+    # Prices but no timestamps: fall back to the regular print and report an
+    # unknown age rather than inventing one.
+    return priced[0][0], None
+
+
 def _first_result(payload: Any, symbol: str) -> dict[str, Any] | None:
     """Pull this symbol's entry out of a multi-symbol MCP response."""
     data = _unwrap(payload)
@@ -227,6 +266,10 @@ def build_snapshot(
 
     last_price: Decimal | None = None
     previous_close: Decimal | None = None
+    quote_as_of: datetime | None = None
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+    book_as_of: datetime | None = None
     tradable = True
     staleness_note: str | None = None
 
@@ -234,11 +277,18 @@ def build_snapshot(
     if quote_entry:
         q = quote_entry.get("quote", quote_entry)
         if isinstance(q, dict):
-            last_price = _dec(q.get("last_trade_price"), "last_trade_price")
+            last_price, quote_as_of = _select_last_price(q)
             previous_close = _dec(
                 q.get("adjusted_previous_close") or q.get("previous_close"),
                 "previous_close",
             )
+            bid = _positive(_dec(q.get("bid_price"), "bid_price"))
+            ask = _positive(_dec(q.get("ask_price"), "ask_price"))
+            bid_time = _dt(q.get("venue_bid_time"))
+            ask_time = _dt(q.get("venue_ask_time"))
+            # The older of the two sides is how stale the book is as a whole.
+            times = [t for t in (bid_time, ask_time) if t is not None]
+            book_as_of = min(times) if times else None
             state = q.get("state")
             if q.get("has_traded") is False or (state and state != "active"):
                 tradable = False
@@ -275,6 +325,10 @@ def build_snapshot(
         captured_at=now,
         last_price=last_price,
         previous_close=previous_close,
+        quote_as_of=quote_as_of,
+        bid=bid,
+        ask=ask,
+        book_as_of=book_as_of,
         bars=bars,
         indicators=indicator_state,
         earnings=parse_next_earnings(earnings, now.date()) if earnings else None,

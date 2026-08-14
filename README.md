@@ -167,7 +167,9 @@ with a test proving it blocks.
 | `max_position_pct`, `max_open_positions`, `max_portfolio_exposure_pct` | Concentration ceilings. |
 | `max_stop_pct` | A stop this wide means the setup is too loose to size. |
 | `earnings_blackout_days`, `symbol_cooldown_days` | Event and behavioural gates. |
-| `min_avg_volume_30d`, `max_spread_pct` | Liquidity and execution quality. |
+| `min_avg_volume_30d` | Liquidity floor. |
+| `max_spread_pct` | Real bid/ask spread at submission — paid in full on a market order. |
+| `max_price_drift_pct` | How far price may move from the decision price before the setup is re-evaluated rather than chased. |
 
 Three behaviours that are deliberate and will otherwise look like bugs:
 
@@ -186,6 +188,29 @@ Three behaviours that are deliberate and will otherwise look like bugs:
 Config is cross-validated, so contradictory setups fail at startup rather than
 behaving strangely later — a kill switch at or below the daily limit, or a
 position ceiling above the sector ceiling, are both rejected outright.
+
+### Unknown is refused, never assumed benign
+
+The last gate before an order exists is `preflight`, and all three of its checks
+treat missing data as a failure rather than a pass:
+
+| Check | Refuses when |
+|---|---|
+| Quote age | The quote's **venue timestamp** is older than 120s — **or absent**. |
+| Spread | Bid/ask is missing, zero (the broker's no-book sentinel), or crossed. |
+| Drift | Live price has run away from the price the decision was made at. |
+
+This is worth stating because the earlier version of all three was unfalsifiable.
+Staleness was measured against `captured_at`, which is stamped `now()` when the
+snapshot is built — so every snapshot looked fresh, including one replayed from
+a stored bundle months later. The spread check compared the live price to the
+decision price, which is drift, not spread; bid and ask were never read at all.
+Both passed every test they had.
+
+A control that cannot fail is worse than a missing one, because it earns trust
+it has not done anything to deserve. `spread_pct` returns `None` rather than
+`Decimal("0")` for an unusable book for exactly this reason: a zero spread would
+sail through the tightest possible threshold on the worst possible information.
 
 ### The critic may shrink a trade, never grow it
 
@@ -241,11 +266,18 @@ Layer 1 constrains this agent; layer 2 catches everything. Neither is meant to
 stop a determined human, and layer 1 is a speed bump rather than a boundary —
 the lock is the boundary.
 
-**Known gap:** the entry order cannot carry a broker-native stop. Stops are
-*managed* — a separate `stop_market` order must follow the fill, or the
-position is unprotected between cycles. This is documented everywhere it
-matters and is the first thing to close before live trading. It is also why
-`estimated_max_loss` is named a *modeled* loss and not a floor.
+**Known gap:** the entry order cannot carry a broker-native stop. Stops here are
+*managed*, and only half of that is currently implemented:
+
+- **Done** — the strategy enforces the stop each cycle. It exits when the live
+  price is at or below the level, and also when a bar's *low* touched it even if
+  price recovered, since a resting order would have filled there. The level
+  comes from the open trade record in the journal, which is the only place it is
+  written down.
+- **Not done** — no `stop_market` order is placed at the broker after a fill.
+  Between cycles the position is genuinely unprotected, and an overnight gap can
+  exceed the modeled loss. This is why `estimated_max_loss` is named a *modeled*
+  loss and not a floor, and it is the last thing to close before live trading.
 
 ## Layout
 
@@ -275,16 +307,16 @@ config/
 
 In rough priority order:
 
-1. **Close the managed-stop gap** — place the protective `stop_market` order
-   after a fill. Until this lands, the configured stop is advisory between
-   cycles, which makes it the most important open item by some distance.
-2. **Bid/ask capture** — the quote is parsed but the spread is dropped, and
-   spread is the real execution risk on a market order.
-3. **ATR-scaled stops**, replacing the flat percentage.
-4. **Market-level regime** from SPY, so the strategy stops buying pullbacks
+1. **Place the protective `stop_market` order after a fill** — the remaining
+   half of the managed-stop gap, and the only item here that touches the
+   live-order path. The strategy now acts on a breached stop, but between
+   cycles nothing at the broker does.
+2. **ATR-scaled stops**, replacing the flat percentage. `atr_14` is already
+   parsed into the model but no skill fetches it and nothing reads it.
+3. **Market-level regime** from SPY, so the strategy stops buying pullbacks
    into a falling market.
-5. **A more diversified universe**, which the sector cap now demands.
-6. **Universe scanner**, `ApprovalExecutor` recording who approved what, and
+4. **A more diversified universe**, which the sector cap now demands.
+5. **Universe scanner**, `ApprovalExecutor` recording who approved what, and
    normalized `agent_decisions` / `daily_performance` journal tables.
 
 ## Status
@@ -292,6 +324,6 @@ In rough priority order:
 Shadow mode. `trend_pullback` implemented and tested; `momentum` stubbed.
 **No live trades placed.**
 
-82 tests, ruff clean. Test coverage is weighted toward the negative cases —
+107 tests, ruff clean. Test coverage is weighted toward the negative cases —
 every risk gate has a test proving it *blocks*, because a limit that silently
 fails open is worse than no limit at all.

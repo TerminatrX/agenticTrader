@@ -33,6 +33,13 @@ class StrategyContext:
     position: Position | None = None
     params: dict[str, Any] = field(default_factory=dict)
 
+    # The protective stop recorded when this position was opened. It does not
+    # come from the broker: stops here are managed, so no resting order exists
+    # and nothing enforces the level unless a strategy checks it. `None` means
+    # no open trade record was found, which a strategy must treat as "unknown",
+    # never as "no stop was set".
+    active_stop: Decimal | None = None
+
     @property
     def holds_position(self) -> bool:
         return self.position is not None and self.position.quantity > 0

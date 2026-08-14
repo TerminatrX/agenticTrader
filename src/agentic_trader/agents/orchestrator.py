@@ -99,6 +99,7 @@ def run_cycle(
     known_client_keys: set[str] | None = None,
     last_loss_exit: date | None = None,
     recent_symbol_trades: int = 0,
+    active_stop: Decimal | None = None,
     now: datetime | None = None,
 ) -> CycleResult:
     """Evaluate one symbol under one strategy."""
@@ -125,6 +126,7 @@ def run_cycle(
         context = StrategyContext(
             position=account.position_in(snapshot.symbol),
             params=dict(entry.params) if entry else {},
+            active_stop=active_stop,
         )
         signal = strategy.evaluate(snapshot, context)
     except Exception as exc:  # A broken strategy must not halt the whole run.
@@ -204,6 +206,7 @@ def run_cycle(
             snapshot,
             account.account_number,
             max_spread_pct=config.risk.max_spread_pct,
+            max_price_drift_pct=config.risk.max_price_drift_pct,
             mode="live" if mode == "live" else "shadow",
             known_client_keys=known_client_keys,
             now=current,

@@ -116,9 +116,25 @@ class RiskConfig(BaseModel):
         ),
     )
 
-    # --- Liquidity --------------------------------------------------------
+    # --- Liquidity and execution quality ----------------------------------
     min_avg_volume_30d: Decimal = Field(default=Decimal("500000"), ge=0)
-    max_spread_pct: Decimal = Field(default=Decimal("0.005"), gt=0, le=Decimal("0.1"))
+    max_spread_pct: Decimal = Field(
+        default=Decimal("0.005"), gt=0, le=Decimal("0.1"),
+        description=(
+            "Widest tolerated bid/ask spread, as a fraction of the mid. Entries "
+            "are market orders by broker constraint, so the spread is paid in "
+            "full on every fill."
+        ),
+    )
+    max_price_drift_pct: Decimal = Field(
+        default=Decimal("0.005"), gt=0, le=Decimal("0.1"),
+        description=(
+            "How far the live price may move from the price the decision was "
+            "made at before the setup must be re-evaluated rather than chased. "
+            "Distinct from max_spread_pct: that is the cost of crossing the "
+            "book now, this is the staleness of the thesis."
+        ),
+    )
 
     # --- Kill switch ------------------------------------------------------
     halt_file: str = Field(

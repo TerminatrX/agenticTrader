@@ -90,6 +90,13 @@ def bullish_pullback_snapshot() -> MarketSnapshot:
         captured_at=datetime(2026, 8, 13, 17, 44, tzinfo=UTC),
         last_price=Decimal("303.54"),
         previous_close=Decimal("302.25"),
+        # Quote printed a second before we captured it, with a ~0.02% book —
+        # roughly what AAPL actually quotes. Preflight now requires both: a
+        # venue timestamp to age the price, and a usable book to bound spread.
+        quote_as_of=datetime(2026, 8, 13, 17, 43, 59, tzinfo=UTC),
+        bid=Decimal("303.51"),
+        ask=Decimal("303.57"),
+        book_as_of=datetime(2026, 8, 13, 17, 43, 59, tzinfo=UTC),
         bars=make_bars(["308.26", "304.91", "302.25"]),
         indicators=Indicators(
             as_of=datetime(2026, 8, 12, tzinfo=UTC),

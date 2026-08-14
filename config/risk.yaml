@@ -64,11 +64,19 @@ symbol_cooldown_days: 2
 # on unless the account is upgraded to margin.
 respect_unsettled_funds: true
 
-# --- Liquidity ----------------------------------------------------------
+# --- Liquidity and execution quality ------------------------------------
 min_avg_volume_30d: 500000
-# Doubles as the maximum tolerated drift between the decision price and the
-# submission price, since fractional orders must be market orders.
+
+# Two different risks, deliberately separated. They previously shared one key,
+# which meant only one of them was ever actually measured.
+#
+# max_spread_pct      the real bid/ask spread at submission. Fractional orders
+#                     must be market orders, so this cost is paid on every fill.
+# max_price_drift_pct how far the live price has moved from the price the
+#                     decision was made at. Wide drift means the setup changed
+#                     and should be re-evaluated, not chased.
 max_spread_pct: 0.005
+max_price_drift_pct: 0.005
 
 # --- Kill switch --------------------------------------------------------
 # `touch HALT` at the project root stops all order construction immediately.

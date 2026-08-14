@@ -74,6 +74,7 @@ def preflight(
     snapshot: MarketSnapshot,
     *,
     max_spread_pct: Decimal,
+    max_price_drift_pct: Decimal,
     max_quote_age_seconds: int = 120,
     now: datetime | None = None,
     known_client_keys: set[str] | None = None,
@@ -102,23 +103,56 @@ def preflight(
         raise PreflightError(f"symbol not tradable: {snapshot.staleness_note}")
 
     current = now or datetime.now(UTC)
-    age = (current - snapshot.captured_at).total_seconds()
-    if age > max_quote_age_seconds:
+
+    # 1. Quote age, measured from the venue's own print time. Deliberately not
+    # `captured_at`, which is set to now() when the snapshot is built and so
+    # reports every snapshot as fresh — including one replayed from a bundle
+    # months later.
+    quote_age = snapshot.quote_age_seconds(current)
+    if quote_age is None:
         raise PreflightError(
-            f"snapshot is {age:.0f}s old (limit {max_quote_age_seconds}s) — "
+            "quote carries no venue timestamp, so its age cannot be verified — "
+            "refusing to submit a market order against an unknown-age price"
+        )
+    if quote_age > max_quote_age_seconds:
+        raise PreflightError(
+            f"quote is {quote_age:.0f}s old (limit {max_quote_age_seconds}s) — "
             "re-fetch the quote before submitting a market order"
         )
-    notes.append(f"snapshot age {age:.0f}s")
+    notes.append(f"quote age {quote_age:.0f}s")
 
-    # A market order with a wide spread is how a small account donates money.
+    # 2. Spread. Entries are market orders by broker constraint, so this is paid
+    # in full on every fill — a wide spread is how a small account donates money.
+    spread = snapshot.spread_pct
+    if spread is None:
+        raise PreflightError(
+            "no usable bid/ask (missing, zero, or crossed book) — the spread on "
+            "a market order cannot be bounded, so the order is refused"
+        )
+    if spread > max_spread_pct:
+        raise PreflightError(
+            f"spread is {spread:.2%} (bid {snapshot.bid}, ask {snapshot.ask}), "
+            f"exceeding {max_spread_pct:.2%} — the fill would give back more "
+            "than the setup is worth"
+        )
+    notes.append(f"spread {spread:.2%} within tolerance")
+
+    # 3. Drift between the price the decision was made at and the live price.
+    # A separate question from the spread: this one asks whether the setup still
+    # exists, not what crossing the book costs.
     drift = abs(snapshot.last_price - intent.reference_price) / intent.reference_price
-    if drift > max_spread_pct:
+    if drift > max_price_drift_pct:
         raise PreflightError(
             f"price moved {drift:.2%} from the decision reference "
             f"({intent.reference_price:.2f} -> {snapshot.last_price:.2f}), "
-            f"exceeding {max_spread_pct:.2%} — re-evaluate rather than chase"
+            f"exceeding {max_price_drift_pct:.2%} — re-evaluate rather than chase"
         )
     notes.append(f"price drift {drift:.2%} within tolerance")
+
+    # Reported, never gated: how long this process took between assembling the
+    # snapshot and reaching here. Useful for spotting a slow cycle; it says
+    # nothing about whether the market data is current.
+    notes.append(f"pipeline latency {(current - snapshot.captured_at).total_seconds():.0f}s")
 
     return notes
 
@@ -129,6 +163,7 @@ def build_order_payload(
     account_number: str,
     *,
     max_spread_pct: Decimal = Decimal("0.005"),
+    max_price_drift_pct: Decimal = Decimal("0.005"),
     mode: Literal["live", "shadow"] = "shadow",
     use_dollar_amount: bool = True,
     known_client_keys: set[str] | None = None,
@@ -145,6 +180,7 @@ def build_order_payload(
         decision,
         snapshot,
         max_spread_pct=max_spread_pct,
+        max_price_drift_pct=max_price_drift_pct,
         known_client_keys=known_client_keys,
         now=now,
     )

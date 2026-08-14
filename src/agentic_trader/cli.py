@@ -149,6 +149,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     known_keys: set[str] = set()
     last_loss: date | None = None
     recent_trades = 0
+    active_stop: Decimal | None = None
     if not args.no_journal:
         try:
             repo = JournalRepository(args.db or _default_db(config.project_root))
@@ -158,6 +159,17 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             recent_trades = len(
                 [t for t in repo.closed_trades() if t.symbol == symbol.upper()]
             )
+            # The stop that was set when this position was opened. Nothing at
+            # the broker enforces it — stops here are managed — so the journal
+            # is the only record of it, and the strategy cannot check a level it
+            # is never told. Where several lots are open, the highest stop wins:
+            # it is the one that would trigger first.
+            stops = [
+                t.stop_price
+                for t in repo.open_trades()
+                if t.symbol == symbol.upper() and t.stop_price is not None
+            ]
+            active_stop = max(stops) if stops else None
         except Exception as exc:  # noqa: BLE001 - journal must never block a decision
             repo = None
             known_keys = set()
@@ -173,6 +185,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             known_client_keys=known_keys,
             last_loss_exit=last_loss,
             recent_symbol_trades=recent_trades,
+            active_stop=active_stop,
         )
     except Exception as exc:  # noqa: BLE001
         return _fail(f"cycle failed: {exc!r}", EXIT_ERROR)

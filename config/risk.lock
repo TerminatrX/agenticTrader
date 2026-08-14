@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256",
-  "fingerprint": "1857ec0e300f24fdc5ea1bdcf8b1bd62b56a665846cc17428f8a0268579774ed",
+  "fingerprint": "7dbebdc0bd58a86c768ce51b415cd1552b824757625e4d61313d917bec7f3866",
   "values": {
     "default_stop_pct": "0.05",
     "earnings_blackout_days": 3,
@@ -11,6 +11,7 @@
     "max_order_notional": "25.0",
     "max_portfolio_exposure_pct": "0.8",
     "max_position_pct": "0.25",
+    "max_price_drift_pct": "0.005",
     "max_sector_exposure_pct": "0.25",
     "max_spread_pct": "0.005",
     "max_stop_pct": "0.12",

@@ -170,11 +170,19 @@ def critique(
 
     # --- Data quality -----------------------------------------------------
 
-    age_seconds = (current - snapshot.captured_at).total_seconds()
-    if age_seconds > 900:
-        report.block(f"snapshot is {age_seconds / 60:.0f} minutes old — refuse to trade on it")
+    # Age of the price itself, from the venue's print time. `captured_at` cannot
+    # answer this: it is stamped when the snapshot object is built, so it
+    # reports "fresh" even for a quote served from a stale cache.
+    age_seconds = snapshot.quote_age_seconds(current)
+    if age_seconds is None:
+        report.block(
+            "quote carries no venue timestamp — its age is unknown, and unknown "
+            "is not the same as fresh"
+        )
+    elif age_seconds > 900:
+        report.block(f"quote is {age_seconds / 60:.0f} minutes old — refuse to trade on it")
     elif age_seconds > 300:
-        report.concern(f"snapshot is {age_seconds / 60:.0f} minutes old", 0.10)
+        report.concern(f"quote is {age_seconds / 60:.0f} minutes old", 0.10)
 
     if snapshot.indicators.as_of is not None:
         indicator_age = (current.date() - snapshot.indicators.as_of.date()).days
@@ -201,11 +209,22 @@ def critique(
 
     # --- Thesis coherence -------------------------------------------------
 
+    # UNKNOWN is checked first: it does not permit long entry either, so leaving
+    # it to the general branch below would report "contradicts the strategy
+    # premise" for what is really absent data. Both block; only one is true.
     regime = classify_regime(snapshot)
-    if intent.side is Side.BUY and not regime.allows_long_entry:
+    if regime is Regime.UNKNOWN:
+        if intent.side is Side.BUY:
+            report.block(
+                "regime could not be classified — entering long without trend "
+                "context is trading on absent data"
+            )
+        else:
+            report.concern(
+                "regime could not be classified — trading without trend context", 0.15
+            )
+    elif intent.side is Side.BUY and not regime.allows_long_entry:
         report.block(f"long entry in a {regime.value} regime contradicts the strategy premise")
-    elif regime is Regime.UNKNOWN:
-        report.concern("regime could not be classified — trading without trend context", 0.15)
 
     if intent.side is Side.BUY and signal.confidence < 0.5:
         report.concern(f"confidence {signal.confidence:.2f} is weak for a new position")
