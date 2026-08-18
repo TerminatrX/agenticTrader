@@ -25,6 +25,7 @@ from typing import Any
 
 from agentic_trader.journal.models import AuditEntry, CycleOutcome, TradeRecord
 from agentic_trader.models import ProtectionState
+from agentic_trader.universe.candidate import funnel_counts
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit (
@@ -126,7 +127,7 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     unique_discovered        INTEGER NOT NULL DEFAULT 0,
     duplicates_removed       INTEGER NOT NULL DEFAULT 0,
     selected_for_enrichment  INTEGER NOT NULL DEFAULT 0,
-    truncated_candidate_count INTEGER NOT NULL DEFAULT 0,
+    budget_deferred_count    INTEGER NOT NULL DEFAULT 0,
     coverage_status          TEXT NOT NULL,
     coverage_complete        INTEGER NOT NULL DEFAULT 0,
     scan_config_json         TEXT,
@@ -355,7 +356,7 @@ class JournalRepository:
         scanner_profile_ref: str | None = None,
         scan_config: dict[str, Any] | None = None,
         selected_count: int = 0,
-        truncated_count: int = 0,
+        budget_deferred_count: int = 0,
         completed_at: datetime | None = None,
     ) -> None:
         """Persist a discovery run and every candidate it produced.
@@ -365,13 +366,14 @@ class JournalRepository:
         "the strategy declined it" from "we never looked", and those two answer
         completely different questions about why a day produced no trades.
         """
+        rows = list(candidates if candidates is not None else batch.candidates)
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO scan_runs (
                     run_id, source, scanner_profile_ref, started_at, completed_at,
                     shard_count, returned_before_dedupe, unique_discovered,
                     duplicates_removed, selected_for_enrichment,
-                    truncated_candidate_count, coverage_status, coverage_complete,
+                    budget_deferred_count, coverage_status, coverage_complete,
                     scan_config_json, funnel_counts_json
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
@@ -385,11 +387,11 @@ class JournalRepository:
                     len(batch.candidates),
                     batch.duplicates_removed,
                     selected_count,
-                    truncated_count,
+                    budget_deferred_count,
                     batch.coverage.value,
                     int(batch.coverage_complete),
                     json.dumps(scan_config) if scan_config else None,
-                    json.dumps(batch.counts()),
+                    json.dumps(funnel_counts(rows)),
                 ),
             )
             conn.executemany(
@@ -409,7 +411,7 @@ class JournalRepository:
                         json.dumps(c.source_values) if c.source_values else None,
                         c.discovered_at.isoformat(),
                     )
-                    for c in (candidates if candidates is not None else batch.candidates)
+                    for c in rows
                 ],
             )
 

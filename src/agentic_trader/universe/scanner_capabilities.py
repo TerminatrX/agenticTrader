@@ -4,9 +4,16 @@ Separate from the order-execution profile in `execution.capabilities` because
 the two evolve independently: a change to the filter vocabulary should not
 force a version bump on claims about `place_equity_order`, and vice versa.
 
-Every claim here is `EMPIRICALLY_VERIFIED` — this profile was written from
-observed responses rather than from tool descriptions, and in two cases the
-observation contradicted what the documentation implied.
+Most claims here are `EMPIRICALLY_VERIFIED` — this profile was written from
+observed responses rather than tool descriptions, and in two cases the
+observation contradicted what the documentation implied. Where a claim was not
+exercised its evidence says so; read the evidence rather than assuming.
+
+Deliberately excluded: anything describing a *particular saved scan*. Its
+filters, its sort, its column list, its shard ids all live in
+`scan_definition`, because retuning a filter must not bump a profile about the
+endpoint, and a change to the endpoint must not invalidate a record of the
+filters we were running.
 """
 
 from __future__ import annotations
@@ -43,8 +50,6 @@ class ScannerCapabilities(CapabilityProfile):
     max_rows_per_run: int
     row_instrument_type: str
     filter_instrument_type: str
-    default_row_fields: tuple[str, ...]
-    default_sorting: str
 
     def fingerprint_items(self) -> tuple[str, ...]:
         return (
@@ -52,8 +57,6 @@ class ScannerCapabilities(CapabilityProfile):
             f"max_rows_per_run={self.max_rows_per_run}",
             f"row_instrument_type={self.row_instrument_type}",
             f"filter_instrument_type={self.filter_instrument_type}",
-            "default_row_fields=" + ",".join(sorted(self.default_row_fields)),
-            f"default_sorting={self.default_sorting}",
         )
 
     def coverage_for(self, returned_count: int) -> CoverageStatus:
@@ -116,30 +119,5 @@ ROBINHOOD_MCP_SCANNER = ScannerCapabilities(
     # nothing, which is how this was found.
     row_instrument_type="EQUITY",
     filter_instrument_type="STOCK",
-    default_row_fields=(
-        "% Change",
-        "Asset type",
-        "Average volume",
-        "Last",
-        "Market cap",
-        "Name",
-        "Net change",
-        "RSI",
-        "Relative volume",
-        "Symbol",
-        "Volume",
-    ),
-    default_sorting="Market cap desc",
 )
 
-
-# The saved scans backing production discovery. Market-cap bands chosen so each
-# returns strictly under `max_rows_per_run`; if one ever reaches the cap, split
-# it again rather than accepting a truncated universe.
-DISCOVERY_SHARD_IDS: tuple[str, ...] = (
-    "cc72022a-5f93-4c66-a69e-369dc6c89d92",  # Mega   >$100B
-    "cccffcd4-8c3d-452c-ba23-23c71308030e",  # Large  $20B-$100B
-    "795e9148-25fa-4678-a2b6-13ced4cbb025",  # Mid    $8B-$20B
-    "bd7d315f-db05-4fda-b937-b31b1989ce24",  # Small  $4B-$8B
-    "813dd065-f51b-47de-9eff-ef112295a3de",  # Micro  $2B-$4B
-)

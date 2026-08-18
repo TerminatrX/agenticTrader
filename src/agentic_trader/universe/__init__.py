@@ -11,39 +11,57 @@ from agentic_trader.universe.candidate import (
     DiscoveryBatch,
     FunnelStage,
     ScanCandidate,
+    ShardError,
     ShardResult,
+    funnel_counts,
+    resolve_coverage,
 )
 from agentic_trader.universe.discovery import (
     DiscoverySource,
+    IdentityConflict,
     ScannerSource,
     StaticSource,
     parse_scan_payload,
 )
+from agentic_trader.universe.scan_definition import (
+    DISCOVERY_V1,
+    ScanDefinition,
+    ShardSpec,
+)
 from agentic_trader.universe.scanner_capabilities import (
-    DISCOVERY_SHARD_IDS,
     ROBINHOOD_MCP_SCANNER,
     ScannerCapabilities,
 )
 from agentic_trader.universe.selection import (
     BUDGET_EXHAUSTED,
+    UNKNOWN_SECTOR_LIMIT,
     SelectionResult,
+    rotation_key,
     select_for_enrichment,
 )
 
 __all__ = [
     "BUDGET_EXHAUSTED",
-    "DISCOVERY_SHARD_IDS",
+    "DISCOVERY_V1",
     "ROBINHOOD_MCP_SCANNER",
+    "UNKNOWN_SECTOR_LIMIT",
     "CoverageStatus",
     "DiscoveryBatch",
     "DiscoverySource",
     "FunnelStage",
+    "IdentityConflict",
     "ScanCandidate",
+    "ScanDefinition",
     "ScannerCapabilities",
     "ScannerSource",
     "SelectionResult",
+    "ShardError",
     "ShardResult",
+    "ShardSpec",
     "StaticSource",
+    "funnel_counts",
     "parse_scan_payload",
+    "resolve_coverage",
+    "rotation_key",
     "select_for_enrichment",
 ]

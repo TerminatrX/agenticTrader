@@ -1,17 +1,20 @@
 """Discovery, coverage, and the enrichment budget.
 
-The load-bearing test in this file is the last one: a candidate's
-`source_values` can be arbitrarily wrong without changing any decision, because
-only the symbol crosses into authoritative enrichment. Everything else here
-protects the two properties that make discovery honest — coverage is proven
-from row counts rather than a field observed to be unreliable, and the budget
-spreads across sectors instead of reproducing the concentration the sector cap
-exists to prevent.
+The load-bearing test here is the trust boundary: a candidate's `source_values`
+can be arbitrarily wrong without changing any decision, because only the symbol
+crosses into authoritative enrichment.
+
+Most of the rest defend against a single failure mode — claiming to have seen
+more of the universe than we did. Coverage can be overstated by a missing
+shard, by an unparseable shard, by a malformed row shortening a capped result
+below the cap, or by trusting a broker field observed to contradict itself.
+Each has a test, because every one of them reads downstream as "the market was
+quiet today".
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -19,38 +22,52 @@ import pytest
 from agentic_trader.market.snapshot import build_snapshot
 from agentic_trader.universe import (
     BUDGET_EXHAUSTED,
+    DISCOVERY_V1,
     ROBINHOOD_MCP_SCANNER,
+    UNKNOWN_SECTOR_LIMIT,
     CoverageStatus,
     FunnelStage,
+    IdentityConflict,
     ScanCandidate,
     ScannerSource,
+    ShardError,
     StaticSource,
+    funnel_counts,
     parse_scan_payload,
+    rotation_key,
     select_for_enrichment,
 )
 
 NOW = datetime(2026, 8, 18, 14, 0, tzinfo=UTC)
+DAY = date(2026, 8, 18)
+SHARDS = DISCOVERY_V1.expected_shard_ids
 
 
-def _payload(scan_id: str, tickers: list[str], total: int | None = None):
+def _payload(scan_id: str, tickers, total: int | None = None, extra_rows=()):
+    rows = [
+        {
+            "ticker": t,
+            "instrument_id": f"iid-{t}",
+            "instrument_type": "EQUITY",
+            "columns": {"Symbol": t, "RSI": "40.0", "Market cap": "3.0e+09"},
+        }
+        for t in tickers
+    ]
+    rows.extend(extra_rows)
     return {
         "data": {
             "result": {
                 "scan_id": scan_id,
                 "scan_title": f"shard {scan_id}",
-                "total_items": total if total is not None else len(tickers),
-                "results": [
-                    {
-                        "ticker": t,
-                        "instrument_id": f"iid-{t}",
-                        "instrument_type": "EQUITY",
-                        "columns": {"Symbol": t, "RSI": "40.0", "Market cap": "3.0e+09"},
-                    }
-                    for t in tickers
-                ],
+                "total_items": total if total is not None else len(rows),
+                "results": rows,
             }
         }
     }
+
+
+def _all_shards():
+    return [_payload(sid, [f"S{i}"]) for i, sid in enumerate(SHARDS)]
 
 
 def _cand(symbol: str, sector: str | None = None) -> ScanCandidate:
@@ -59,37 +76,96 @@ def _cand(symbol: str, sector: str | None = None) -> ScanCandidate:
     ).with_sector(sector)
 
 
-# ------------------------------------------------------------------ coverage
+# ------------------------------------------------------- coverage: shard set
 
 
-def test_a_short_result_set_proves_complete_coverage():
-    shard = parse_scan_payload(_payload("s1", ["AAPL", "MSFT"]), source="x", discovered_at=NOW)
+def test_zero_shards_is_incomplete_not_complete():
+    """`all([])` is True, so an empty run would otherwise claim full coverage —
+    the most dangerous possible wrong answer here."""
+    batch = ScannerSource([], definition=DISCOVERY_V1).discover(now=NOW)
 
-    assert shard.returned_count == 2
-    assert shard.coverage is CoverageStatus.COMPLETE
-    assert shard.coverage_complete
+    assert batch.coverage is CoverageStatus.INCOMPLETE
+    assert not batch.coverage_complete
+    assert len(batch.missing_shard_ids) == 5
+
+
+def test_four_of_five_shards_is_incomplete_even_when_each_is_short():
+    batch = ScannerSource(_all_shards()[:4], definition=DISCOVERY_V1).discover(now=NOW)
+
+    assert batch.coverage is CoverageStatus.INCOMPLETE
+    assert batch.missing_shard_ids == (SHARDS[4],)
+
+
+def test_all_five_short_shards_are_complete():
+    batch = ScannerSource(_all_shards(), definition=DISCOVERY_V1).discover(now=NOW)
+
+    assert batch.coverage is CoverageStatus.COMPLETE
+    assert batch.missing_shard_ids == ()
+    assert len(batch.candidates) == 5
+
+
+def test_an_unparseable_shard_does_not_silently_vanish():
+    payloads = [*_all_shards()[:4], {"data": {"result": {"scan_id": SHARDS[4]}}}]
+    batch = ScannerSource(payloads, definition=DISCOVERY_V1).discover(now=NOW)
+
+    assert batch.coverage is CoverageStatus.INCOMPLETE
+    assert SHARDS[4] in batch.missing_shard_ids
+
+
+def test_a_capped_shard_makes_the_run_unknown_truncated():
+    full = _payload(SHARDS[0], [f"T{i}" for i in range(200)])
+    payloads = [full, *_all_shards()[1:]]
+    batch = ScannerSource(payloads, definition=DISCOVERY_V1).discover(now=NOW)
+
+    assert batch.coverage is CoverageStatus.UNKNOWN_TRUNCATED
+
+
+# --------------------------------------------------- coverage: the row count
+
+
+def test_coverage_uses_raw_rows_not_parsed_candidates():
+    """200 raw rows with one unusable parses to 199 candidates.
+
+    Judging coverage on the parsed count would call that COMPLETE, disguising
+    a response that actually hit the cap.
+    """
+    rows = [f"T{i}" for i in range(199)]
+    shard = parse_scan_payload(
+        _payload("s", rows, extra_rows=[{"instrument_id": "iid-x", "columns": {}}]),
+        source="x",
+        discovered_at=NOW,
+    )
+
+    assert shard.returned_row_count == 200
+    assert shard.candidate_count == 199
+    assert shard.rows_rejected == 1
+    assert shard.coverage is not CoverageStatus.COMPLETE
+
+
+def test_a_row_without_identity_makes_the_shard_incomplete():
+    shard = parse_scan_payload(
+        _payload("s", ["AAPL"], extra_rows=[{"columns": {"RSI": "40"}}]),
+        source="x",
+        discovered_at=NOW,
+    )
+
+    assert shard.coverage is CoverageStatus.INCOMPLETE
+    assert shard.rows_rejected == 1
+    assert [c.symbol for c in shard.candidates] == ["AAPL"]
 
 
 def test_a_full_result_set_is_unknown_not_complete():
-    """200 rows is ambiguous: exactly-200 and truncated-from-more look identical.
-
-    There is no pagination, so nothing can distinguish them — and the broker's
-    own total cannot be used to try.
-    """
-    rows = [f"T{i}" for i in range(ROBINHOOD_MCP_SCANNER.max_rows_per_run)]
-    shard = parse_scan_payload(_payload("s1", rows), source="x", discovered_at=NOW)
-
-    assert shard.returned_count == 200
+    """Exactly-200 and truncated-from-more are indistinguishable without
+    pagination, and there is none."""
+    shard = parse_scan_payload(
+        _payload("s", [f"T{i}" for i in range(200)]), source="x", discovered_at=NOW
+    )
     assert shard.coverage is CoverageStatus.UNKNOWN_TRUNCATED
-    assert not shard.coverage_complete
 
 
 def test_coverage_ignores_the_reported_total():
-    """total_items is not consulted, because it has been observed unreliable.
-
-    Five disjoint shards over one filter definition summed to 668 while the
-    unsharded equivalent reported 394.
-    """
+    """Five disjoint shards summed to 668 while the unsharded equivalent
+    reported 394, so that field cannot establish anything."""
     honest = parse_scan_payload(_payload("s", ["A", "B"], total=2), source="x", discovered_at=NOW)
     lying = parse_scan_payload(_payload("s", ["A", "B"], total=9999), source="x", discovered_at=NOW)
 
@@ -97,18 +173,15 @@ def test_coverage_ignores_the_reported_total():
     assert lying.reported_total == 9999  # recorded, never trusted
 
 
-def test_a_run_is_complete_only_if_every_shard_is():
-    full = [f"T{i}" for i in range(200)]
-    batch = ScannerSource([_payload("a", ["AAPL"]), _payload("b", full)]).discover(now=NOW)
-
-    assert batch.coverage is CoverageStatus.UNKNOWN_TRUNCATED
-    assert not batch.coverage_complete
+def test_a_payload_with_no_result_object_raises():
+    with pytest.raises(ShardError):
+        parse_scan_payload({"nonsense": True}, source="x", discovered_at=NOW)
 
 
-# ------------------------------------------------------------------- shards
+# ------------------------------------------------------------------- dedupe
 
 
-def test_shards_are_unioned_and_deduplicated_by_instrument_id():
+def test_the_same_symbol_dedupes_across_shards():
     batch = ScannerSource(
         [_payload("a", ["AAPL", "MSFT"]), _payload("b", ["MSFT", "NVDA"])]
     ).discover(now=NOW)
@@ -118,20 +191,32 @@ def test_shards_are_unioned_and_deduplicated_by_instrument_id():
     assert batch.duplicates_removed == 1
 
 
+def test_a_missing_instrument_id_still_dedupes():
+    """Keying on `instrument_id or symbol` would give one copy the key "abc"
+    and the other "AAPL", so the duplicate would survive."""
+    with_id = _payload("a", ["AAPL"])
+    without = _payload("b", ["AAPL"])
+    without["data"]["result"]["results"][0]["instrument_id"] = None
+
+    batch = ScannerSource([with_id, without]).discover(now=NOW)
+
+    assert len(batch.candidates) == 1
+    assert batch.duplicates_removed == 1
+    assert batch.candidates[0].instrument_id == "iid-AAPL"  # identity preserved
+
+
+def test_conflicting_instrument_ids_fail_loudly():
+    a = _payload("a", ["AAPL"])
+    b = _payload("b", ["AAPL"])
+    b["data"]["result"]["results"][0]["instrument_id"] = "different-id"
+
+    with pytest.raises(IdentityConflict, match="two instrument ids"):
+        ScannerSource([a, b]).discover(now=NOW)
+
+
 def test_disjoint_shards_remove_nothing():
-    """A non-zero duplicate count is evidence about band boundaries, so zero
-    is worth asserting rather than assuming."""
     batch = ScannerSource([_payload("a", ["AAPL"]), _payload("b", ["MSFT"])]).discover(now=NOW)
-
     assert batch.duplicates_removed == 0
-
-
-def test_rows_without_a_ticker_are_skipped_not_guessed():
-    payload = _payload("a", ["AAPL"])
-    payload["data"]["result"]["results"].append({"instrument_id": "iid-x", "columns": {}})
-    shard = parse_scan_payload(payload, source="x", discovered_at=NOW)
-
-    assert [c.symbol for c in shard.candidates] == ["AAPL"]
 
 
 def test_static_source_is_always_complete():
@@ -144,73 +229,106 @@ def test_static_source_is_always_complete():
 # ------------------------------------------------------- enrichment budget
 
 
-def test_the_budget_spreads_across_sectors_instead_of_taking_a_global_top_n():
-    """The concentration problem this selector exists to avoid.
+def _sel(cands, **kw):
+    kw.setdefault("on", DAY)
+    return select_for_enrichment(cands, **kw)
 
-    Twenty technology candidates and a handful elsewhere must not yield a
-    technology-only budget — the sector gate would then block everything after
-    the first entry, and the run would spend its whole budget to find one trade.
-    """
+
+def test_the_budget_spreads_across_sectors():
     candidates = (
         [_cand(f"TECH{i}", "Technology") for i in range(20)]
-        + [_cand(f"FIN{i}", "Financials") for i in range(5)]
-        + [_cand(f"HLTH{i}", "Healthcare") for i in range(5)]
+        + [_cand(f"FIN{i}", "Financials") for i in range(20)]
+        + [_cand(f"HLTH{i}", "Healthcare") for i in range(20)]
     )
-    result = select_for_enrichment(candidates, budget=9)
+    result = _sel(candidates, budget=25)
 
-    assert len(result.selected) == 9
+    assert len(result.selected) == 25
     assert len(result.per_sector) == 3
-    assert max(result.per_sector.values()) <= 5
+    assert max(result.per_sector.values()) <= 13
 
 
-def test_one_sector_cannot_consume_the_whole_budget():
-    result = select_for_enrichment([_cand(f"T{i}", "Technology") for i in range(50)], budget=10)
+def test_a_single_known_sector_may_fill_the_whole_budget():
+    """The cap allocates compute between sectors. With no other sector to
+    protect, holding capacity back protects nothing — max_sector_exposure_pct
+    still governs what the account may actually hold.
+    """
+    result = _sel([_cand(f"T{i}", "Technology") for i in range(60)], budget=25)
 
-    assert result.per_sector["Technology"] <= 5
-    assert len(result.selected) <= 5
+    assert len(result.selected) == 25
+    assert result.per_sector["Technology"] == 25
 
 
-def test_a_single_sector_still_fills_up_to_its_cap():
-    result = select_for_enrichment([_cand(f"T{i}", "Technology") for i in range(3)], budget=10)
-    assert len(result.selected) == 3
+def test_unknown_sector_never_backfills():
+    """A missing sector means the concentration gate cannot fully assess the
+    position, so an unknown-heavy day deliberately underuses the budget."""
+    result = _sel([_cand(f"U{i}") for i in range(60)], budget=25)
+
+    assert len(result.selected) == 13
+    assert result.per_sector["unknown"] == 13
 
 
-def test_unexamined_candidates_are_recorded_with_a_budget_reason():
-    """A compute limit must never read as a strategy rejection."""
-    result = select_for_enrichment([_cand(f"T{i}", f"S{i % 4}") for i in range(40)], budget=8)
+def test_an_unknown_shortfall_is_not_reported_as_budget_exhaustion():
+    """The budget was not exhausted, so saying so would be false."""
+    result = _sel([_cand(f"U{i}") for i in range(60)], budget=25)
+
+    assert all(c.exit_reason == UNKNOWN_SECTOR_LIMIT for c in result.deferred)
+    assert result.budget_deferred_count == 0
+
+
+def test_a_real_budget_exhaustion_says_so():
+    result = _sel([_cand(f"T{i}", f"S{i % 4}") for i in range(80)], budget=8)
 
     assert len(result.selected) == 8
-    assert result.deferred_count == 32
     assert all(c.exit_reason == BUDGET_EXHAUSTED for c in result.deferred)
 
 
+def test_known_sectors_backfill_around_a_capped_unknown_bucket():
+    mixed = [_cand(f"T{i}", "Technology") for i in range(40)] + [_cand(f"U{i}") for i in range(40)]
+    result = _sel(mixed, budget=25)
+
+    assert len(result.selected) == 25
+    assert result.per_sector["unknown"] <= 13
+    assert result.per_sector["Technology"] >= 12
+
+
 def test_selected_candidates_advance_a_stage():
-    result = select_for_enrichment([_cand("AAPL", "Technology")], budget=5)
+    result = _sel([_cand("AAPL", "Technology")], budget=5)
     assert result.selected[0].stage is FunnelStage.SELECTED
 
 
-def test_unknown_sector_is_ranked_last_but_not_dropped():
-    known = [_cand(f"K{i}", "Technology") for i in range(2)]
-    unknown = [_cand("U1"), _cand("U2")]
-    result = select_for_enrichment(known + unknown, budget=4)
-
-    assert len(result.selected) == 4
-    assert "unknown" in result.per_sector
+def test_a_zero_budget_selects_nothing():
+    result = _sel([_cand("AAPL", "Technology")], budget=0)
+    assert result.selected == []
+    assert result.deferred_count == 1
 
 
-def test_selection_is_deterministic():
-    """A discovery run must replay identically from stored payloads."""
-    c = [_cand(f"T{i}", f"S{i % 3}") for i in range(30)]
-    a = select_for_enrichment(list(c), budget=7)
-    b = select_for_enrichment(list(c), budget=7)
+# ------------------------------------------------------------- rotation
+
+
+def test_selection_is_deterministic_for_one_date():
+    c = [_cand(f"T{i}", f"S{i % 3}") for i in range(40)]
+    a = _sel(list(c), budget=7)
+    b = _sel(list(c), budget=7)
 
     assert [x.symbol for x in a.selected] == [x.symbol for x in b.selected]
 
 
-def test_a_zero_budget_selects_nothing():
-    result = select_for_enrichment([_cand("AAPL", "Technology")], budget=0)
-    assert result.selected == []
-    assert result.deferred_count == 1
+def test_selection_rotates_across_dates():
+    """Sorting by symbol is deterministic but biased: run daily, alphabetically
+    early tickers would consume the budget every time, replacing the broker's
+    market-cap sampling bias with an alphabet one."""
+    c = [_cand(f"T{i:02}", "Technology") for i in range(60)]
+    day1 = {x.symbol for x in _sel(list(c), budget=10, on=date(2026, 8, 18)).selected}
+    day2 = {x.symbol for x in _sel(list(c), budget=10, on=date(2026, 8, 19)).selected}
+
+    assert day1 != day2
+
+
+def test_rotation_key_is_stable_across_processes():
+    """hashlib, not hash() — the builtin is salted per process and would not
+    replay."""
+    assert rotation_key("AAPL", DAY) == rotation_key("AAPL", DAY)
+    assert rotation_key("AAPL", DAY) != rotation_key("AAPL", date(2026, 8, 19))
 
 
 # ------------------------------------------- the trust boundary (load-bearing)
@@ -249,11 +367,10 @@ INDICATORS = {
 def test_a_lying_scanner_cannot_change_the_decision_snapshot():
     """The property the whole discovery architecture rests on.
 
-    Two candidates for the same symbol carrying contradictory scanner values —
-    RSI 12 vs 99, market cap $9T vs $1 — produce byte-identical snapshots,
-    because only `symbol` crosses into enrichment and every value a decision
-    uses is re-fetched. The scanner may be stale, wrong, or computed over a
-    different session; none of it can reach a trade.
+    Two candidates for one symbol carrying contradictory scanner values — RSI
+    12 vs 99, market cap $9T vs $1 — produce identical snapshots, because only
+    `symbol` crosses into enrichment and every value a decision uses is
+    re-fetched.
     """
     honest = ScanCandidate(
         symbol="AAPL", source="scanner", discovered_at=NOW,
@@ -265,9 +382,7 @@ def test_a_lying_scanner_cannot_change_the_decision_snapshot():
     )
 
     snapshots = [
-        build_snapshot(
-            c.symbol, quote=QUOTE, indicators=INDICATORS, captured_at=NOW
-        )
+        build_snapshot(c.symbol, quote=QUOTE, indicators=INDICATORS, captured_at=NOW)
         for c in (honest, lying)
     ]
 
@@ -277,51 +392,62 @@ def test_a_lying_scanner_cannot_change_the_decision_snapshot():
 
 
 def test_source_values_never_appear_in_a_snapshot():
-    """Structural, not conventional: build_snapshot takes a symbol and payloads.
-
-    There is no parameter through which a candidate's scanner columns could be
-    passed, which is what makes the guarantee hold without relying on care.
-    """
+    """Structural, not conventional: there is no parameter through which a
+    candidate's scanner columns could be passed."""
     import inspect
 
     params = set(inspect.signature(build_snapshot).parameters)
-    assert "source_values" not in params
-    assert "candidate" not in params
     assert params == {
         "symbol", "quote", "historicals", "fundamentals",
         "earnings", "indicators", "captured_at",
     }
 
 
-# ------------------------------------------------------ capability profile
+# ------------------------------------------------------ capability / config
 
 
-def test_the_scanner_profile_is_separate_from_the_broker_profile():
+def test_the_scanner_profile_describes_the_endpoint_only():
+    """Scan-specific configuration belongs to the definition, not the profile.
+
+    "Asset type" appearing in the returned columns is an artifact of how these
+    scans were configured; it is not an invariant of run_scan.
+    """
+    fields = {f for f in ROBINHOOD_MCP_SCANNER.__dataclass_fields__}
+
+    assert "default_row_fields" not in fields
+    assert "default_sorting" not in fields
+    assert "Asset type" in DISCOVERY_V1.columns
+
+
+def test_profiles_and_definitions_are_versioned_independently():
     from agentic_trader.execution.capabilities import ROBINHOOD_MCP
 
-    assert ROBINHOOD_MCP_SCANNER.profile_ref == "robinhood-mcp-scanner@2026-08-18"
-    assert ROBINHOOD_MCP_SCANNER.profile_ref != ROBINHOOD_MCP.profile_ref
-    assert ROBINHOOD_MCP_SCANNER.content_fingerprint != ROBINHOOD_MCP.content_fingerprint
+    refs = {
+        ROBINHOOD_MCP.profile_ref,
+        ROBINHOOD_MCP_SCANNER.profile_ref,
+        DISCOVERY_V1.definition_ref,
+    }
+    assert len(refs) == 3
 
 
-def test_the_scanner_fingerprint_covers_semantic_content_not_just_booleans():
-    """A vocabulary change must move the hash.
-
-    Hashing only Capability fields would let the instrument-type vocabulary or
-    the row cap change while profile_ref stayed put, so a stored reference
-    would denote two different contracts.
-    """
+def test_the_scanner_fingerprint_covers_semantics_not_just_booleans():
     import dataclasses
 
     base = ROBINHOOD_MCP_SCANNER.content_fingerprint
-    for field_name, value in [
-        ("max_rows_per_run", 500),
-        ("filter_instrument_type", "EQUITY"),
-        ("default_sorting", "Volume desc"),
-        ("default_row_fields", ("Symbol",)),
-    ]:
-        altered = dataclasses.replace(ROBINHOOD_MCP_SCANNER, **{field_name: value})
-        assert altered.content_fingerprint != base, field_name
+    for name, value in [("max_rows_per_run", 500), ("filter_instrument_type", "EQUITY")]:
+        altered = dataclasses.replace(ROBINHOOD_MCP_SCANNER, **{name: value})
+        assert altered.content_fingerprint != base, name
+
+
+def test_retuning_a_filter_moves_the_definition_fingerprint():
+    """A run recorded under RSI 25-50 must stay interpretable after a retune."""
+    import dataclasses
+
+    retuned = dataclasses.replace(
+        DISCOVERY_V1,
+        base_filters={**DISCOVERY_V1.base_filters, "rsi": {"values": [20, 55]}},
+    )
+    assert retuned.config_fingerprint != DISCOVERY_V1.config_fingerprint
 
 
 def test_the_vocabulary_mismatch_is_recorded():
@@ -334,43 +460,45 @@ def test_the_vocabulary_mismatch_is_recorded():
 def test_freshness_is_recorded_as_absent_but_is_not_a_permission():
     cap = ROBINHOOD_MCP_SCANNER.row_freshness_timestamp
     assert cap.supported is False
-    assert cap.is_certain  # observed, not inferred
+    assert cap.is_certain
     assert not cap.usable
 
 
 # ------------------------------------------------------------------ journal
 
 
-def test_a_discovery_run_persists_every_candidate_including_the_unexamined(tmp_path):
-    """Deferred candidates must survive to the journal.
-
-    A funnel recording only survivors cannot answer why a day produced no
-    trades: it conflates "nothing qualified" with "we ran out of budget".
+def test_stored_funnel_counts_match_the_stored_candidate_stages(tmp_path):
+    """Candidates are immutable, so selection returns new objects. Counting the
+    pre-selection batch would record everything as `discovered` while the rows
+    said otherwise.
     """
     from agentic_trader.journal import JournalRepository
 
     batch = ScannerSource([_payload("a", ["AAPL", "MSFT", "NVDA"])]).discover(now=NOW)
     batch.candidates = [c.with_sector("Technology") for c in batch.candidates]
-    result = select_for_enrichment(batch.candidates, budget=2, max_per_sector=2)
+    result = _sel(batch.candidates, budget=2, max_per_sector=2)
+    persisted = [*result.selected, *result.deferred]
 
     repo = JournalRepository(tmp_path / "j.db")
     repo.record_scan_run(
         "run-1",
         batch,
-        candidates=[*result.selected, *result.deferred],
+        candidates=persisted,
         scanner_profile_ref=ROBINHOOD_MCP_SCANNER.profile_ref,
-        scan_config={"rsi": [25, 50]},
+        scan_config=DISCOVERY_V1.as_config(),
         selected_count=len(result.selected),
-        truncated_count=result.deferred_count,
+        budget_deferred_count=result.budget_deferred_count,
     )
 
-    (run,) = repo.scan_runs()
-    assert run["unique_discovered"] == 3
-    assert run["selected_for_enrichment"] == 2
-    assert run["truncated_candidate_count"] == 1
-    assert run["coverage_complete"] == 1
-    assert run["scanner_profile_ref"] == "robinhood-mcp-scanner@2026-08-18"
+    import json
 
+    (run,) = repo.scan_runs()
     stored = repo.scan_candidates("run-1")
-    assert len(stored) == 3
-    assert sum(1 for c in stored if c["exit_reason"] == BUDGET_EXHAUSTED) == 1
+
+    assert json.loads(run["funnel_counts_json"]) == funnel_counts(persisted)
+    assert json.loads(run["funnel_counts_json"]) == {"selected": 2, "discovered": 1}
+    from collections import Counter
+
+    assert Counter(c["stage"] for c in stored) == Counter({"selected": 2, "discovered": 1})
+    assert run["unique_discovered"] == 3
+    assert run["budget_deferred_count"] == 1
