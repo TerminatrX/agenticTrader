@@ -48,6 +48,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from agentic_trader.agents.discovery import abort_candidates, run_discovery
 from agentic_trader.agents.orchestrator import CycleResult, run_cycle
 from agentic_trader.config import (
     ConfigError,
@@ -63,6 +64,7 @@ from agentic_trader.market.snapshot import SnapshotError, build_snapshot
 from agentic_trader.market.symbol_regime import classify_symbol_regime
 from agentic_trader.models import AccountState
 from agentic_trader.strategies.base import available_strategies
+from agentic_trader.universe import DISCOVERY_V1
 
 EXIT_OK, EXIT_BAD_INPUT, EXIT_ERROR = 0, 1, 2
 
@@ -240,6 +242,70 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             print(f"warning: journal write failed ({exc})", file=sys.stderr)
 
     _emit(_render_result(result, symbol_regime=classify_symbol_regime(snapshot).value))
+    return EXIT_OK
+
+
+def cmd_discover(args: argparse.Namespace) -> int:
+    """Phase one of a multi-symbol cycle: decide what is worth evaluating.
+
+    Consumes batched payloads the agent already fetched and emits a symbol
+    list. Evaluation stays a separate command because it costs roughly seven
+    single-symbol calls per candidate — this phase exists to bound that.
+    """
+    try:
+        bundle = _read_bundle(args.input)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return _fail(f"could not read bundle: {exc}")
+
+    try:
+        config = load_config(Path(args.project_root) if args.project_root else None)
+    except ConfigError as exc:
+        return _fail(str(exc))
+
+    payloads = bundle.get("payloads", {})
+    try:
+        trading_date = (
+            date.fromisoformat(args.date) if args.date else datetime.now(UTC).date()
+        )
+    except ValueError:
+        return _fail(f"--date must be YYYY-MM-DD, got {args.date!r}")
+
+    try:
+        result = run_discovery(
+            scans_payload=payloads.get("scans") or {},
+            run_payloads=payloads.get("runs") or [],
+            fundamentals_payloads=payloads.get("fundamentals") or [],
+            definition=DISCOVERY_V1,
+            trading_date=trading_date,
+            budget=args.budget,
+            max_per_sector=args.max_per_sector,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _fail(f"discovery failed: {exc!r}", EXIT_ERROR)
+
+    if not args.no_journal and not args.dry_run and result.batch is not None:
+        try:
+            repo = JournalRepository(args.db or _default_db(config.project_root))
+            repo.record_scan_run(
+                result.run_id,
+                result.batch,
+                candidates=abort_candidates(result),
+                scanner_profile_ref=result.scanner_profile_ref,
+                scan_definition_ref=result.definition_ref,
+                scan_config_fingerprint=result.config_fingerprint,
+                scan_config=DISCOVERY_V1.as_config(),
+                selected_count=len(result.selected_symbols),
+                budget_deferred_count=(
+                    result.selection.budget_deferred_count if result.selection else 0
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - journal must never block a decision
+            print(f"warning: journal unavailable ({exc})", file=sys.stderr)
+
+    payload = {"ok": True, **result.summary()}
+    # A blocking drift is not an error the agent should retry around; it is a
+    # deliberate refusal, so it exits 0 with an empty selection.
+    _emit(payload)
     return EXIT_OK
 
 
@@ -471,6 +537,18 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--no-journal", action="store_true", help="Skip all journal access.")
     ev.add_argument("--dry-run", action="store_true", help="Evaluate but write nothing.")
     ev.set_defaults(func=cmd_evaluate)
+
+    dc = sub.add_parser(
+        "discover",
+        help="Verify saved scans, union the shards, and select candidates to enrich.",
+    )
+    dc.add_argument("--input", help="Discovery bundle (default: stdin).")
+    dc.add_argument("--budget", type=int, default=25, help="Max candidates to enrich.")
+    dc.add_argument("--max-per-sector", type=int, default=None)
+    dc.add_argument("--date", help="Trading date (YYYY-MM-DD). Defaults to today.")
+    dc.add_argument("--no-journal", action="store_true")
+    dc.add_argument("--dry-run", action="store_true")
+    dc.set_defaults(func=cmd_discover)
 
     rp = sub.add_parser("report", help="Performance and audit summary.")
     rp.add_argument("--strategy", help="Limit to one strategy.")

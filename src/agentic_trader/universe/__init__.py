@@ -24,6 +24,14 @@ from agentic_trader.universe.discovery import (
     StaticSource,
     parse_scan_payload,
 )
+from agentic_trader.universe.drift import (
+    DefinitionDriftStatus,
+    DriftFinding,
+    DriftKind,
+    DriftReport,
+    DriftSeverity,
+    check_definition_drift,
+)
 from agentic_trader.universe.scan_definition import (
     DISCOVERY_V1,
     ScanDefinition,
@@ -47,6 +55,11 @@ __all__ = [
     "ROBINHOOD_MCP_SCANNER",
     "UNKNOWN_SECTOR_LIMIT",
     "CoverageReport",
+    "DefinitionDriftStatus",
+    "DriftFinding",
+    "DriftKind",
+    "DriftReport",
+    "DriftSeverity",
     "CoverageStatus",
     "DiscoveryBatch",
     "DiscoverySource",
@@ -61,6 +74,7 @@ __all__ = [
     "ShardResult",
     "ShardSpec",
     "StaticSource",
+    "check_definition_drift",
     "funnel_counts",
     "parse_scan_payload",
     "resolve_coverage",
