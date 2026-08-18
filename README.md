@@ -321,12 +321,14 @@ is about $20 today, so a position is whole shares only for a stock under roughly
 $20 — and the universe trades at $250+. **Every position this account can take
 is unprotectable.**
 
-Note what that threshold depends on, though: `stop_distance`. Today it is a flat
-5%, but once stops are ATR-scaled it varies per symbol and per regime — a $0.50
-stop on a $1 risk budget affords a $2 notional, a $2.00 stop affords $0.50. So
-"trade cheaper stocks" is *not* established as the answer, and forcing a price
-ceiling into the scanner to accommodate a $100 test account would distort which
-setups the strategy sees. The honest sequencing is: find what the strategy
+Note what that threshold depends on, though: `stop_distance`, which is now
+derived from ATR and so varies per symbol rather than sitting at a fixed
+percentage. A $0.50 stop on a $1 risk budget affords a $2 notional; a $2.00 stop
+affords $0.50. There is no single price ceiling that separates protectable from
+unprotectable — it moves with each stock's volatility. So "trade cheaper stocks"
+is *not* established as the answer, and forcing a price ceiling into the scanner
+to accommodate a $100 test account would distort which setups the strategy
+sees. The honest sequencing is: find what the strategy
 actually wants, then ask what capital that requires under whole-share
 protection. A $100 account may simply be adequate for shadow validation and
 inadequate for protected execution, which is a fine answer.
@@ -390,7 +392,7 @@ In rough priority order:
    be guessing — ATR makes the stop distance vary per symbol, so the price
    ceiling implied by `risk_budget / stop_distance` is no longer one number.
 3. **The protective-stop lifecycle** — submit, confirm acceptance, record the
-   broker order id, monitor, reconcile on restart. Gated on (4), since until
+   broker order id, monitor, reconcile on restart. Gated on (2) — until
    positions can be whole shares it could never leave its first state. Note
    there is no replace/modify tool, so moving a stop means cancel-then-place
    with an unprotected window in between.

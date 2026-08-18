@@ -119,8 +119,8 @@ numbers destroys reproducibility.
 | `models/` | Domain types crossing every layer |
 | `market/snapshot.py` | Raw MCP payloads → `MarketSnapshot` |
 | `market/signals.py` | Pure predicates strategies compose |
-| `market/regime.py` | Per-symbol trend classification; gates which strategies may fire |
-| `market/market_regime.py` | SPY/QQQ backdrop. **Journalled, never gated** |
+| `market/symbol_regime.py` | `SymbolTrendRegime` — does *this stock* satisfy the trend premise? **Gates** |
+| `market/market_regime.py` | `MarketRegime` — what is SPY/QQQ doing? **Journalled, never gated** |
 | `strategies/stops.py` | ATR-scaled stop construction, with bounds |
 | `strategies/` | Opinions only. No account access, no sizing |
 | `risk/limits.py` | Pass/fail gates, incl. sector cap and kill switch |
@@ -240,6 +240,12 @@ Three behaviours worth knowing:
 - **Missing ATR falls back to a flat percentage** and records
   `stop_basis: flat_pct`. It still trades; the critic shrinks it. Never
   present a flat-percentage stop as volatility-derived.
+
+The two regime concepts are named apart because they answer different questions
+at different scopes, and scanner code will touch both:
+
+    SymbolTrendRegime   does THIS stock satisfy the trend premise?  -> may gate
+    MarketRegime        what is the broad market doing?             -> journal only
 
 Market regime (`market/market_regime.py`) is **recorded and never enforced**.
 Do not add a gate on it until expectancy per regime exists in the journal —

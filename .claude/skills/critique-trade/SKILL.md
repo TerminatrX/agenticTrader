@@ -23,7 +23,8 @@ separate pass with an adversarial mandate is the only structural fix.
 - Notional is within buying power and the concentration ceiling
 - Snapshot and indicator freshness
 - No required indicator is missing
-- Regime permits the direction
+- The symbol's own trend regime permits the direction (market-wide regime is
+  recorded for later analysis and deliberately does not gate)
 - Earnings proximity, large gaps, repeat trading in the symbol
 
 Those run automatically and appear as `critic` in the `evaluate` output. If the

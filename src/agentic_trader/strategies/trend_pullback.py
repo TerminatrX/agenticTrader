@@ -34,7 +34,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from agentic_trader.market import signals
-from agentic_trader.market.regime import classify_regime
+from agentic_trader.market.symbol_regime import classify_symbol_regime
 from agentic_trader.models import MarketSnapshot, Side, Signal, SignalStrength
 from agentic_trader.strategies.base import Strategy, StrategyContext, register
 from agentic_trader.strategies.stops import build_stop
@@ -82,8 +82,8 @@ class TrendPullbackStrategy(Strategy):
         failed: list[str] = []
         metrics: dict[str, object] = {}
 
-        regime = classify_regime(snapshot)
-        metrics["regime"] = regime.value
+        regime = classify_symbol_regime(snapshot)
+        metrics["symbol_regime"] = regime.value
 
         # Each check records why it passed or failed. `None` means the data
         # needed to judge it was absent, which counts as a failure.

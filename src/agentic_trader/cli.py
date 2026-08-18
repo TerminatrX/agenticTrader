@@ -59,8 +59,8 @@ from agentic_trader.config import (
 )
 from agentic_trader.journal import JournalRepository
 from agentic_trader.market.market_regime import MarketContext, classify_market_regime
-from agentic_trader.market.regime import classify_regime
 from agentic_trader.market.snapshot import SnapshotError, build_snapshot
+from agentic_trader.market.symbol_regime import classify_symbol_regime
 from agentic_trader.models import AccountState
 from agentic_trader.strategies.base import available_strategies
 
@@ -239,7 +239,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"warning: journal write failed ({exc})", file=sys.stderr)
 
-    _emit(_render_result(result, snapshot_regime=classify_regime(snapshot).value))
+    _emit(_render_result(result, symbol_regime=classify_symbol_regime(snapshot).value))
     return EXIT_OK
 
 
@@ -265,7 +265,7 @@ def _write_halt(config: Any, result: CycleResult, *, dry_run: bool) -> None:
         )
 
 
-def _render_result(result: CycleResult, *, snapshot_regime: str) -> dict[str, Any]:
+def _render_result(result: CycleResult, *, symbol_regime: str) -> dict[str, Any]:
     """Shape the result for the agent, foregrounding what it must act on."""
     payload: dict[str, Any] = {
         "ok": True,
@@ -273,7 +273,7 @@ def _render_result(result: CycleResult, *, snapshot_regime: str) -> dict[str, An
         "symbol": result.symbol,
         "strategy": result.strategy,
         "outcome": result.outcome.value,
-        "regime": snapshot_regime,
+        "symbol_regime": symbol_regime,
         "market_regime": (
             result.market_context.to_dict() if result.market_context else None
         ),

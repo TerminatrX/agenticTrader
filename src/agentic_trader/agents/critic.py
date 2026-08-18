@@ -25,7 +25,7 @@ from decimal import Decimal
 from enum import StrEnum
 
 from agentic_trader.config import RiskConfig
-from agentic_trader.market.regime import Regime, classify_regime
+from agentic_trader.market.symbol_regime import SymbolTrendRegime, classify_symbol_regime
 from agentic_trader.models import (
     AccountState,
     MarketSnapshot,
@@ -212,8 +212,8 @@ def critique(
     # UNKNOWN is checked first: it does not permit long entry either, so leaving
     # it to the general branch below would report "contradicts the strategy
     # premise" for what is really absent data. Both block; only one is true.
-    regime = classify_regime(snapshot)
-    if regime is Regime.UNKNOWN:
+    regime = classify_symbol_regime(snapshot)
+    if regime is SymbolTrendRegime.UNKNOWN:
         if intent.side is Side.BUY:
             report.block(
                 "regime could not be classified — entering long without trend "
