@@ -130,10 +130,29 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     budget_deferred_count    INTEGER NOT NULL DEFAULT 0,
     coverage_status          TEXT NOT NULL,
     coverage_complete        INTEGER NOT NULL DEFAULT 0,
+    scan_definition_ref      TEXT,
+    scan_config_fingerprint  TEXT,
     scan_config_json         TEXT,
+    coverage_reasons_json    TEXT,
     funnel_counts_json       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
+
+-- Per-shard detail. A run can be incomplete for six different reasons, and a
+-- single status on scan_runs cannot answer "why was August 18 incomplete?"
+-- months later without reconstructing it from logs that no longer exist.
+CREATE TABLE IF NOT EXISTS scan_shards (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id             TEXT NOT NULL,
+    scan_id            TEXT NOT NULL,
+    scan_title         TEXT,
+    returned_row_count INTEGER NOT NULL DEFAULT 0,
+    candidate_count    INTEGER NOT NULL DEFAULT 0,
+    rows_rejected      INTEGER NOT NULL DEFAULT 0,
+    reported_total     INTEGER,
+    coverage_status    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_shards_run ON scan_shards(run_id);
 
 -- Every candidate a run produced, including the ones never examined. Recording
 -- only survivors would make the funnel unreadable: the interesting question is
@@ -175,6 +194,16 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "capability_profile": "TEXT",
         "market_regime": "TEXT",
         "market_context": "TEXT",
+    },
+    # scan_runs shipped at 98ee06d with `truncated_candidate_count`. Renaming
+    # it in SCHEMA does nothing to an existing database — CREATE TABLE IF NOT
+    # EXISTS leaves it alone — so the insert would fail on a missing column.
+    # The obsolete column stays behind harmlessly; nothing reads it.
+    "scan_runs": {
+        "budget_deferred_count": "INTEGER NOT NULL DEFAULT 0",
+        "scan_definition_ref": "TEXT",
+        "scan_config_fingerprint": "TEXT",
+        "coverage_reasons_json": "TEXT",
     },
     "trades": {
         "thesis": "TEXT",
@@ -354,6 +383,8 @@ class JournalRepository:
         *,
         candidates: Sequence[Any] | None = None,
         scanner_profile_ref: str | None = None,
+        scan_definition_ref: str | None = None,
+        scan_config_fingerprint: str | None = None,
         scan_config: dict[str, Any] | None = None,
         selected_count: int = 0,
         budget_deferred_count: int = 0,
@@ -374,8 +405,9 @@ class JournalRepository:
                     shard_count, returned_before_dedupe, unique_discovered,
                     duplicates_removed, selected_for_enrichment,
                     budget_deferred_count, coverage_status, coverage_complete,
-                    scan_config_json, funnel_counts_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    scan_definition_ref, scan_config_fingerprint,
+                    scan_config_json, coverage_reasons_json, funnel_counts_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     batch.source,
@@ -390,7 +422,10 @@ class JournalRepository:
                     budget_deferred_count,
                     batch.coverage.value,
                     int(batch.coverage_complete),
+                    scan_definition_ref,
+                    scan_config_fingerprint,
                     json.dumps(scan_config) if scan_config else None,
+                    json.dumps(batch.report.reasons()),
                     json.dumps(funnel_counts(rows)),
                 ),
             )
@@ -414,6 +449,33 @@ class JournalRepository:
                     for c in rows
                 ],
             )
+
+            conn.executemany(
+                """INSERT INTO scan_shards (
+                    run_id, scan_id, scan_title, returned_row_count,
+                    candidate_count, rows_rejected, reported_total, coverage_status
+                ) VALUES (?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        run_id,
+                        sh.scan_id,
+                        sh.scan_title,
+                        sh.returned_row_count,
+                        sh.candidate_count,
+                        sh.rows_rejected,
+                        sh.reported_total,
+                        sh.coverage.value,
+                    )
+                    for sh in batch.shards
+                ],
+            )
+
+    def scan_shards(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scan_shards WHERE run_id = ?", (run_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def scan_candidates(self, run_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:

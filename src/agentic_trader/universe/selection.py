@@ -81,9 +81,9 @@ def rotation_key(symbol: str, on: date) -> str:
 def select_for_enrichment(
     candidates: list[ScanCandidate],
     *,
+    on: date,
     budget: int = 25,
     max_per_sector: int | None = None,
-    on: date | None = None,
 ) -> SelectionResult:
     """Pick up to `budget` candidates, spread across sectors.
 
@@ -104,7 +104,10 @@ def select_for_enrichment(
     if budget <= 0:
         return SelectionResult(deferred=[c.dropped(BUDGET_EXHAUSTED) for c in candidates])
 
-    day = on or date.today()
+    # `on` is required rather than defaulting to today: the date is part of
+    # the algorithm, and an implicit one would make the same stored
+    # candidates select differently on replay.
+    day = on
     cap = max_per_sector if max_per_sector is not None else max(1, (budget + 1) // 2)
 
     buckets: dict[str, list[ScanCandidate]] = defaultdict(list)

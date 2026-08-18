@@ -13,7 +13,13 @@ version churn in both directions.
 
 `"Asset type"` appearing among the returned columns is the clearest example:
 that column exists because of how *these scans* were configured, not because
-`run_scan` always returns it. It belongs here.
+`run_scan` always returns it.
+
+Columns are deliberately **not** declared here either. They were observed to
+vary per shard — one carries ten, the others eleven, in differing order — and
+they are display-only, affecting `source_values` richness rather than which
+candidates are returned. Drift checking reads the live column set per shard
+instead of asserting a uniform one that was never true.
 """
 
 from __future__ import annotations
@@ -53,7 +59,6 @@ class ScanDefinition:
     shards: tuple[ShardSpec, ...]
     base_filters: dict[str, Any] = field(default_factory=dict)
     sorting: str | None = None
-    columns: tuple[str, ...] = ()
 
     @property
     def definition_ref(self) -> str:
@@ -71,7 +76,6 @@ class ScanDefinition:
             "as_of": self.as_of.isoformat(),
             "base_filters": self.base_filters,
             "sorting": self.sorting,
-            "columns": list(self.columns),
             "shards": [s.as_dict() for s in self.shards],
         }
 
@@ -118,19 +122,6 @@ DISCOVERY_V1 = ScanDefinition(
     as_of=date(2026, 8, 18),
     base_filters=_BASE_FILTERS,
     sorting="Market cap desc",
-    columns=(
-        "% Change",
-        "Asset type",
-        "Average volume",
-        "Last",
-        "Market cap",
-        "Name",
-        "Net change",
-        "RSI",
-        "Relative volume",
-        "Symbol",
-        "Volume",
-    ),
     shards=(
         _shard("cc72022a-5f93-4c66-a69e-369dc6c89d92", "Mega >$100B", 100_000_000_000, None),
         _shard("cccffcd4-8c3d-452c-ba23-23c71308030e", "Large $20B-$100B",

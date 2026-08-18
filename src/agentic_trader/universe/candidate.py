@@ -118,6 +118,85 @@ class ShardResult:
         return self.coverage is CoverageStatus.COMPLETE
 
 
+@dataclass(frozen=True)
+class CoverageReport:
+    """Run-level coverage plus every reason it might not be COMPLETE.
+
+    A single status is not enough to answer "why was August 18 incomplete?"
+    six months later, so each failure mode is carried separately.
+    """
+
+    status: CoverageStatus
+    missing_shard_ids: tuple[str, ...] = ()
+    unexpected_shard_ids: tuple[str, ...] = ()
+    duplicate_shard_ids: tuple[str, ...] = ()
+    parse_error_count: int = 0
+
+    @property
+    def complete(self) -> bool:
+        return self.status is CoverageStatus.COMPLETE
+
+    def reasons(self) -> list[str]:
+        out = []
+        if self.missing_shard_ids:
+            out.append(f"missing shards: {', '.join(self.missing_shard_ids)}")
+        if self.unexpected_shard_ids:
+            out.append(f"unexpected shards: {', '.join(self.unexpected_shard_ids)}")
+        if self.duplicate_shard_ids:
+            out.append(f"duplicate shards: {', '.join(self.duplicate_shard_ids)}")
+        if self.parse_error_count:
+            out.append(f"{self.parse_error_count} payload(s) failed to parse")
+        return out
+
+
+def resolve_coverage(
+    shards: list[ShardResult],
+    *,
+    expected_shard_ids: tuple[str, ...],
+    parse_error_count: int = 0,
+) -> CoverageReport:
+    """Require the observed shard set to *equal* the expected one.
+
+    Checking only for missing ids is not enough. All five expected shards plus
+    an unrelated sixth still satisfies "nothing missing", while that sixth
+    scan's candidates quietly join the declared universe. A duplicated shard is
+    equally an integration defect — it double-counts a band and inflates the
+    dedupe statistics that are supposed to reveal boundary semantics.
+
+    Missing shards are also checked independently of `all(...)`, because an
+    empty shard list makes `all([])` true: a run that queried nothing would
+    otherwise report complete coverage.
+    """
+    observed = [s.scan_id for s in shards]
+    expected = set(expected_shard_ids)
+
+    missing = tuple(sorted(expected - set(observed)))
+    unexpected = tuple(sorted(set(observed) - expected))
+    duplicates = tuple(sorted({sid for sid in observed if observed.count(sid) > 1}))
+
+    # An empty shard list is checked explicitly. `all([])` is True, so a run
+    # that queried nothing would otherwise fall through to COMPLETE.
+    incomplete = (
+        bool(missing or unexpected or duplicates or parse_error_count)
+        or not shards
+        or any(s.coverage is CoverageStatus.INCOMPLETE for s in shards)
+    )
+    if incomplete:
+        status = CoverageStatus.INCOMPLETE
+    elif any(s.coverage is CoverageStatus.UNKNOWN_TRUNCATED for s in shards):
+        status = CoverageStatus.UNKNOWN_TRUNCATED
+    else:
+        status = CoverageStatus.COMPLETE
+
+    return CoverageReport(
+        status=status,
+        missing_shard_ids=missing,
+        unexpected_shard_ids=unexpected,
+        duplicate_shard_ids=duplicates,
+        parse_error_count=parse_error_count,
+    )
+
+
 @dataclass
 class DiscoveryBatch:
     """Every candidate a discovery run produced, plus how it went.
@@ -131,11 +210,18 @@ class DiscoveryBatch:
 
     source: str
     started_at: datetime
-    coverage: CoverageStatus
+    report: CoverageReport
     shards: list[ShardResult] = field(default_factory=list)
     candidates: list[ScanCandidate] = field(default_factory=list)
     returned_before_dedupe: int = 0
-    missing_shard_ids: tuple[str, ...] = ()
+
+    @property
+    def coverage(self) -> CoverageStatus:
+        return self.report.status
+
+    @property
+    def missing_shard_ids(self) -> tuple[str, ...]:
+        return self.report.missing_shard_ids
 
     @property
     def duplicates_removed(self) -> int:
@@ -143,33 +229,7 @@ class DiscoveryBatch:
 
     @property
     def coverage_complete(self) -> bool:
-        return self.coverage is CoverageStatus.COMPLETE
-
-
-def resolve_coverage(
-    shards: list[ShardResult],
-    *,
-    expected_shard_ids: tuple[str, ...] = (),
-) -> tuple[CoverageStatus, tuple[str, ...]]:
-    """Combine shard coverage into a run-level verdict.
-
-    Missing shards are checked *first* and independently of `all(...)`, because
-    an empty shard list makes `all([])` true — a run that queried nothing would
-    otherwise report complete coverage, which is the most dangerous possible
-    wrong answer here.
-    """
-    seen = {s.scan_id for s in shards}
-    missing = tuple(sorted(set(expected_shard_ids) - seen))
-
-    if expected_shard_ids and missing:
-        return CoverageStatus.INCOMPLETE, missing
-    if not expected_shard_ids and not shards:
-        return CoverageStatus.INCOMPLETE, ()
-    if any(s.coverage is CoverageStatus.INCOMPLETE for s in shards):
-        return CoverageStatus.INCOMPLETE, missing
-    if any(s.coverage is CoverageStatus.UNKNOWN_TRUNCATED for s in shards):
-        return CoverageStatus.UNKNOWN_TRUNCATED, missing
-    return CoverageStatus.COMPLETE, missing
+        return self.report.complete
 
 
 def funnel_counts(candidates: list[ScanCandidate]) -> dict[str, int]:

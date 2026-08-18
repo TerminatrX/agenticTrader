@@ -7,6 +7,7 @@ reaching a decision.
 """
 
 from agentic_trader.universe.candidate import (
+    CoverageReport,
     CoverageStatus,
     DiscoveryBatch,
     FunnelStage,
@@ -45,6 +46,7 @@ __all__ = [
     "DISCOVERY_V1",
     "ROBINHOOD_MCP_SCANNER",
     "UNKNOWN_SECTOR_LIMIT",
+    "CoverageReport",
     "CoverageStatus",
     "DiscoveryBatch",
     "DiscoverySource",

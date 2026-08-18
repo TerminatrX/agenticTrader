@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from agentic_trader.universe.candidate import (
+    CoverageReport,
     CoverageStatus,
     DiscoveryBatch,
     ScanCandidate,
@@ -71,7 +72,7 @@ class StaticSource:
         return DiscoveryBatch(
             source=self.name,
             started_at=at,
-            coverage=CoverageStatus.COMPLETE,
+            report=CoverageReport(status=CoverageStatus.COMPLETE),
             shards=[],
             candidates=candidates,
             returned_before_dedupe=len(candidates),
@@ -161,19 +162,23 @@ class ScannerSource:
     def __init__(
         self,
         payloads: Sequence[Any],
+        definition: ScanDefinition,
         *,
-        definition: ScanDefinition | None = None,
         capabilities: ScannerCapabilities = ROBINHOOD_MCP_SCANNER,
     ) -> None:
+        # Required, not optional. "Complete coverage" is meaningless without a
+        # declared universe to be complete *of* — without one, a handful of
+        # short arbitrary payloads would report COMPLETE. `parse_scan_payload`
+        # stays available for probes and tests that genuinely have no universe.
         self.payloads = list(payloads)
         self.definition = definition
         self.capabilities = capabilities
 
     def discover(self, now: datetime | None = None) -> DiscoveryBatch:
         at = now or datetime.now(UTC)
-        expected = self.definition.expected_shard_ids if self.definition else ()
 
         shards: list[ShardResult] = []
+        parse_errors = 0
         for p in self.payloads:
             try:
                 shards.append(
@@ -182,22 +187,25 @@ class ScannerSource:
                     )
                 )
             except ShardError:
-                # A shard that could not be parsed is a shard we did not query.
-                # Skipping it silently would let the run claim coverage it does
-                # not have; the missing-id check below turns it into INCOMPLETE.
-                continue
+                # Counted, not swallowed. The missing-id check catches a broken
+                # *expected* shard, but an extra malformed payload would other-
+                # wise vanish without affecting coverage at all.
+                parse_errors += 1
 
         candidates, returned = _dedupe([c for s in shards for c in s.candidates])
-        coverage, missing = resolve_coverage(shards, expected_shard_ids=expected)
+        report = resolve_coverage(
+            shards,
+            expected_shard_ids=self.definition.expected_shard_ids,
+            parse_error_count=parse_errors,
+        )
 
         return DiscoveryBatch(
             source=self.name,
             started_at=at,
-            coverage=coverage,
+            report=report,
             shards=shards,
             candidates=candidates,
             returned_before_dedupe=returned,
-            missing_shard_ids=missing,
         )
 
 
