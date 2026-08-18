@@ -43,12 +43,18 @@ For each symbol, call these in parallel:
 - `get_equity_historicals` — interval `day`, `start_time` ~90 days back
 - `get_equity_fundamentals` — for liquidity and the 52-week range
 - `get_earnings_results` — for the blackout gate
-- `get_equity_technical_indicators` five times, all interval `day`:
+- `get_equity_technical_indicators` six times, all interval `day`:
   - `rsi` period 14, `output: "last:2"`, start ~120 days back
   - `macd` (defaults), `output: "last:2"`, start ~200 days back
   - `sma` period 20, `output: "latest"`, start ~90 days back
   - `sma` period 50, `output: "latest"`, start ~200 days back
   - `sma` period 200, `output: "latest"`, start ~500 days back
+  - `atr` period 14, `output: "latest"`, start ~120 days back
+
+ATR sets the stop distance, and the stop sets the position size — so omitting
+it does not merely lose an input, it silently changes how much the system buys.
+Without it the strategy falls back to a flat percentage and records
+`stop_basis: flat_pct`, which the critic penalizes. Fetch it.
 
 `last:2` on RSI and MACD is required, not optional. The strategy compares the
 current bar to the prior one to decide whether momentum is stabilizing, and
@@ -82,7 +88,8 @@ your positions, so they must never be written into the project tree.
   },
   "payloads": {
     "quote": {}, "historicals": {}, "fundamentals": {}, "earnings": {},
-    "indicators": {"rsi": {}, "macd": {}, "sma_20": {}, "sma_50": {}, "sma_200": {}}
+    "indicators": {"rsi": {}, "macd": {}, "sma_20": {}, "sma_50": {},
+                   "sma_200": {}, "atr": {}}
   }
 }
 ```

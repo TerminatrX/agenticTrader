@@ -33,6 +33,7 @@ from agentic_trader.config import AppConfig
 from agentic_trader.execution.executor import ExecutionPlan, PreflightError, build_order_payload
 from agentic_trader.execution.shadow_executor import ShadowExecutor
 from agentic_trader.journal.models import AuditEntry, CycleOutcome, TradeRecord
+from agentic_trader.market.market_regime import MarketContext
 from agentic_trader.models import (
     AccountState,
     MarketSnapshot,
@@ -65,6 +66,9 @@ class CycleResult:
     # rather than invisible — the performance review reads the gap between them.
     original_confidence: float | None = None
     adjusted_confidence: float | None = None
+
+    # Recorded for later analysis; nothing in this cycle branches on it.
+    market_context: MarketContext | None = None
 
     @property
     def should_submit(self) -> bool:
@@ -100,6 +104,7 @@ def run_cycle(
     last_loss_exit: date | None = None,
     recent_symbol_trades: int = 0,
     active_stop: Decimal | None = None,
+    market_context: MarketContext | None = None,
     now: datetime | None = None,
 ) -> CycleResult:
     """Evaluate one symbol under one strategy."""
@@ -111,6 +116,7 @@ def run_cycle(
         symbol=snapshot.symbol,
         strategy=strategy_name,
         outcome=CycleOutcome.NO_SIGNAL,
+        market_context=market_context,
     )
 
     def finish(outcome: CycleOutcome) -> CycleResult:
@@ -245,6 +251,10 @@ def run_cycle(
             sector=snapshot.sector,
             protection_state=fill.protection,
             capability_profile=plan.capability_profile,
+            market_regime=(
+                market_context.regime.value if market_context is not None else None
+            ),
+            stop_basis=signal.metrics.get("stop_basis"),
         )
         return finish(CycleOutcome.SHADOW_FILLED)
 
@@ -257,9 +267,12 @@ def _build_audit(
     signal = result.signal
     decision = result.risk_decision
     plan = result.plan
+    market = result.market_context
     return AuditEntry(
         protection_state=plan.protection if plan is not None else None,
         capability_profile=plan.capability_profile if plan is not None else None,
+        market_regime=market.regime.value if market is not None else None,
+        market_context=market.to_dict() if market is not None else None,
         cycle_id=result.cycle_id,
         occurred_at=occurred_at,
         symbol=result.symbol,

@@ -143,12 +143,31 @@ Sizing works backward from the loss you accept, not forward from the cash you
 hold:
 
 ```
-risk budget = account value × risk_per_trade_pct
-notional    = risk budget ÷ stop distance
+stop distance = clamp(ATR(14) × multiple, floor, ceiling)
+risk budget   = account value × risk_per_trade_pct
+notional      = risk budget ÷ stop distance
 ```
 
 A 1% budget with a 5% stop is a 20% position; the same budget with a 10% stop
-is 10%. The stop decides the size, not conviction.
+is 10%. The stop decides the size, not conviction — and the *stock* decides the
+stop. Reversing that order, picking a size and then finding a stop to fit it, is
+how a position ends up sized by preference rather than by risk.
+
+**The stop comes from measured volatility.** ATR(14) scaled by a multiple, so a
+name that routinely moves 3% a day gets a wider stop and a proportionally
+smaller position than one that moves 1%. Three things bound it:
+
+| Bound | Why |
+|---|---|
+| Floor (`min_stop_pct`) | Sizing divides by this. A 0.5% stop implies 200× the risk budget in notional. |
+| Ceiling (`max_stop_pct`) | Volatility beyond it **declines the setup** rather than clamping — a stop at the ceiling would sit inside the stock's ordinary daily range, so the risk would only look bounded. |
+| Structure | The 50-day may *widen* the stop, never tighten it. It may exceed the ceiling, and the risk engine refuses it there. |
+
+When ATR is unavailable the stop falls back to a flat percentage and records
+`stop_basis: flat_pct`. That still trades — refusing would mean no trades
+whenever an indicator call fails — but the critic shrinks the position for it,
+because a risk boundary asserted from a constant is a weaker claim than one
+measured from the stock.
 
 Sizes are in **dollars**, not shares — a $100 account cannot buy one share of a
 $300 stock, so a share-based sizer would simply never trade.
@@ -211,6 +230,27 @@ A control that cannot fail is worse than a missing one, because it earns trust
 it has not done anything to deserve. `spread_pct` returns `None` rather than
 `Decimal("0")` for an unusable book for exactly this reason: a zero spread would
 sail through the tightest possible threshold on the worst possible information.
+
+### Market regime is recorded, not enforced
+
+`market/market_regime.py` classifies the backdrop from SPY, confirmed by QQQ:
+`BULL_TREND`, `BEAR_TREND`, `RANGE`, `HIGH_VOLATILITY`, `UNKNOWN`. Volatility
+outranks direction, and SPY/QQQ disagreeing downgrades a trend to `RANGE` — a
+split market means the move is sectoral, not market-wide.
+
+**Nothing gates on it.** No strategy consults it and no limit reads it. The
+useful version of this rule looks like
+
+```
+trend_pullback   BULL_TREND        expectancy +0.34R
+                 RANGE             expectancy -0.18R
+                 HIGH_VOLATILITY   expectancy -0.52R
+```
+
+and none of those numbers exist yet. Wiring a guess into a gate now would
+suppress exactly the trades needed to find out whether the guess was right. The
+regime and the inputs that produced it are journalled on every cycle; the rule
+follows the evidence, not the other way round.
 
 ### The critic may shrink a trade, never grow it
 
@@ -341,27 +381,23 @@ config/
 
 In rough priority order:
 
-1. **ATR-scaled stops**, replacing the flat percentage. `atr_14` is already
-   parsed into the model but no skill fetches it and nothing reads it. This
-   comes first because it changes `stop_distance`, and therefore changes what
-   "affordable as whole shares" even means.
-2. **Market-level regime** from SPY/QQQ — journalled only at first, with rules
-   derived from observed expectancy per regime rather than assumed up front.
-3. **A more diversified universe and a scanner**, which the sector cap already
+1. **A more diversified universe and a scanner**, which the sector cap already
    demands. Robinhood exposes `run_scan` and `get_scanner_filter_specs`
    server-side, which may replace much of a hand-built scanner. Deliberately
    *not* constrained by a price ceiling chosen to suit the current account.
-4. **Then, with (1) and (3) known:** how much capital this strategy needs for
-   whole-share broker protection. Answering it earlier would be guessing.
-5. **The protective-stop lifecycle** — submit, confirm acceptance, record the
+2. **Then, with ATR stops and a real universe known:** how much capital this
+   strategy needs for whole-share broker protection. Answering it earlier would
+   be guessing — ATR makes the stop distance vary per symbol, so the price
+   ceiling implied by `risk_budget / stop_distance` is no longer one number.
+3. **The protective-stop lifecycle** — submit, confirm acceptance, record the
    broker order id, monitor, reconcile on restart. Gated on (4), since until
    positions can be whole shares it could never leave its first state. Note
    there is no replace/modify tool, so moving a stop means cancel-then-place
    with an unprotected window in between.
-6. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
+4. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
    spread, slippage and stop-gap modelling, and a baseline-vs-critic A/B to
    establish whether the critic actually improves expectancy.
-7. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
+5. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
    test suite (see safety rule 8).
 
 ## Status
@@ -369,7 +405,7 @@ In rough priority order:
 Shadow mode. `trend_pullback` implemented and tested; `momentum` stubbed.
 **No live trades placed.**
 
-133 tests, ruff clean. Test coverage is weighted toward the negative cases —
+160 tests, ruff clean. Test coverage is weighted toward the negative cases —
 every risk gate has a test proving it *blocks*, because a limit that silently
 fails open is worse than no limit at all.
 

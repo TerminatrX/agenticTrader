@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from agentic_trader.models import Indicators, SignalStrength
 from agentic_trader.strategies.base import StrategyContext
 from agentic_trader.strategies.trend_pullback import TrendPullbackStrategy
@@ -34,7 +36,7 @@ def test_full_setup_produces_enter(bullish_pullback_snapshot):
     assert signal.stop_price is not None and signal.stop_price < signal.reference_price
     assert signal.target_price > signal.reference_price
     assert not signal.failed_conditions
-    assert len(signal.reasons) == 6
+    assert len(signal.reasons) == 7
 
 
 def test_deepening_momentum_downgrades_to_watch(bullish_pullback_snapshot):
@@ -126,18 +128,35 @@ def test_low_confidence_downgrades_to_watch(bullish_pullback_snapshot):
     assert any("confidence" in f for f in signal.failed_conditions)
 
 
-def test_tight_stop_widens_past_the_sma50(bullish_pullback_snapshot):
+def test_structure_widens_the_stop_below_the_50day(bullish_pullback_snapshot):
     """The stop belongs where the thesis fails, not at a fixed percentage.
 
-    With the 50-day at 300.00 just under the 302.25 close, a flat 1% stop would
-    land at 299.23 — above the average, where ordinary noise the premise allows
-    for would take it out. It is widened to 1% under the average instead.
+    With the 50-day at 295.00, its 1%-under level (292.05) sits below where a
+    tight percentage stop would land. The average is where this strategy's
+    premise actually breaks, so the stop is widened to clear it — a stop above
+    it gets taken out by movement the thesis explicitly allows for.
     """
-    near = _with_indicators(bullish_pullback_snapshot, sma_50=Decimal("300.00"))
+    near = _with_indicators(bullish_pullback_snapshot, sma_50=Decimal("295.00"))
     signal = _evaluate(near, stop_pct=Decimal("0.01"))
 
     assert signal.strength is SignalStrength.ENTER
-    assert signal.stop_price == Decimal("297.00")
+    assert signal.stop_price == Decimal("292.05")
+    assert signal.metrics["stop_basis"] == "structure"
+
+
+def test_the_minimum_stop_floor_binds_before_structure(bullish_pullback_snapshot):
+    """A very tight stop is clamped up to the floor first.
+
+    Sizing divides by the stop distance, so a 1% stop implies a hundred times
+    the risk budget in notional. The floor bounds that at the source, before
+    any structural anchor is considered.
+    """
+    near = _with_indicators(bullish_pullback_snapshot, sma_50=Decimal("300.00"))
+    signal = _evaluate(near, stop_pct=Decimal("0.01"), min_stop_pct=Decimal("0.02"))
+
+    # 2% under 302.25, not the 1% the parameter asked for.
+    assert signal.stop_price == Decimal("296.20")
+    assert signal.metrics["stop_distance_pct"] == pytest.approx(0.02, abs=1e-4)
 
 
 def test_stop_already_below_sma50_is_left_alone(bullish_pullback_snapshot):

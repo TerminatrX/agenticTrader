@@ -121,6 +121,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "invalidation_reason": "TEXT",
         "protection_state": "TEXT",
         "capability_profile": "TEXT",
+        "market_regime": "TEXT",
+        "market_context": "TEXT",
     },
     "trades": {
         "thesis": "TEXT",
@@ -128,6 +130,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "sector": "TEXT",
         "protection_state": "TEXT",
         "capability_profile": "TEXT",
+        "market_regime": "TEXT",
+        "stop_basis": "TEXT",
     },
 }
 
@@ -172,9 +176,10 @@ class JournalRepository:
                     original_confidence, adjusted_confidence,
                     thesis, invalidation_reason,
                     protection_state, capability_profile,
+                    market_regime, market_context,
                     reasons, failed_conditions, risk_breaches, critic_notes,
                     snapshot_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     entry.cycle_id,
                     entry.occurred_at.isoformat(),
@@ -190,6 +195,8 @@ class JournalRepository:
                     entry.invalidation_reason,
                     entry.protection_state.value if entry.protection_state else None,
                     entry.capability_profile,
+                    entry.market_regime,
+                    json.dumps(entry.market_context) if entry.market_context else None,
                     json.dumps(entry.reasons),
                     json.dumps(entry.failed_conditions),
                     json.dumps(entry.risk_breaches),
@@ -221,8 +228,9 @@ class JournalRepository:
                         entry_price, quantity, notional, stop_price, target_price,
                         entry_rationale, thesis, invalidation_reason, sector,
                         protection_state, capability_profile,
+                        market_regime, stop_basis,
                         closed_at, exit_price, exit_reason
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         trade.client_key,
                         trade.symbol,
@@ -240,6 +248,8 @@ class JournalRepository:
                         trade.sector,
                         trade.protection_state.value,
                         trade.capability_profile,
+                        trade.market_regime,
+                        trade.stop_basis,
                         trade.closed_at.isoformat() if trade.closed_at else None,
                         _s(trade.exit_price),
                         trade.exit_reason,
@@ -391,6 +401,7 @@ def _audit_row(row: sqlite3.Row) -> dict[str, Any]:
         "signal_strength": row["signal_strength"],
         "protection_state": row["protection_state"],
         "capability_profile": row["capability_profile"],
+        "market_regime": row["market_regime"],
         "reasons": json.loads(row["reasons"] or "[]"),
         "failed_conditions": json.loads(row["failed_conditions"] or "[]"),
         "risk_breaches": json.loads(row["risk_breaches"] or "[]"),
@@ -419,6 +430,8 @@ def _trade_from_row(row: sqlite3.Row) -> TradeRecord:
         # not a claim they were protected.
         protection_state=ProtectionState(row["protection_state"] or ProtectionState.NOT_REQUIRED),
         capability_profile=row["capability_profile"],
+        market_regime=row["market_regime"],
+        stop_basis=row["stop_basis"],
         closed_at=datetime.fromisoformat(row["closed_at"]) if row["closed_at"] else None,
         exit_price=_d(row["exit_price"]),
         exit_reason=row["exit_reason"],

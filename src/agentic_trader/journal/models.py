@@ -66,6 +66,12 @@ class AuditEntry(BaseModel):
     protection_state: ProtectionState | None = None
     capability_profile: str | None = None
 
+    # The market backdrop this decision was made against. Recorded, never
+    # enforced — the point is to accumulate expectancy per regime and let any
+    # future gating rule follow the evidence rather than precede it.
+    market_regime: str | None = None
+    market_context: dict[str, Any] | None = None
+
     reasons: list[str] = Field(default_factory=list)
     failed_conditions: list[str] = Field(default_factory=list)
     risk_breaches: list[str] = Field(default_factory=list)
@@ -110,6 +116,11 @@ class TradeRecord(BaseModel):
     # a protective order at all is still answerable.
     protection_state: ProtectionState = ProtectionState.NOT_REQUIRED
     capability_profile: str | None = None
+
+    # Denormalized onto the trade so "expectancy by regime" is a group-by on
+    # closed trades rather than a join back through the audit stream.
+    market_regime: str | None = None
+    stop_basis: str | None = None
 
     closed_at: datetime | None = None
     exit_price: Decimal | None = None

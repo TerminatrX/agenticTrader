@@ -24,7 +24,12 @@ The `evaluate` bundle:
         "earnings":     <get_earnings_results response>,
         "indicators": {
           "rsi": <...>, "macd": <...>,
-          "sma_20": <...>, "sma_50": <...>, "sma_200": <...>
+          "sma_20": <...>, "sma_50": <...>, "sma_200": <...>,
+          "atr": <...>                     // sets the stop, and so the size
+        },
+        "market": {                        // optional; recorded, never gated
+          "SPY": {"quote": <...>, "indicators": {...}},
+          "QQQ": {"quote": <...>, "indicators": {...}}
         }
       }
     }
@@ -53,6 +58,7 @@ from agentic_trader.config import (
     write_risk_lock,
 )
 from agentic_trader.journal import JournalRepository
+from agentic_trader.market.market_regime import MarketContext, classify_market_regime
 from agentic_trader.market.regime import classify_regime
 from agentic_trader.market.snapshot import SnapshotError, build_snapshot
 from agentic_trader.models import AccountState
@@ -137,6 +143,28 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     except SnapshotError as exc:
         return _fail(f"could not build snapshot: {exc}")
 
+    # Index snapshots for market-regime context. Entirely optional: the bundle
+    # may omit them, and a malformed one must not stop a decision — the regime
+    # is recorded for later analysis and gates nothing.
+    market_context: MarketContext | None = None
+    market_payloads = payloads.get("market") or {}
+    if market_payloads:
+        try:
+            index_snaps = {
+                sym.upper(): build_snapshot(
+                    sym,
+                    quote=data.get("quote"),
+                    historicals=data.get("historicals"),
+                    indicators=data.get("indicators", {}),
+                )
+                for sym, data in market_payloads.items()
+            }
+            market_context = classify_market_regime(
+                index_snaps.get("SPY"), index_snaps.get("QQQ")
+            )
+        except (SnapshotError, AttributeError, TypeError) as exc:
+            print(f"warning: market context unavailable ({exc})", file=sys.stderr)
+
     mode = bundle.get("mode", args.mode)
     if mode not in ("shadow", "live"):
         return _fail(f"mode must be 'shadow' or 'live', got {mode!r}")
@@ -186,6 +214,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             last_loss_exit=last_loss,
             recent_symbol_trades=recent_trades,
             active_stop=active_stop,
+            market_context=market_context,
         )
     except Exception as exc:  # noqa: BLE001
         return _fail(f"cycle failed: {exc!r}", EXIT_ERROR)
@@ -245,6 +274,9 @@ def _render_result(result: CycleResult, *, snapshot_regime: str) -> dict[str, An
         "strategy": result.strategy,
         "outcome": result.outcome.value,
         "regime": snapshot_regime,
+        "market_regime": (
+            result.market_context.to_dict() if result.market_context else None
+        ),
         "headline": result.headline(),
         "should_submit": result.should_submit,
         "errors": result.errors,

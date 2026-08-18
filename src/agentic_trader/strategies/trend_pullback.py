@@ -13,6 +13,12 @@ Entry requires all of:
     4. RSI(14) inside [rsi_floor, rsi_ceiling]  (soft, not capitulating)
     5. MACD histogram rising                    (selling pressure easing)
     6. Pullback depth within max_pullback_pct   (not a trend break)
+    7. Volatility fits inside the stop ceiling  (risk is actually boundable)
+
+Condition 7 is about the stop rather than the setup: if ATR says the stock
+routinely travels further than the widest stop allowed, then a stop at that
+ceiling sits inside ordinary daily movement. The setup might be perfect and
+still be untradeable at this risk budget.
 
 Condition 5 is the one that earns its keep. Conditions 1-4 will happily fire in
 the middle of a collapse; a rising histogram is what says the fall is decaying.
@@ -31,6 +37,7 @@ from agentic_trader.market import signals
 from agentic_trader.market.regime import classify_regime
 from agentic_trader.models import MarketSnapshot, Side, Signal, SignalStrength
 from agentic_trader.strategies.base import Strategy, StrategyContext, register
+from agentic_trader.strategies.stops import build_stop
 
 
 @register
@@ -42,6 +49,14 @@ class TrendPullbackStrategy(Strategy):
         "rsi_floor": 30.0,
         "rsi_ceiling": 45.0,
         "max_pullback_pct": Decimal("0.12"),
+        # Stop construction. `atr_stop_multiple` scales measured volatility;
+        # `stop_pct` is only the fallback when ATR is unavailable. The bounds
+        # mirror the risk engine's own `max_stop_pct` gate on purpose — the
+        # strategy declines a setup it considers untradeable, and risk refuses
+        # it independently. Neither layer relies on the other.
+        "atr_stop_multiple": Decimal("2.0"),
+        "min_stop_pct": Decimal("0.02"),
+        "max_stop_pct": Decimal("0.12"),
         "stop_pct": Decimal("0.05"),
         "target_r_multiple": Decimal("2.0"),
         "exit_rsi": 72.0,
@@ -121,13 +136,38 @@ class TrendPullbackStrategy(Strategy):
 
         all_passed = all([above_200, stack, pullback, rsi_ok, stabilizing, depth_ok])
 
-        stop_price = (price * (Decimal("1") - p("stop_pct"))).quantize(Decimal("0.01"))
-        # Anchor the stop below the 50-day when that sits lower than a flat
-        # percentage would put it: the average is where the thesis actually
-        # fails, and a stop above it gets taken out by noise the premise allows.
-        if ind.sma_50 is not None and ind.sma_50 < price:
-            structural = (ind.sma_50 * Decimal("0.99")).quantize(Decimal("0.01"))
-            stop_price = min(stop_price, structural)
+        # The 50-day is where this strategy's premise actually fails, so it may
+        # widen the stop but never tighten it.
+        structural = (
+            (ind.sma_50 * Decimal("0.99")).quantize(Decimal("0.01"))
+            if ind.sma_50 is not None and ind.sma_50 < price
+            else None
+        )
+        stop = build_stop(
+            price,
+            atr=ind.atr_14,
+            atr_multiple=p("atr_stop_multiple"),
+            min_stop_pct=p("min_stop_pct"),
+            max_stop_pct=p("max_stop_pct"),
+            flat_stop_pct=p("stop_pct"),
+            structural_level=structural,
+        )
+        stop_price = stop.stop_price
+        metrics["stop_basis"] = stop.basis.value
+        metrics["stop_distance_pct"] = float(stop.distance_pct)
+        metrics["atr_14"] = float(ind.atr_14) if ind.atr_14 is not None else None
+
+        # Volatility demanding a wider stop than the ceiling allows is a real
+        # condition, not a rounding problem: a stop at the ceiling would be
+        # inside the stock's ordinary daily range, so the position would be
+        # sized as though the risk were bounded when it is not.
+        volatility_ok = check(
+            "volatility_within_stop_ceiling",
+            not stop.too_volatile_to_trade,
+            "; ".join(stop.notes) if stop.too_volatile_to_trade else f"stop {stop.basis.value}",
+        )
+
+        all_passed = all_passed and volatility_ok
 
         risk_per_share = price - stop_price
         target_price = (price + risk_per_share * p("target_r_multiple")).quantize(Decimal("0.01"))

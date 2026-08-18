@@ -165,6 +165,12 @@ def _indicator_series(payload: Any, kind: str) -> list[dict[str, Any]]:
     return []
 
 
+def _stamp(stamps: list[datetime], entry: dict[str, Any]) -> None:
+    when = _dt(entry.get("begins_at"))
+    if when is not None:
+        stamps.append(when)
+
+
 def parse_indicators(payloads: dict[str, Any]) -> Indicators:
     """Assemble indicators from separate per-indicator MCP responses.
 
@@ -174,14 +180,19 @@ def parse_indicators(payloads: dict[str, Any]) -> Indicators:
          "sma_20": ..., "sma_50": ..., "sma_200": ..., "atr": ...}
     """
     fields: dict[str, Any] = {}
-    as_of: datetime | None = None
+    # Every indicator's own bar timestamp. The snapshot reports the *oldest* of
+    # them, because the honest answer to "how current is this view?" is set by
+    # the stalest input being relied on, not the freshest. Last-writer-wins
+    # would let one fresh series mask a stale one — a fresh ATR hiding an RSI
+    # computed a week ago, say — and the critic's staleness check reads this.
+    stamps: list[datetime] = []
 
     rsi = _indicator_series(payloads.get("rsi"), "rsi")
     if rsi:
         fields["rsi_14"] = _float(rsi[-1].get("value"))
         if len(rsi) >= 2:
             fields["rsi_prev"] = _float(rsi[-2].get("value"))
-        as_of = _dt(rsi[-1].get("begins_at")) or as_of
+        _stamp(stamps, rsi[-1])
 
     macd = _indicator_series(payloads.get("macd"), "macd")
     if macd:
@@ -191,19 +202,22 @@ def parse_indicators(payloads: dict[str, Any]) -> Indicators:
         fields["macd_hist"] = _float(latest.get("histogram"))
         if len(macd) >= 2:
             fields["macd_hist_prev"] = _float(macd[-2].get("histogram"))
-        as_of = _dt(latest.get("begins_at")) or as_of
+        _stamp(stamps, latest)
 
     for label, field in (("sma_20", "sma_20"), ("sma_50", "sma_50"), ("sma_200", "sma_200")):
         series = _indicator_series(payloads.get(label), "sma")
         if series:
             fields[field] = _dec(series[-1].get("value"), label)
-            as_of = _dt(series[-1].get("begins_at")) or as_of
+            _stamp(stamps, series[-1])
 
     atr = _indicator_series(payloads.get("atr"), "atr")
     if atr:
+        # ATR is quoted in dollars per share, not as a percentage — stop
+        # construction converts it against the price.
         fields["atr_14"] = _dec(atr[-1].get("value"), "atr")
+        _stamp(stamps, atr[-1])
 
-    return Indicators(as_of=as_of, **fields)
+    return Indicators(as_of=min(stamps) if stamps else None, **fields)
 
 
 def parse_next_earnings(payload: Any, as_of: date) -> EarningsEvent | None:

@@ -226,6 +226,17 @@ def critique(
     elif intent.side is Side.BUY and not regime.allows_long_entry:
         report.block(f"long entry in a {regime.value} regime contradicts the strategy premise")
 
+    # A flat-percentage stop is a weaker claim than a measured one: it asserts
+    # a risk boundary without having looked at how far this stock actually
+    # moves. It still trades — refusing would mean no trades whenever an
+    # indicator call fails — but it is sized slightly smaller for it.
+    if intent.side is Side.BUY and signal.metrics.get("stop_basis") == "flat_pct":
+        report.concern(
+            "stop is a flat percentage, not derived from measured volatility "
+            "(ATR missing) — the risk boundary is assumed rather than observed",
+            0.10,
+        )
+
     if intent.side is Side.BUY and signal.confidence < 0.5:
         report.concern(f"confidence {signal.confidence:.2f} is weak for a new position")
 

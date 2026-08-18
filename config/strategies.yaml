@@ -23,8 +23,27 @@ strategies:
       # the move stops being a pullback and starts being a trend change.
       max_pullback_pct: 0.12
 
-      # Initial stop. The strategy tightens this toward the 50-day when that
-      # sits closer, since the average is where the thesis actually fails.
+      # --- Stop construction -------------------------------------------
+      # The stop decides the position size (notional = risk_budget / stop
+      # distance), so these values move real money in a way the other
+      # parameters here do not.
+
+      # ATR(14) multiplier. The stop sits this many average daily ranges below
+      # entry, so a volatile name gets a wider stop and a proportionally
+      # smaller position. 2.0 puts AAPL near 5% at current volatility.
+      atr_stop_multiple: 2.0
+
+      # Bounds on the ATR-derived distance. The floor matters because sizing
+      # divides by it: a 0.5% stop would imply 200x the risk budget in
+      # notional. The ceiling is not a clamp — a setup whose volatility
+      # demands more than this is declined outright, since a stop at the
+      # ceiling would sit inside the stock's ordinary daily range.
+      min_stop_pct: 0.02
+      max_stop_pct: 0.12
+
+      # Fallback only, used when ATR is unavailable. Recorded as
+      # stop_basis: flat_pct, which the critic penalizes — a stop asserted
+      # from a constant is a weaker claim than one measured from the stock.
       stop_pct: 0.05
 
       # Target as a multiple of initial risk.

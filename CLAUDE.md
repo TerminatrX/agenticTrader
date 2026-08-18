@@ -119,7 +119,9 @@ numbers destroys reproducibility.
 | `models/` | Domain types crossing every layer |
 | `market/snapshot.py` | Raw MCP payloads → `MarketSnapshot` |
 | `market/signals.py` | Pure predicates strategies compose |
-| `market/regime.py` | Trend classification; gates which strategies may fire |
+| `market/regime.py` | Per-symbol trend classification; gates which strategies may fire |
+| `market/market_regime.py` | SPY/QQQ backdrop. **Journalled, never gated** |
+| `strategies/stops.py` | ATR-scaled stop construction, with bounds |
 | `strategies/` | Opinions only. No account access, no sizing |
 | `risk/limits.py` | Pass/fail gates, incl. sector cap and kill switch |
 | `risk/sizing.py` | Dollar-denominated position sizing |
@@ -212,6 +214,36 @@ Discovered from the MCP tool schemas, not assumed:
 .venv/Scripts/python.exe -m pytest -q
 .venv/Scripts/python.exe -m ruff check src tests
 ```
+
+### Stops and sizing
+
+The stop is computed from measured volatility, and the size follows from the
+stop:
+
+```
+stop distance = clamp(ATR(14) x multiple, min_stop_pct, max_stop_pct)
+notional      = risk_budget / stop distance
+```
+
+Never invert this. Choosing a position size and then finding a stop that fits it
+produces a position sized by preference rather than by risk, and it is the one
+mistake here that a passing test suite will not catch.
+
+Three behaviours worth knowing:
+
+- **The ceiling declines the setup; it does not clamp.** If ATR says the stock
+  travels further than `max_stop_pct` allows, a stop at that ceiling sits inside
+  ordinary daily movement — the risk would look bounded without being bounded.
+  `trend_pullback` treats it as a failed entry condition.
+- **Structure only widens.** The 50-day may push the stop lower, never higher,
+  and may exceed the ceiling — `risk/limits.py` refuses it there instead.
+- **Missing ATR falls back to a flat percentage** and records
+  `stop_basis: flat_pct`. It still trades; the critic shrinks it. Never
+  present a flat-percentage stop as volatility-derived.
+
+Market regime (`market/market_regime.py`) is **recorded and never enforced**.
+Do not add a gate on it until expectancy per regime exists in the journal —
+gating on a guess suppresses the trades needed to test the guess.
 
 When adding a strategy:
 
