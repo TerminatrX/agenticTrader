@@ -1,13 +1,13 @@
-"""What a broker can actually do, and how confidently we know it.
+"""What a broker can actually do at order time, and how confidently we know it.
 
-Two facts are tracked separately for every capability, because conflating them
-is how a system ends up trusting a guess:
+The shared vocabulary — `Capability`, `Evidence`, `CapabilityProfile` — lives in
+`models.capabilities`; this module holds only the order-execution profile. The
+scanner has its own, in `universe.scanner_capabilities`, because filter
+vocabularies and row shapes evolve independently of order semantics and neither
+should force a version bump on the other.
 
-- **supported** — can the broker do this? `None` means unknown.
-- **evidence** — how that was established, from a verified round trip down to
-  an inference nobody has checked.
-
-The distinction is load-bearing here. The capability driving this whole module —
+The support/evidence split is load-bearing here. The capability driving this
+whole module —
 whether a fractional position can carry a resting protective stop — is
 documented as unsupported in the MCP tool schema, but could not be confirmed
 empirically. `review_equity_order` accepted a fractional `stop_market` sell with
@@ -27,60 +27,16 @@ profile rather than a search for `if robinhood`.
 
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from enum import StrEnum
 
-
-class Evidence(StrEnum):
-    """How a capability claim was established, strongest first."""
-
-    EMPIRICALLY_VERIFIED = "empirically_verified"
-    """Observed directly against the broker. The only category that proves
-    behaviour rather than describing it."""
-
-    SCHEMA_DOCUMENTED = "schema_documented"
-    """Stated in the MCP tool schema. Authoritative about intent, but the
-    schema and the running system can disagree."""
-
-    PUBLIC_DOCUMENTED = "public_documented"
-    """Stated in the broker's public documentation, which may lag the API."""
-
-    INFERRED = "inferred"
-    """Deduced from adjacent facts. Reasoning, not a source."""
-
-    UNKNOWN = "unknown"
-    """No basis. Must be treated as unsupported wherever failing closed matters."""
-
-
-@dataclass(frozen=True)
-class Capability:
-    """One thing a broker can or cannot do, plus the basis for saying so."""
-
-    supported: bool | None
-    evidence: Evidence
-    note: str = ""
-
-    @property
-    def is_certain(self) -> bool:
-        """True only for a claim actually observed against the broker."""
-        return self.supported is not None and self.evidence is Evidence.EMPIRICALLY_VERIFIED
-
-    @property
-    def usable(self) -> bool:
-        """Fail closed: unknown support is not permission.
-
-        Deliberately not `supported is not False` — `None` must never read as a
-        yes, and a capability nobody has established is exactly the case where
-        an optimistic default does the most damage.
-        """
-        return self.supported is True
-
-    def describe(self) -> str:
-        state = {True: "supported", False: "not supported", None: "unknown"}[self.supported]
-        return f"{state} ({self.evidence.value})" + (f": {self.note}" if self.note else "")
+from agentic_trader.models.capabilities import (
+    Capability,
+    CapabilityProfile,
+    Evidence,
+    capability_items,
+)
 
 
 @dataclass(frozen=True)
@@ -96,8 +52,8 @@ class ProtectionFeasibility:
 
 
 @dataclass(frozen=True)
-class BrokerCapabilities:
-    """A broker's capability profile, as understood at `as_of`.
+class BrokerCapabilities(CapabilityProfile):
+    """A broker's order-execution capabilities, as understood at `as_of`.
 
     Versioned on purpose. A decision made months ago was made against whatever
     was believed then, and a profile that silently mutates would make past
@@ -105,10 +61,6 @@ class BrokerCapabilities:
     went unprotected because protection was impossible or because the system
     did not yet know it was possible.
     """
-
-    profile_id: str
-    version: str
-    as_of: date
 
     market_orders: Capability
     limit_orders: Capability
@@ -125,32 +77,13 @@ class BrokerCapabilities:
 
     stops_regular_hours_only: Capability
 
-    @property
-    def profile_ref(self) -> str:
-        """Stable identifier to store alongside a decision."""
-        return f"{self.profile_id}@{self.version}"
+    def fingerprint_items(self) -> tuple[str, ...]:
+        """Execution claims are all booleans, so support and evidence are all of it.
 
-    @property
-    def content_fingerprint(self) -> str:
-        """SHA-256 over every capability's support and evidence.
-
-        A stored `profile_ref` is only worth keeping if it identifies exactly
-        one set of claims. Nothing stops someone editing a capability in place
-        and leaving `version` alone, which would silently repoint every
-        historical decision at claims that were never used to make it — the
-        journal would say `robinhood-mcp@2026-08-14` and mean something else.
-
-        This is the same trick `config/risk.lock` plays on the risk values:
-        hash the semantic content, pin it in a test, and a change that skips the
-        version bump fails loudly instead of quietly rewriting history. `note`
-        is excluded — prose may be improved without invalidating a claim.
+        Contrast the scanner profile, which also carries observed vocabularies
+        and must fingerprint those too.
         """
-        parts = [
-            f"{f.name}={cap.supported}:{cap.evidence.value}"
-            for f in fields(self)
-            if isinstance(cap := getattr(self, f.name), Capability)
-        ]
-        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+        return capability_items(self)
 
     def protection_feasibility(self, quantity: Decimal) -> ProtectionFeasibility:
         """Can a resting stop be placed for exactly this quantity?

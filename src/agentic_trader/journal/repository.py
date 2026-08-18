@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -103,6 +103,57 @@ CREATE TABLE IF NOT EXISTS protective_orders (
     last_reconciled_at  TEXT,
     supersedes_protective_order_id INTEGER REFERENCES protective_orders(id)
 );
+-- One discovery run, and how much of its declared universe it actually saw.
+--
+-- `coverage_complete` is computed from row counts against the scanner's hard
+-- cap, never from the broker's reported total, which has been observed to
+-- disagree with itself. A false value does not stop a shadow run, but analysis
+-- must be able to tell "the strategy saw the whole universe" from "the strategy
+-- saw a truncated sample" — otherwise a broker limit reads as a lack of setups.
+--
+-- `scan_config_json` records the filter definition that produced the run, so a
+-- run stays interpretable after the filters are retuned. Same reasoning as the
+-- versioned capability profile, applied to the scan rather than the endpoint.
+CREATE TABLE IF NOT EXISTS scan_runs (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                   TEXT NOT NULL UNIQUE,
+    source                   TEXT NOT NULL,
+    scanner_profile_ref      TEXT,
+    started_at               TEXT NOT NULL,
+    completed_at             TEXT,
+    shard_count              INTEGER NOT NULL DEFAULT 0,
+    returned_before_dedupe   INTEGER NOT NULL DEFAULT 0,
+    unique_discovered        INTEGER NOT NULL DEFAULT 0,
+    duplicates_removed       INTEGER NOT NULL DEFAULT 0,
+    selected_for_enrichment  INTEGER NOT NULL DEFAULT 0,
+    truncated_candidate_count INTEGER NOT NULL DEFAULT 0,
+    coverage_status          TEXT NOT NULL,
+    coverage_complete        INTEGER NOT NULL DEFAULT 0,
+    scan_config_json         TEXT,
+    funnel_counts_json       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at);
+
+-- Every candidate a run produced, including the ones never examined. Recording
+-- only survivors would make the funnel unreadable: the interesting question is
+-- usually where candidates stop, not which ones finished.
+CREATE TABLE IF NOT EXISTS scan_candidates (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         TEXT NOT NULL,
+    symbol         TEXT NOT NULL,
+    instrument_id  TEXT,
+    source         TEXT NOT NULL,
+    sector         TEXT,
+    stage          TEXT NOT NULL,
+    exit_reason    TEXT,
+    -- Diagnostic only. Never an input to any decision; kept so a funnel can be
+    -- re-examined and so scanner drift is detectable after the fact.
+    source_values_json TEXT,
+    discovered_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_candidates_run ON scan_candidates(run_id);
+CREATE INDEX IF NOT EXISTS idx_scan_candidates_symbol ON scan_candidates(symbol);
+
 CREATE INDEX IF NOT EXISTS idx_protective_trade ON protective_orders(trade_client_key);
 CREATE INDEX IF NOT EXISTS idx_protective_state ON protective_orders(state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_protective_broker_order
@@ -292,6 +343,89 @@ class JournalRepository:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM trades WHERE closed_at IS NULL").fetchall()
         return [_trade_from_row(r) for r in rows]
+
+    # ----------------------------------------------------------- discovery
+
+    def record_scan_run(
+        self,
+        run_id: str,
+        batch: Any,
+        *,
+        candidates: Sequence[Any] | None = None,
+        scanner_profile_ref: str | None = None,
+        scan_config: dict[str, Any] | None = None,
+        selected_count: int = 0,
+        truncated_count: int = 0,
+        completed_at: datetime | None = None,
+    ) -> None:
+        """Persist a discovery run and every candidate it produced.
+
+        Candidates are written whatever stage they reached, deferred ones
+        included. A funnel that recorded only survivors could not distinguish
+        "the strategy declined it" from "we never looked", and those two answer
+        completely different questions about why a day produced no trades.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO scan_runs (
+                    run_id, source, scanner_profile_ref, started_at, completed_at,
+                    shard_count, returned_before_dedupe, unique_discovered,
+                    duplicates_removed, selected_for_enrichment,
+                    truncated_candidate_count, coverage_status, coverage_complete,
+                    scan_config_json, funnel_counts_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    batch.source,
+                    scanner_profile_ref,
+                    batch.started_at.isoformat(),
+                    (completed_at or datetime.now(UTC)).isoformat(),
+                    len(batch.shards),
+                    batch.returned_before_dedupe,
+                    len(batch.candidates),
+                    batch.duplicates_removed,
+                    selected_count,
+                    truncated_count,
+                    batch.coverage.value,
+                    int(batch.coverage_complete),
+                    json.dumps(scan_config) if scan_config else None,
+                    json.dumps(batch.counts()),
+                ),
+            )
+            conn.executemany(
+                """INSERT INTO scan_candidates (
+                    run_id, symbol, instrument_id, source, sector, stage,
+                    exit_reason, source_values_json, discovered_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        run_id,
+                        c.symbol,
+                        c.instrument_id,
+                        c.source,
+                        c.sector,
+                        c.stage.value,
+                        c.exit_reason,
+                        json.dumps(c.source_values) if c.source_values else None,
+                        c.discovered_at.isoformat(),
+                    )
+                    for c in (candidates if candidates is not None else batch.candidates)
+                ],
+            )
+
+    def scan_candidates(self, run_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scan_candidates WHERE run_id = ?", (run_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def scan_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scan_runs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def closed_trades(self, strategy: str | None = None) -> list[TradeRecord]:
         query = "SELECT * FROM trades WHERE closed_at IS NOT NULL"
