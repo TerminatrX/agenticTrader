@@ -264,9 +264,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
 
     payloads = bundle.get("payloads", {})
     try:
-        trading_date = (
-            date.fromisoformat(args.date) if args.date else datetime.now(UTC).date()
-        )
+        trading_date = date.fromisoformat(args.date)
     except ValueError:
         return _fail(f"--date must be YYYY-MM-DD, got {args.date!r}")
 
@@ -283,7 +281,11 @@ def cmd_discover(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         return _fail(f"discovery failed: {exc!r}", EXIT_ERROR)
 
-    if not args.no_journal and not args.dry_run and result.batch is not None:
+    # Journalled unconditionally. A run stopped by membership drift produces no
+    # DiscoveryBatch at all, and that is precisely the run worth keeping — "Legend
+    # changed, so we refused to discover" must survive in the record rather than
+    # only in stdout.
+    if not args.no_journal and not args.dry_run:
         try:
             repo = JournalRepository(args.db or _default_db(config.project_root))
             repo.record_scan_run(
@@ -298,6 +300,12 @@ def cmd_discover(args: argparse.Namespace) -> int:
                 budget_deferred_count=(
                     result.selection.budget_deferred_count if result.selection else 0
                 ),
+                drift_status=result.drift_status.value,
+                drift_findings=result.drift.as_dicts(),
+                aborted_reason=result.aborted_reason,
+                coverage_status=result.coverage.value,
+                source="robinhood_scanner",
+                started_at=result.started_at,
             )
         except Exception as exc:  # noqa: BLE001 - journal must never block a decision
             print(f"warning: journal unavailable ({exc})", file=sys.stderr)
@@ -545,7 +553,15 @@ def build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--input", help="Discovery bundle (default: stdin).")
     dc.add_argument("--budget", type=int, default=25, help="Max candidates to enrich.")
     dc.add_argument("--max-per-sector", type=int, default=None)
-    dc.add_argument("--date", help="Trading date (YYYY-MM-DD). Defaults to today.")
+    dc.add_argument(
+        "--date",
+        required=True,
+        help=(
+            "Trading date (YYYY-MM-DD). Required: candidate rotation keys on it, "
+            "and UTC crosses midnight while the US session is still open, so an "
+            "ambient clock would rotate a day early and mislabel the journal."
+        ),
+    )
     dc.add_argument("--no-journal", action="store_true")
     dc.add_argument("--dry-run", action="store_true")
     dc.set_defaults(func=cmd_discover)

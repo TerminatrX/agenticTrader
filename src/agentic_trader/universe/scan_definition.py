@@ -60,6 +60,15 @@ class ScanDefinition:
     base_filters: dict[str, Any] = field(default_factory=dict)
     sorting: str | None = None
 
+    # Whether a run may proceed when coverage is anything but COMPLETE.
+    #
+    # The entire point of sharding is that the declared universe is fully
+    # reachable. If a shard grows to the cap, the correct response is to split
+    # that band again — not to keep collecting shadow observations from a
+    # biased first 200 while the journal records them as ordinary results.
+    # A definition that genuinely wants best-effort discovery can turn this off.
+    require_complete_coverage: bool = True
+
     @property
     def definition_ref(self) -> str:
         return f"{self.name}@{self.version}"
@@ -76,6 +85,7 @@ class ScanDefinition:
             "as_of": self.as_of.isoformat(),
             "base_filters": self.base_filters,
             "sorting": self.sorting,
+            "require_complete_coverage": self.require_complete_coverage,
             "shards": [s.as_dict() for s in self.shards],
         }
 
@@ -91,9 +101,20 @@ class ScanDefinition:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# `session` is declared explicitly. It is not a filter parameter we send — the
+# broker bakes it into the underlying expression, e.g.
+# `rsi(candlePeriod="1d", candleCount=14, session="all")` — but it changes what
+# the number means, and "all" includes extended hours while our own indicators
+# use regular hours only. Recording it makes a silent change to that semantics
+# detectable as drift instead of invisible.
 _BASE_FILTERS = {
-    "average_volume": {"predicate": ">", "value": 500_000, "length": 30, "interval": "1d"},
-    "rsi": {"predicate": "BETWEEN", "values": [25, 50], "length": 14, "interval": "1d"},
+    "average_volume": {
+        "predicate": ">", "value": 500_000, "length": 30, "interval": "1d", "session": "all",
+    },
+    "rsi": {
+        "predicate": "BETWEEN", "values": [25, 50], "length": 14, "interval": "1d",
+        "session": "all",
+    },
     "instrument_type": {"predicate": "=", "value": "STOCK"},
 }
 
@@ -118,7 +139,7 @@ def _shard(scan_id: str, label: str, low: int | None, high: int | None) -> Shard
 # distort which setups the strategy ever sees.
 DISCOVERY_V1 = ScanDefinition(
     name="agentic-discovery",
-    version="v1-2026-08-18",
+    version="v2-2026-08-18",
     as_of=date(2026, 8, 18),
     base_filters=_BASE_FILTERS,
     sorting="Market cap desc",

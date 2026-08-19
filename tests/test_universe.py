@@ -468,10 +468,15 @@ def test_the_scanner_fingerprint_is_pinned():
 
 def test_the_discovery_definition_fingerprint_is_pinned():
     """Same reasoning: retuning RSI 25-50 to 20-55 must not leave the run
-    labelled agentic-discovery@v1-2026-08-18."""
-    assert DISCOVERY_V1.definition_ref == "agentic-discovery@v1-2026-08-18"
+    labelled with the version that denoted the old universe.
+
+    v2 declares indicator session semantics explicitly. The universe it selects
+    is unchanged, but the declaration is not — and re-pinning without bumping is
+    exactly what this guard exists to prevent.
+    """
+    assert DISCOVERY_V1.definition_ref == "agentic-discovery@v2-2026-08-18"
     assert DISCOVERY_V1.config_fingerprint == (
-        "52f7627cb23d99eaeaf627b9af873b65837326ad2e7cef395b41e673b88c4692"
+        "a267b3add57036d2c8e82dc071d05e141269f1915f2413836177d4e9a6677761"
     )
 
 
@@ -550,7 +555,7 @@ def test_a_run_records_all_three_contract_identities(tmp_path):
 
     (run,) = repo.scan_runs()
     assert run["scanner_profile_ref"] == "robinhood-mcp-scanner@2026-08-18"
-    assert run["scan_definition_ref"] == "agentic-discovery@v1-2026-08-18"
+    assert run["scan_definition_ref"] == "agentic-discovery@v2-2026-08-18"
     assert run["scan_config_fingerprint"] == DISCOVERY_V1.config_fingerprint
     assert json.loads(run["scan_config_json"])["base_filters"]["rsi"]["values"] == [25, 50]
 
@@ -603,5 +608,5 @@ def test_a_journal_from_the_previous_release_still_accepts_a_run(tmp_path):
     _record(repo, batch, result)
 
     (run,) = repo.scan_runs()
-    assert run["scan_definition_ref"] == "agentic-discovery@v1-2026-08-18"
+    assert run["scan_definition_ref"] == "agentic-discovery@v2-2026-08-18"
     assert "truncated_candidate_count" in run  # obsolete column left in place

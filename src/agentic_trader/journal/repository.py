@@ -131,6 +131,9 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     coverage_status          TEXT NOT NULL,
     coverage_complete        INTEGER NOT NULL DEFAULT 0,
     scan_definition_ref      TEXT,
+    drift_status             TEXT,
+    drift_findings_json      TEXT,
+    aborted_reason           TEXT,
     scan_config_fingerprint  TEXT,
     scan_config_json         TEXT,
     coverage_reasons_json    TEXT,
@@ -204,6 +207,9 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "scan_definition_ref": "TEXT",
         "scan_config_fingerprint": "TEXT",
         "coverage_reasons_json": "TEXT",
+        "drift_status": "TEXT",
+        "drift_findings_json": "TEXT",
+        "aborted_reason": "TEXT",
     },
     "trades": {
         "thesis": "TEXT",
@@ -379,13 +385,19 @@ class JournalRepository:
     def record_scan_run(
         self,
         run_id: str,
-        batch: Any,
+        batch: Any | None,
         *,
         candidates: Sequence[Any] | None = None,
         scanner_profile_ref: str | None = None,
         scan_definition_ref: str | None = None,
         scan_config_fingerprint: str | None = None,
         scan_config: dict[str, Any] | None = None,
+        drift_status: str | None = None,
+        drift_findings: list[dict[str, Any]] | None = None,
+        aborted_reason: str | None = None,
+        coverage_status: str | None = None,
+        source: str | None = None,
+        started_at: datetime | None = None,
         selected_count: int = 0,
         budget_deferred_count: int = 0,
         completed_at: datetime | None = None,
@@ -397,7 +409,12 @@ class JournalRepository:
         "the strategy declined it" from "we never looked", and those two answer
         completely different questions about why a day produced no trades.
         """
-        rows = list(candidates if candidates is not None else batch.candidates)
+        rows = list(
+            candidates
+            if candidates is not None
+            else (batch.candidates if batch is not None else [])
+        )
+        shards = list(batch.shards) if batch is not None else []
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO scan_runs (
@@ -406,27 +423,33 @@ class JournalRepository:
                     duplicates_removed, selected_for_enrichment,
                     budget_deferred_count, coverage_status, coverage_complete,
                     scan_definition_ref, scan_config_fingerprint,
-                    scan_config_json, coverage_reasons_json, funnel_counts_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    scan_config_json, coverage_reasons_json, funnel_counts_json,
+                    drift_status, drift_findings_json, aborted_reason
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
-                    batch.source,
+                    source or (batch.source if batch is not None else "unknown"),
                     scanner_profile_ref,
-                    batch.started_at.isoformat(),
+                    (started_at or (batch.started_at if batch is not None else datetime.now(UTC)))
+                    .isoformat(),
                     (completed_at or datetime.now(UTC)).isoformat(),
-                    len(batch.shards),
-                    batch.returned_before_dedupe,
-                    len(batch.candidates),
-                    batch.duplicates_removed,
+                    len(shards),
+                    batch.returned_before_dedupe if batch is not None else 0,
+                    len(batch.candidates) if batch is not None else 0,
+                    batch.duplicates_removed if batch is not None else 0,
                     selected_count,
                     budget_deferred_count,
-                    batch.coverage.value,
-                    int(batch.coverage_complete),
+                    coverage_status
+                    or (batch.coverage.value if batch is not None else "incomplete"),
+                    int(batch.coverage_complete) if batch is not None else 0,
                     scan_definition_ref,
                     scan_config_fingerprint,
                     json.dumps(scan_config) if scan_config else None,
-                    json.dumps(batch.report.reasons()),
+                    json.dumps(batch.report.reasons() if batch is not None else []),
                     json.dumps(funnel_counts(rows)),
+                    drift_status,
+                    json.dumps(drift_findings) if drift_findings else None,
+                    aborted_reason,
                 ),
             )
             conn.executemany(
@@ -466,7 +489,7 @@ class JournalRepository:
                         sh.reported_total,
                         sh.coverage.value,
                     )
-                    for sh in batch.shards
+                    for sh in shards
                 ],
             )
 

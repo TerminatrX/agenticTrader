@@ -50,6 +50,25 @@ from agentic_trader.universe.scanner_capabilities import (
 )
 from agentic_trader.universe.selection import SelectionResult, select_for_enrichment
 
+COVERAGE_ABORT = "discovery_coverage_incomplete"
+"""Exit reason when the declared universe was not fully reachable.
+
+The point of five shards is that every match is returned. A shard reaching the
+cap means it should be split again, not that the run should quietly continue
+collecting shadow observations from a biased first two hundred and record them
+as ordinary results.
+"""
+
+FUNDAMENTALS_MISSING = "fundamentals_missing"
+"""No authoritative fundamentals response covered this symbol.
+
+Distinct from a genuinely unknown sector. A returned entry whose `sector` is
+null is a fact about the company; a symbol absent from every response is a fact
+about our fetch. Treating the second as the first would let a failed batch feed
+candidates into selection under the unknown-sector cap as though they were
+ordinary.
+"""
+
 DRIFT_ABORT = "scan_definition_drift"
 """Exit reason for candidates on a run stopped by membership-affecting drift.
 
@@ -72,6 +91,7 @@ class DiscoveryResult:
     drift: DriftReport = field(default_factory=DriftReport)
     batch: DiscoveryBatch | None = None
     selection: SelectionResult | None = None
+    unfetched: list[ScanCandidate] = field(default_factory=list)
     aborted_reason: str | None = None
 
     @property
@@ -95,7 +115,7 @@ class DiscoveryResult:
     @property
     def all_candidates(self) -> list[ScanCandidate]:
         if self.selection:
-            return [*self.selection.selected, *self.selection.deferred]
+            return [*self.selection.selected, *self.selection.deferred, *self.unfetched]
         return list(self.batch.candidates) if self.batch else []
 
     def summary(self) -> dict[str, Any]:
@@ -111,6 +131,7 @@ class DiscoveryResult:
             "funnel": funnel_counts(self.all_candidates),
             "discovered": len(self.batch.candidates) if self.batch else 0,
             "duplicates_removed": self.batch.duplicates_removed if self.batch else 0,
+            "fundamentals_missing": len(self.unfetched),
             "selected": self.selected_symbols,
         }
 
@@ -160,23 +181,37 @@ def run_discovery(
         result.aborted_reason = DRIFT_ABORT
         return result
 
+    if definition.require_complete_coverage and result.coverage is not CoverageStatus.COMPLETE:
+        result.aborted_reason = COVERAGE_ABORT
+        return result
+
     # 3. Sector, from authoritative fundamentals. Scanner columns are never
     # consulted — they are diagnostic, and computed over a different session.
     sectors = parse_sectors(fundamentals_payloads or [])
-    enriched = [
-        c.with_sector(sectors.get(c.symbol)).advanced_to(FunnelStage.ELIGIBLE)
-        for c in result.batch.candidates
-    ]
+    eligible: list[ScanCandidate] = []
+    result.unfetched = []
+    for c in result.batch.candidates:
+        if c.symbol not in sectors:
+            # Absent from every response, not merely sector-less. Never selected.
+            result.unfetched.append(c.dropped(FUNDAMENTALS_MISSING))
+            continue
+        eligible.append(
+            c.with_sector(sectors[c.symbol]).advanced_to(FunnelStage.ELIGIBLE)
+        )
 
     # 4. Selection, bounded by the enrichment budget.
     result.selection = select_for_enrichment(
-        enriched, on=trading_date, budget=budget, max_per_sector=max_per_sector
+        eligible, on=trading_date, budget=budget, max_per_sector=max_per_sector
     )
     return result
 
 
 def abort_candidates(result: DiscoveryResult) -> list[ScanCandidate]:
     """Candidates of an aborted run, tagged so the funnel says what happened."""
-    if not result.aborted_reason or not result.batch:
+    if not result.aborted_reason:
         return result.all_candidates
+    if not result.batch:
+        # Membership drift stops the run before any scan result is interpreted,
+        # so there are no candidates at all. The run itself is still journalled.
+        return []
     return [c.dropped(result.aborted_reason) for c in result.batch.candidates]

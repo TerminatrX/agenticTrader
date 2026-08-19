@@ -28,6 +28,7 @@ rewriting either would defeat the point of versioning them.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -121,6 +122,23 @@ class DriftReport:
         return [f.as_dict() for f in self.findings]
 
 
+_SESSION_RE = re.compile(r'session\s*=\s*"([^"]+)"')
+
+
+def _session_of(expression: str | None) -> str:
+    """Pull `session="all"` out of a broker expression.
+
+    `get_scans` does not surface session as a filter field, but it does return
+    the underlying expression, which carries it. Extracting it is what makes a
+    change from all-session to regular-session detectable — the two produce
+    materially different RSI and volume values for the same symbol.
+    """
+    if not expression:
+        return ""
+    m = _SESSION_RE.search(str(expression))
+    return m.group(1) if m else ""
+
+
 def _canonical(enum_name: str, spec: dict[str, Any]) -> tuple:
     """Normalize a filter to a comparable shape.
 
@@ -139,6 +157,7 @@ def _canonical(enum_name: str, spec: dict[str, Any]) -> tuple:
         values,
         str(spec.get("interval") or ""),
         str(spec.get("length") or ""),
+        str(spec.get("session") or ""),
     )
 
 
@@ -162,6 +181,7 @@ def _observed_filters(scan: dict[str, Any]) -> set[tuple]:
                     "values": f.get("values") or [],
                     "interval": f.get("interval"),
                     "length": f.get("length"),
+                    "session": _session_of(f.get("expression")),
                 },
             )
         )
@@ -213,8 +233,11 @@ def check_definition_drift(
                 )
             )
 
+        # A vanished sort is drift, not a match. Treating absent as equal is
+        # most dangerous exactly at the cap, where sorting decides which rows
+        # survive.
         live_sort = scan.get("sorting")
-        if definition.sorting and live_sort and live_sort != definition.sorting:
+        if definition.sorting and live_sort != definition.sorting:
             findings.append(
                 DriftFinding(
                     kind=DriftKind.SORT_DRIFT,
