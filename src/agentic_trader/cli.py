@@ -64,7 +64,7 @@ from agentic_trader.market.snapshot import SnapshotError, build_snapshot
 from agentic_trader.market.symbol_regime import classify_symbol_regime
 from agentic_trader.models import AccountState
 from agentic_trader.strategies.base import available_strategies
-from agentic_trader.universe import DISCOVERY_V1
+from agentic_trader.universe import CURRENT_DISCOVERY
 
 EXIT_OK, EXIT_BAD_INPUT, EXIT_ERROR = 0, 1, 2
 
@@ -272,10 +272,13 @@ def cmd_discover(args: argparse.Namespace) -> int:
         result = run_discovery(
             scans_payload=payloads.get("scans") or {},
             run_payloads=payloads.get("runs") or [],
-            fundamentals_payloads=payloads.get("fundamentals") or [],
-            definition=DISCOVERY_V1,
+            # Omitted key means "not fetched yet"; an empty list means the
+            # fetch happened and returned nothing. Do not collapse them.
+            fundamentals_payloads=payloads.get("fundamentals"),
+            definition=CURRENT_DISCOVERY,
             trading_date=trading_date,
             budget=args.budget,
+            fundamentals_budget=args.fundamentals_budget,
             max_per_sector=args.max_per_sector,
         )
     except Exception as exc:  # noqa: BLE001
@@ -295,7 +298,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
                 scanner_profile_ref=result.scanner_profile_ref,
                 scan_definition_ref=result.definition_ref,
                 scan_config_fingerprint=result.config_fingerprint,
-                scan_config=DISCOVERY_V1.as_config(),
+                scan_config=CURRENT_DISCOVERY.as_config(),
                 selected_count=len(result.selected_symbols),
                 budget_deferred_count=(
                     result.selection.budget_deferred_count if result.selection else 0
@@ -552,6 +555,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dc.add_argument("--input", help="Discovery bundle (default: stdin).")
     dc.add_argument("--budget", type=int, default=25, help="Max candidates to enrich.")
+    dc.add_argument(
+        "--fundamentals-budget",
+        type=int,
+        default=50,
+        help="Max candidates to request authoritative sector data for.",
+    )
     dc.add_argument("--max-per-sector", type=int, default=None)
     dc.add_argument(
         "--date",

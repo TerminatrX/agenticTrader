@@ -33,7 +33,7 @@ from agentic_trader.universe.drift import (
     check_definition_drift,
 )
 from agentic_trader.universe.scan_definition import (
-    DISCOVERY_V1,
+    CURRENT_DISCOVERY,
     ScanDefinition,
     ShardSpec,
 )
@@ -53,7 +53,7 @@ from agentic_trader.universe.selection import (
 
 __all__ = [
     "BUDGET_EXHAUSTED",
-    "DISCOVERY_V1",
+    "CURRENT_DISCOVERY",
     "FUNDAMENTALS_BUDGET",
     "ROBINHOOD_MCP_SCANNER",
     "UNKNOWN_SECTOR_LIMIT",

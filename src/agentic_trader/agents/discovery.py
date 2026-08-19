@@ -172,7 +172,7 @@ def run_discovery(
     *,
     scans_payload: Any,
     run_payloads: list[Any],
-    fundamentals_payloads: list[Any] | None = None,
+    fundamentals_payloads: list[Any] | None = None,   # None = not fetched yet
     definition: ScanDefinition,
     trading_date: date,
     budget: int = 25,
@@ -226,12 +226,20 @@ def run_discovery(
     )
     requested = {c.symbol for c in result.fundamentals_plan.selected}
 
-    sectors = parse_sectors(fundamentals_payloads or [])
-    if not sectors:
-        # Nothing fetched yet. Return the plan so the agent knows exactly which
-        # symbols to request; the selection is deterministic, so re-running with
-        # those payloads picks the same set.
+    if fundamentals_payloads is None:
+        # Phase one: nothing fetched yet. Return the plan so the agent knows
+        # exactly which symbols to request; selection is deterministic, so
+        # re-running with those payloads picks the same set.
+        #
+        # `None` rather than falsiness on purpose. An attempted fetch that came
+        # back with zero results is a provider failure, not an un-started phase,
+        # and an emptiness check would loop it back to "please fetch these"
+        # forever instead of recording it.
         return result
+
+    # Phase two: a fetch was attempted. Anything requested but absent from the
+    # response is now a failure, including when the response carried nothing.
+    sectors = parse_sectors(fundamentals_payloads)
 
     eligible: list[ScanCandidate] = []
     result.unfetched = []

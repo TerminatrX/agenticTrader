@@ -32,7 +32,7 @@ from agentic_trader.cli import main
 from agentic_trader.journal import JournalRepository
 from agentic_trader.models import MarketSnapshot
 from agentic_trader.universe import (
-    DISCOVERY_V1,
+    CURRENT_DISCOVERY,
     FUNDAMENTALS_BUDGET,
     ROBINHOOD_MCP_SCANNER,
     CoverageStatus,
@@ -42,7 +42,7 @@ from agentic_trader.universe import (
 
 NOW = datetime(2026, 8, 18, 14, 0, tzinfo=UTC)
 DAY = date(2026, 8, 18)
-SHARDS = DISCOVERY_V1.expected_shard_ids
+SHARDS = CURRENT_DISCOVERY.expected_shard_ids
 SECTORS = ["Technology", "Financials", "Healthcare", "Energy", "Utilities"]
 
 
@@ -99,13 +99,13 @@ def _live_scan(shard, *, rsi=("25", "50"), sorting="Market cap desc",
 
 
 def _scans(**kw):
-    return {"data": {"scans": [_live_scan(s, **kw) for s in DISCOVERY_V1.shards]}}
+    return {"data": {"scans": [_live_scan(s, **kw) for s in CURRENT_DISCOVERY.shards]}}
 
 
 def _drifted_scans(shard_index=2, **kw):
     entries = [
         _live_scan(s, **(kw if i == shard_index else {}))
-        for i, s in enumerate(DISCOVERY_V1.shards)
+        for i, s in enumerate(CURRENT_DISCOVERY.shards)
     ]
     return {"data": {"scans": entries}}
 
@@ -147,7 +147,7 @@ def _run(**kw):
     kw.setdefault("scans_payload", _scans())
     kw.setdefault("run_payloads", _runs())
     kw.setdefault("fundamentals_payloads", _fundamentals())
-    kw.setdefault("definition", DISCOVERY_V1)
+    kw.setdefault("definition", CURRENT_DISCOVERY)
     kw.setdefault("trading_date", DAY)
     kw.setdefault("now", NOW)
     kw.setdefault("run_id", "run-e2e")
@@ -216,10 +216,10 @@ def test_a_cortex_managed_scan_blocks():
 
 
 def test_drift_is_never_repaired_automatically():
-    before = DISCOVERY_V1.config_fingerprint
+    before = CURRENT_DISCOVERY.config_fingerprint
     _run(scans_payload=_drifted_scans(rsi=("20", "55")))
 
-    assert DISCOVERY_V1.config_fingerprint == before
+    assert CURRENT_DISCOVERY.config_fingerprint == before
 
 
 # ----------------------------------------------------- sort drift (conditional)
@@ -268,7 +268,7 @@ def test_a_definition_may_opt_out_of_requiring_complete_coverage():
     """Policy on the definition, not baked into ScannerSource."""
     import dataclasses
 
-    lenient = dataclasses.replace(DISCOVERY_V1, require_complete_coverage=False)
+    lenient = dataclasses.replace(CURRENT_DISCOVERY, require_complete_coverage=False)
     result = _run(definition=lenient, run_payloads=_runs(capped_shard=0),
                   fundamentals_payloads=_fundamentals())
 
@@ -313,7 +313,7 @@ def test_a_returned_null_sector_is_a_genuine_unknown():
 
 def test_no_fundamentals_yet_returns_a_plan_rather_than_failures():
     """Three states, not two. Nothing has failed here — nothing was asked."""
-    result = _run(fundamentals_payloads=[])
+    result = _run(fundamentals_payloads=None)
 
     assert result.selected_symbols == []
     assert result.unfetched == []            # no failures
@@ -326,10 +326,34 @@ def test_no_fundamentals_yet_returns_a_plan_rather_than_failures():
 
 def test_the_fundamentals_plan_is_deterministic():
     """The agent fetches the plan then re-runs; both runs must agree."""
-    a = _run(fundamentals_payloads=[]).fundamentals_requested
-    b = _run(fundamentals_payloads=[]).fundamentals_requested
+    a = _run(fundamentals_payloads=None).fundamentals_requested
+    b = _run(fundamentals_payloads=None).fundamentals_requested
 
     assert a == b
+
+
+def test_an_attempted_fetch_that_returned_nothing_is_a_failure():
+    """`None` and `[]` are different states.
+
+    An emptiness check would loop a failed fetch back into "please fetch
+    these" forever instead of recording that the provider returned nothing.
+    """
+    result = _run(fundamentals_payloads=[{"data": {"results": []}}])
+
+    # The plan still records what was asked for — that is what makes the
+    # failure legible rather than looking like nothing was ever requested.
+    assert len(result.fundamentals_requested) == 20
+    assert len(result.unfetched) == 20
+    assert all(c.exit_reason == FUNDAMENTALS_MISSING for c in result.unfetched)
+    assert result.selected_symbols == []
+
+
+def test_an_empty_payload_list_also_counts_as_attempted():
+    """The agent made calls and got nothing usable back."""
+    result = _run(fundamentals_payloads=[])
+
+    assert len(result.unfetched) == 20
+    assert all(c.exit_reason == FUNDAMENTALS_MISSING for c in result.unfetched)
 
 
 def test_the_fundamentals_budget_rotates_across_shards():
@@ -337,7 +361,7 @@ def test_the_fundamentals_budget_rotates_across_shards():
 
     Provenance decides where compute is spent; scanner values never do.
     """
-    result = _run(run_payloads=_runs(per_shard=20), fundamentals_payloads=[],
+    result = _run(run_payloads=_runs(per_shard=20), fundamentals_payloads=None,
                   fundamentals_budget=10)
 
     assert len(result.fundamentals_requested) == 10
@@ -348,7 +372,7 @@ def test_the_fundamentals_budget_rotates_across_shards():
 def test_unrequested_candidates_are_budget_deferred_not_missing():
     """A deliberate compute decision must not be recorded as a provider
     failure, which is what the live smoke exposed."""
-    result = _run(run_payloads=_runs(per_shard=20), fundamentals_payloads=[],
+    result = _run(run_payloads=_runs(per_shard=20), fundamentals_payloads=None,
                   fundamentals_budget=10)
 
     deferred = result.fundamentals_plan.deferred
@@ -368,7 +392,7 @@ def _record(repo, result):
         scanner_profile_ref=result.scanner_profile_ref,
         scan_definition_ref=result.definition_ref,
         scan_config_fingerprint=result.config_fingerprint,
-        scan_config=DISCOVERY_V1.as_config(),
+        scan_config=CURRENT_DISCOVERY.as_config(),
         selected_count=len(result.selected_symbols),
         drift_status=result.drift_status.value,
         drift_findings=result.drift.as_dicts(),

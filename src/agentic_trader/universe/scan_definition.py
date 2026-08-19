@@ -137,7 +137,11 @@ def _shard(scan_id: str, label: str, low: int | None, high: int | None) -> Shard
 # authoritatively from fundamentals during enrichment anyway. No price filter,
 # deliberately — a ceiling chosen to suit the current account size would
 # distort which setups the strategy ever sees.
-DISCOVERY_V1 = ScanDefinition(
+# The definition in force. Named for its role rather than its version --
+# `ScanDefinition.version` is the authoritative historical identity, and a
+# constant called DISCOVERY_V1 holding a v2 definition was already one
+# mismatch too many.
+CURRENT_DISCOVERY = ScanDefinition(
     name="agentic-discovery",
     version="v2-2026-08-18",
     as_of=date(2026, 8, 18),

@@ -26,7 +26,7 @@ from agentic_trader.journal import JournalRepository
 from agentic_trader.market.snapshot import build_snapshot
 from agentic_trader.universe import (
     BUDGET_EXHAUSTED,
-    DISCOVERY_V1,
+    CURRENT_DISCOVERY,
     ROBINHOOD_MCP_SCANNER,
     UNKNOWN_SECTOR_LIMIT,
     CoverageStatus,
@@ -44,7 +44,7 @@ from agentic_trader.universe import (
 
 NOW = datetime(2026, 8, 18, 14, 0, tzinfo=UTC)
 DAY = date(2026, 8, 18)
-SHARDS = DISCOVERY_V1.expected_shard_ids
+SHARDS = CURRENT_DISCOVERY.expected_shard_ids
 
 
 def _payload(scan_id, tickers, total=None, extra_rows=()):
@@ -75,7 +75,7 @@ def _all_shards():
 
 
 def _scan(payloads):
-    return ScannerSource(payloads, DISCOVERY_V1).discover(now=NOW)
+    return ScannerSource(payloads, CURRENT_DISCOVERY).discover(now=NOW)
 
 
 def _cand(symbol, sector=None):
@@ -440,7 +440,7 @@ def test_the_scanner_profile_describes_the_endpoint_only():
 
     assert "default_row_fields" not in fields
     assert "default_sorting" not in fields
-    assert "sorting" in DISCOVERY_V1.as_config()
+    assert "sorting" in CURRENT_DISCOVERY.as_config()
 
 
 def test_the_three_contracts_are_versioned_independently():
@@ -449,7 +449,7 @@ def test_the_three_contracts_are_versioned_independently():
     assert len({
         ROBINHOOD_MCP.profile_ref,
         ROBINHOOD_MCP_SCANNER.profile_ref,
-        DISCOVERY_V1.definition_ref,
+        CURRENT_DISCOVERY.definition_ref,
     }) == 3
 
 
@@ -474,8 +474,8 @@ def test_the_discovery_definition_fingerprint_is_pinned():
     is unchanged, but the declaration is not — and re-pinning without bumping is
     exactly what this guard exists to prevent.
     """
-    assert DISCOVERY_V1.definition_ref == "agentic-discovery@v2-2026-08-18"
-    assert DISCOVERY_V1.config_fingerprint == (
+    assert CURRENT_DISCOVERY.definition_ref == "agentic-discovery@v2-2026-08-18"
+    assert CURRENT_DISCOVERY.config_fingerprint == (
         "a267b3add57036d2c8e82dc071d05e141269f1915f2413836177d4e9a6677761"
     )
 
@@ -484,17 +484,17 @@ def test_retuning_a_filter_moves_the_definition_fingerprint():
     import dataclasses
 
     retuned = dataclasses.replace(
-        DISCOVERY_V1,
-        base_filters={**DISCOVERY_V1.base_filters, "rsi": {"values": [20, 55]}},
+        CURRENT_DISCOVERY,
+        base_filters={**CURRENT_DISCOVERY.base_filters, "rsi": {"values": [20, 55]}},
     )
-    assert retuned.config_fingerprint != DISCOVERY_V1.config_fingerprint
+    assert retuned.config_fingerprint != CURRENT_DISCOVERY.config_fingerprint
 
 
 def test_every_shard_declares_the_stock_filter():
     """The Mega shard was created without it and repaired later; the definition
     and the live scans must agree on the declared universe."""
-    assert DISCOVERY_V1.base_filters["instrument_type"]["value"] == "STOCK"
-    assert len(DISCOVERY_V1.expected_shard_ids) == 5
+    assert CURRENT_DISCOVERY.base_filters["instrument_type"]["value"] == "STOCK"
+    assert len(CURRENT_DISCOVERY.expected_shard_ids) == 5
 
 
 def test_the_vocabulary_mismatch_is_recorded():
@@ -520,9 +520,9 @@ def _record(repo, batch, result, run_id="run-1"):
         batch,
         candidates=[*result.selected, *result.deferred],
         scanner_profile_ref=ROBINHOOD_MCP_SCANNER.profile_ref,
-        scan_definition_ref=DISCOVERY_V1.definition_ref,
-        scan_config_fingerprint=DISCOVERY_V1.config_fingerprint,
-        scan_config=DISCOVERY_V1.as_config(),
+        scan_definition_ref=CURRENT_DISCOVERY.definition_ref,
+        scan_config_fingerprint=CURRENT_DISCOVERY.config_fingerprint,
+        scan_config=CURRENT_DISCOVERY.as_config(),
         selected_count=len(result.selected),
         budget_deferred_count=result.budget_deferred_count,
     )
@@ -556,7 +556,7 @@ def test_a_run_records_all_three_contract_identities(tmp_path):
     (run,) = repo.scan_runs()
     assert run["scanner_profile_ref"] == "robinhood-mcp-scanner@2026-08-18"
     assert run["scan_definition_ref"] == "agentic-discovery@v2-2026-08-18"
-    assert run["scan_config_fingerprint"] == DISCOVERY_V1.config_fingerprint
+    assert run["scan_config_fingerprint"] == CURRENT_DISCOVERY.config_fingerprint
     assert json.loads(run["scan_config_json"])["base_filters"]["rsi"]["values"] == [25, 50]
 
 
