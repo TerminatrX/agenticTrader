@@ -43,15 +43,18 @@ from agentic_trader.universe.scanner_capabilities import (
 )
 from agentic_trader.universe.selection import (
     BUDGET_EXHAUSTED,
+    FUNDAMENTALS_BUDGET,
     UNKNOWN_SECTOR_LIMIT,
     SelectionResult,
     rotation_key,
     select_for_enrichment,
+    select_for_fundamentals,
 )
 
 __all__ = [
     "BUDGET_EXHAUSTED",
     "DISCOVERY_V1",
+    "FUNDAMENTALS_BUDGET",
     "ROBINHOOD_MCP_SCANNER",
     "UNKNOWN_SECTOR_LIMIT",
     "CoverageReport",
@@ -80,4 +83,5 @@ __all__ = [
     "resolve_coverage",
     "rotation_key",
     "select_for_enrichment",
+    "select_for_fundamentals",
 ]

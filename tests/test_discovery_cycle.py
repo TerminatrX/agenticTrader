@@ -33,9 +33,11 @@ from agentic_trader.journal import JournalRepository
 from agentic_trader.models import MarketSnapshot
 from agentic_trader.universe import (
     DISCOVERY_V1,
+    FUNDAMENTALS_BUDGET,
     ROBINHOOD_MCP_SCANNER,
     CoverageStatus,
     DefinitionDriftStatus,
+    FunnelStage,
 )
 
 NOW = datetime(2026, 8, 18, 14, 0, tzinfo=UTC)
@@ -288,8 +290,8 @@ def test_coverage_and_drift_stay_orthogonal():
 
 
 def test_a_symbol_absent_from_fundamentals_is_never_selected():
-    """"Sector unknown from an authoritative response" and "we never received
-    authoritative data" are different facts."""
+    """Requested but not returned — a provider failure, distinct from both a
+    null sector and a budget decision."""
     result = _run(fundamentals_payloads=_fundamentals(omit={"S0T0", "S0T1"}))
 
     assert {c.symbol for c in result.unfetched} == {"S0T0", "S0T1"}
@@ -309,13 +311,50 @@ def test_a_returned_null_sector_is_a_genuine_unknown():
     assert any(c.sector is None for c in result.selection.selected)
 
 
-def test_a_wholly_failed_fundamentals_fetch_selects_nothing():
-    """Without this distinction a failed batch would feed candidates into
-    selection under the unknown-sector cap as though they were ordinary."""
+def test_no_fundamentals_yet_returns_a_plan_rather_than_failures():
+    """Three states, not two. Nothing has failed here — nothing was asked."""
     result = _run(fundamentals_payloads=[])
 
     assert result.selected_symbols == []
-    assert len(result.unfetched) == 20
+    assert result.unfetched == []            # no failures
+    assert len(result.fundamentals_requested) == 20
+    assert all(
+        c.stage is FunnelStage.FUNDAMENTALS_SELECTED
+        for c in result.fundamentals_plan.selected
+    )
+
+
+def test_the_fundamentals_plan_is_deterministic():
+    """The agent fetches the plan then re-runs; both runs must agree."""
+    a = _run(fundamentals_payloads=[]).fundamentals_requested
+    b = _run(fundamentals_payloads=[]).fundamentals_requested
+
+    assert a == b
+
+
+def test_the_fundamentals_budget_rotates_across_shards():
+    """Spread over the whole market-cap range, not whichever band sorts first.
+
+    Provenance decides where compute is spent; scanner values never do.
+    """
+    result = _run(run_payloads=_runs(per_shard=20), fundamentals_payloads=[],
+                  fundamentals_budget=10)
+
+    assert len(result.fundamentals_requested) == 10
+    shards = {c.shard_id for c in result.fundamentals_plan.selected}
+    assert len(shards) == 5   # every shard represented
+
+
+def test_unrequested_candidates_are_budget_deferred_not_missing():
+    """A deliberate compute decision must not be recorded as a provider
+    failure, which is what the live smoke exposed."""
+    result = _run(run_payloads=_runs(per_shard=20), fundamentals_payloads=[],
+                  fundamentals_budget=10)
+
+    deferred = result.fundamentals_plan.deferred
+    assert len(deferred) == 90
+    assert all(c.exit_reason == FUNDAMENTALS_BUDGET for c in deferred)
+    assert all(c.exit_reason != FUNDAMENTALS_MISSING for c in deferred)
 
 
 # ------------------------------------------------------------------ journal

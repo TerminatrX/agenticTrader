@@ -37,6 +37,15 @@ separate "the strategy declined this" from "we ran out of budget before
 looking" will read a compute limit as an absence of opportunity.
 """
 
+FUNDAMENTALS_BUDGET = "fundamentals_budget"
+"""We deliberately never requested fundamentals for this candidate.
+
+Distinct from `fundamentals_missing`, which means we asked and got nothing
+back. Nothing failed here — a compute decision was made. Recording a budget
+choice as a data-provider failure would make the funnel unreadable exactly
+where it needs to be clearest.
+"""
+
 UNKNOWN_SECTOR_LIMIT = "unknown_sector_limit"
 """Budget remained, but this candidate's sector is unknown and the unknown
 bucket was already at its cap.
@@ -168,4 +177,62 @@ def select_for_enrichment(
         selected=[c.advanced_to(FunnelStage.SELECTED) for c in selected],
         deferred=deferred,
         per_sector=dict(taken),
+    )
+
+
+def select_for_fundamentals(
+    candidates: list[ScanCandidate],
+    *,
+    on: date,
+    budget: int = 50,
+) -> SelectionResult:
+    """Choose which candidates are worth an authoritative sector lookup.
+
+    Fundamentals batch ten symbols per call, so this budget is far cheaper than
+    the per-symbol enrichment one — but at 763 discovered candidates it is still
+    77 calls, which is why it exists at all.
+
+    Rotation is across *shards*, using the originating scan id as provenance.
+    That spreads the sample over the whole market-cap range instead of whichever
+    band happens to sort first, and it deliberately does not rank on any scanner
+    value: RSI, market cap and volume from the scanner stay diagnostic. Choosing
+    where to spend compute from provenance is legitimate; choosing it from
+    numbers we have already declared untrustworthy is not.
+    """
+    if budget <= 0:
+        return SelectionResult(deferred=[c.dropped(FUNDAMENTALS_BUDGET) for c in candidates])
+
+    buckets: dict[str, list[ScanCandidate]] = defaultdict(list)
+    for c in candidates:
+        buckets[c.shard_id or ""].append(c)
+    for bucket in buckets.values():
+        bucket.sort(key=lambda c: rotation_key(c.symbol, on))
+
+    order = sorted(buckets, key=lambda sid: rotation_key(sid, on))
+    picked: list[ScanCandidate] = []
+    cursor = dict.fromkeys(order, 0)
+    per_shard: dict[str, int] = defaultdict(int)
+
+    while len(picked) < budget:
+        progressed = False
+        for sid in order:
+            if len(picked) >= budget:
+                break
+            i = cursor[sid]
+            if i >= len(buckets[sid]):
+                continue
+            picked.append(buckets[sid][i])
+            cursor[sid] = i + 1
+            per_shard[sid] += 1
+            progressed = True
+        if not progressed:
+            break
+
+    chosen = {id(c) for c in picked}
+    return SelectionResult(
+        selected=[c.advanced_to(FunnelStage.FUNDAMENTALS_SELECTED) for c in picked],
+        deferred=[
+            c.dropped(FUNDAMENTALS_BUDGET) for c in candidates if id(c) not in chosen
+        ],
+        per_sector=dict(per_shard),
     )

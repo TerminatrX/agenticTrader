@@ -48,6 +48,7 @@ class FunnelStage(StrEnum):
     """Where a candidate got to. Ordered from first to last."""
 
     DISCOVERED = "discovered"
+    FUNDAMENTALS_SELECTED = "fundamentals_selected"
     ELIGIBLE = "eligible"
     SELECTED = "selected"
     ENRICHED = "enriched"
@@ -75,6 +76,10 @@ class ScanCandidate:
     discovered_at: datetime
     instrument_id: str | None = None
     source_values: dict[str, str] = field(default_factory=dict)
+
+    # Which saved scan produced this candidate. Provenance, not a value: it
+    # decides where compute is spent, never what a decision concludes.
+    shard_id: str | None = None
 
     stage: FunnelStage = FunnelStage.DISCOVERED
     exit_reason: str | None = None

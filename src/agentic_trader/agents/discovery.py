@@ -48,7 +48,11 @@ from agentic_trader.universe.scanner_capabilities import (
     ROBINHOOD_MCP_SCANNER,
     ScannerCapabilities,
 )
-from agentic_trader.universe.selection import SelectionResult, select_for_enrichment
+from agentic_trader.universe.selection import (
+    SelectionResult,
+    select_for_enrichment,
+    select_for_fundamentals,
+)
 
 COVERAGE_ABORT = "discovery_coverage_incomplete"
 """Exit reason when the declared universe was not fully reachable.
@@ -91,6 +95,7 @@ class DiscoveryResult:
     drift: DriftReport = field(default_factory=DriftReport)
     batch: DiscoveryBatch | None = None
     selection: SelectionResult | None = None
+    fundamentals_plan: SelectionResult | None = None
     unfetched: list[ScanCandidate] = field(default_factory=list)
     aborted_reason: str | None = None
 
@@ -113,9 +118,32 @@ class DiscoveryResult:
         return [c.symbol for c in self.selection.selected] if self.selection else []
 
     @property
+    def fundamentals_requested(self) -> list[str]:
+        """Symbols the agent should fetch fundamentals for, before re-running.
+
+        Deterministic, so the second run selects exactly the same set.
+        """
+        return (
+            [c.symbol for c in self.fundamentals_plan.selected]
+            if self.fundamentals_plan
+            else []
+        )
+
+    @property
     def all_candidates(self) -> list[ScanCandidate]:
+        """Every candidate, each at the furthest stage it reached."""
+        deferred_fundamentals = (
+            list(self.fundamentals_plan.deferred) if self.fundamentals_plan else []
+        )
         if self.selection:
-            return [*self.selection.selected, *self.selection.deferred, *self.unfetched]
+            return [
+                *self.selection.selected,
+                *self.selection.deferred,
+                *self.unfetched,
+                *deferred_fundamentals,
+            ]
+        if self.fundamentals_plan:
+            return [*self.fundamentals_plan.selected, *deferred_fundamentals]
         return list(self.batch.candidates) if self.batch else []
 
     def summary(self) -> dict[str, Any]:
@@ -131,6 +159,10 @@ class DiscoveryResult:
             "funnel": funnel_counts(self.all_candidates),
             "discovered": len(self.batch.candidates) if self.batch else 0,
             "duplicates_removed": self.batch.duplicates_removed if self.batch else 0,
+            "fundamentals_requested": self.fundamentals_requested,
+            "fundamentals_budget_deferred": (
+                len(self.fundamentals_plan.deferred) if self.fundamentals_plan else 0
+            ),
             "fundamentals_missing": len(self.unfetched),
             "selected": self.selected_symbols,
         }
@@ -144,6 +176,7 @@ def run_discovery(
     definition: ScanDefinition,
     trading_date: date,
     budget: int = 25,
+    fundamentals_budget: int = 50,
     max_per_sector: int | None = None,
     capabilities: ScannerCapabilities = ROBINHOOD_MCP_SCANNER,
     now: datetime | None = None,
@@ -185,19 +218,33 @@ def run_discovery(
         result.aborted_reason = COVERAGE_ABORT
         return result
 
-    # 3. Sector, from authoritative fundamentals. Scanner columns are never
-    # consulted — they are diagnostic, and computed over a different session.
+    # 3. Fundamentals budget. Sector lookups batch ten per call, so this is far
+    # cheaper than enrichment — but 763 candidates is still 77 calls, so it gets
+    # a budget of its own rather than being treated as free.
+    result.fundamentals_plan = select_for_fundamentals(
+        result.batch.candidates, on=trading_date, budget=fundamentals_budget
+    )
+    requested = {c.symbol for c in result.fundamentals_plan.selected}
+
     sectors = parse_sectors(fundamentals_payloads or [])
+    if not sectors:
+        # Nothing fetched yet. Return the plan so the agent knows exactly which
+        # symbols to request; the selection is deterministic, so re-running with
+        # those payloads picks the same set.
+        return result
+
     eligible: list[ScanCandidate] = []
     result.unfetched = []
-    for c in result.batch.candidates:
+    for c in result.fundamentals_plan.selected:
         if c.symbol not in sectors:
-            # Absent from every response, not merely sector-less. Never selected.
+            # We asked and got nothing back — a provider failure, not a budget
+            # decision. Never selected.
             result.unfetched.append(c.dropped(FUNDAMENTALS_MISSING))
             continue
         eligible.append(
             c.with_sector(sectors[c.symbol]).advanced_to(FunnelStage.ELIGIBLE)
         )
+    assert requested >= {c.symbol for c in eligible}
 
     # 4. Selection, bounded by the enrichment budget.
     result.selection = select_for_enrichment(

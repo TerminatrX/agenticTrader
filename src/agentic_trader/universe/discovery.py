@@ -106,6 +106,8 @@ def parse_scan_payload(
     if not isinstance(rows, list):
         raise ShardError("scan payload has no results list")
 
+    shard_id = str(result.get("scan_id", "")) or None
+
     candidates: list[ScanCandidate] = []
     rejected = 0
     for row in rows:
@@ -122,6 +124,7 @@ def parse_scan_payload(
                 source=source,
                 discovered_at=discovered_at,
                 instrument_id=row.get("instrument_id"),
+                shard_id=shard_id,
                 # Diagnostic only. Never reaches build_snapshot.
                 source_values={str(k): str(v) for k, v in columns.items() if v is not None},
             )
