@@ -28,6 +28,7 @@ from agentic_trader.config import RiskConfig
 from agentic_trader.market.symbol_regime import SymbolTrendRegime, classify_symbol_regime
 from agentic_trader.models import (
     AccountState,
+    EarningsStatus,
     MarketSnapshot,
     RiskDecision,
     Side,
@@ -252,14 +253,24 @@ def critique(
             0.10,
         )
 
-    if snapshot.earnings is not None:
-        days_out = snapshot.earnings.days_until(current.date())
+    # The critic may only ever *add* concern here. The blackout itself is a
+    # hard gate in `risk/limits.py`; nothing in this function can clear it, and
+    # `confidence_adjustment` is clamped non-positive so a note cannot enlarge
+    # a position either.
+    assessment = snapshot.earnings
+    if assessment is not None and assessment.event is not None:
+        event = assessment.event
+        days_out = event.days_until(current.date())
         if 0 <= days_out <= 10:
             note = (
-                f"earnings in {days_out}d ({snapshot.earnings.report_date}, "
-                f"{'confirmed' if snapshot.earnings.verified else 'tentative'})"
+                f"earnings in {days_out}d ({event.report_date}, "
+                f"{'confirmed' if event.verified else 'tentative'})"
             )
             report.concern(f"{note} — plan the exit before the report", 0.15)
+    elif assessment is not None and assessment.status is EarningsStatus.UNKNOWN:
+        report.concern(
+            f"earnings status unknown ({assessment.reason or 'no reason recorded'})", 0.15
+        )
 
     gap = snapshot.previous_close
     if gap is not None and gap > 0:

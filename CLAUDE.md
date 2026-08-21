@@ -200,6 +200,15 @@ Discovered from the MCP tool schemas, not assumed:
   the symbol, so it appears not to validate order parameters. Confirming it
   would require placing a real order. **Do not.** The uncertainty is recorded in
   `execution/capabilities.py` as evidence, and the restriction is honoured.
+- **Earnings must come from `get_earnings_results`, one symbol per call.**
+  `get_earnings_calendar` accepts no symbol argument — it is a market-wide
+  window scan, and feeding it to a per-symbol parser attributes another
+  company's report date to the symbol under evaluation. That happened live. The
+  blackout gate fails closed: anything it cannot establish is
+  `earnings_status_unknown` and refuses the entry. Never treat a symbol's
+  absence from a response as evidence it has no earnings, and never use
+  `eps.actual` to decide whether a report is still ahead — it is unreliable in
+  both directions. `report.date` decides.
 - **`ref_id` must be a UUID** and is the broker's idempotency key. The risk
   engine derives it deterministically (UUIDv5) so a re-fired cycle dedupes on
   both sides.

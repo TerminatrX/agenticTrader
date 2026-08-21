@@ -9,8 +9,9 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from agentic_trader.models import EarningsEvent, Position, Side, Signal, SignalStrength
+from agentic_trader.models import Position, Side, Signal, SignalStrength
 from agentic_trader.risk.limits import check_limits
+from tests.conftest import clear_earnings
 
 TODAY = date(2026, 8, 13)
 
@@ -50,7 +51,8 @@ def test_earnings_blackout_blocks_entry(
     entry_signal, bullish_pullback_snapshot, account, risk_config
 ):
     imminent = bullish_pullback_snapshot.model_copy(
-        update={"earnings": EarningsEvent(report_date=date(2026, 8, 15), verified=True)}
+        update={"earnings": clear_earnings(
+            "AAPL", as_of=TODAY, report_date=date(2026, 8, 15), verified=True)}
     )
     result = check_limits(entry_signal, imminent, account, risk_config, as_of=TODAY)
 
@@ -64,7 +66,8 @@ def test_earnings_just_outside_blackout_warns_but_allows(
     result = check_limits(
         entry_signal,
         bullish_pullback_snapshot.model_copy(
-            update={"earnings": EarningsEvent(report_date=date(2026, 8, 20), verified=True)}
+            update={"earnings": clear_earnings(
+                "AAPL", as_of=TODAY, report_date=date(2026, 8, 20), verified=True)}
         ),
         account, risk_config, as_of=TODAY,
     )

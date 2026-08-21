@@ -18,7 +18,13 @@ from datetime import date
 from decimal import Decimal
 
 from agentic_trader.config import RiskConfig
-from agentic_trader.models import AccountState, MarketSnapshot, Side, Signal
+from agentic_trader.models import (
+    AccountState,
+    EarningsStatus,
+    MarketSnapshot,
+    Side,
+    Signal,
+)
 
 
 @dataclass
@@ -42,6 +48,15 @@ class LimitCheck:
 
     def note(self, reason: str) -> None:
         self.notes.append(reason)
+
+
+EARNINGS_UNKNOWN = "earnings_status_unknown"
+"""Breach prefix when the blackout window could not be established.
+
+Distinct from a breach naming a real report date: one says the symbol is
+inside its window, the other says we do not know, and a reviewer reading
+the journal must be able to tell those apart.
+"""
 
 
 def check_limits(
@@ -142,19 +157,71 @@ def check_limits(
 
     # --- Event risk -------------------------------------------------------
 
-    if snapshot.earnings is not None:
-        days_out = snapshot.earnings.days_until(today)
+    # Reached only for entries — exits returned above. A gate that blocks
+    # closing a position increases risk, and that ordering is deliberate.
+    #
+    # Fail closed. "We could not establish the earnings status" is not evidence
+    # of safety, and the previous version treated the two identically: a `None`
+    # earnings field skipped the gate entirely, so a missing payload, a
+    # malformed one, and a genuinely clear calendar all silently permitted an
+    # entry. Absence of evidence now blocks.
+    assessment = snapshot.earnings
+    if assessment is None:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: no earnings assessment attached to the snapshot "
+            f"for {signal.symbol} — cannot establish the blackout window"
+        )
+    elif assessment.symbol != signal.symbol.strip().upper():
+        # Defence in depth against the failure this milestone exists to fix:
+        # evidence about one company must never gate another.
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: earnings evidence is for {assessment.symbol}, "
+            f"not {signal.symbol}"
+        )
+    elif assessment.as_of != today:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: earnings evidence is as of {assessment.as_of}, "
+            f"evaluating {today} — stale evidence cannot clear a blackout"
+        )
+    elif assessment.status is EarningsStatus.UNKNOWN:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: {assessment.reason or 'no reason recorded'} "
+            f"(source {assessment.source})"
+        )
+    elif assessment.status is EarningsStatus.UPCOMING and assessment.event is not None:
+        event = assessment.event
+        days_out = event.days_until(today)
+        confidence = "confirmed" if event.verified else "tentative"
+        session = f", {event.timing}" if event.timing else ""
         if 0 <= days_out <= config.earnings_blackout_days:
-            confidence = "confirmed" if snapshot.earnings.verified else "tentative"
             result.breach(
-                f"earnings in {days_out}d ({snapshot.earnings.report_date}, {confidence}) "
+                f"earnings in {days_out}d ({event.report_date}{session}, {confidence}) "
                 f"— inside {config.earnings_blackout_days}d blackout"
             )
         elif days_out <= config.earnings_blackout_days + 5:
             result.warn(
-                f"earnings in {days_out}d ({snapshot.earnings.report_date}) — "
+                f"earnings in {days_out}d ({event.report_date}{session}) — "
                 "position may need closing before the report"
             )
+        if (
+            not event.verified
+            and config.earnings_blackout_days < days_out <= config.earnings_blackout_days + 5
+        ):
+            # A penciled-in date near the window can move into it. Recorded,
+            # not blocked: widening the window for unverified dates would be a
+            # policy change rather than a bug fix.
+            #
+            # Scoped to the warn band on purpose. The quarter after next is
+            # almost always unverified, so warning on every distant date would
+            # fire for nearly every symbol -- and a warning that always fires
+            # is one nobody reads.
+            result.warn(
+                f"earnings date {event.report_date} is unverified and may move "
+                "into the blackout window"
+            )
+    # EarningsStatus.NONE_SCHEDULED falls through: the source resolved the
+    # symbol and shows nothing on or after today. That is the one case where
+    # silence is authoritative.
 
     # --- Liquidity --------------------------------------------------------
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -72,18 +73,76 @@ class Indicators(BaseModel):
         return self.rsi_14 > self.rsi_prev
 
 
+class EarningsStatus(StrEnum):
+    """What we were able to establish about a symbol's next earnings report.
+
+    Three states, not two. The whole class of bug this replaces came from
+    collapsing "we know there is nothing scheduled" together with "we could not
+    find out" — the first is a fact about the company, the second is a fact
+    about our data, and only the first may permit an entry.
+    """
+
+    UPCOMING = "upcoming"
+    """An authoritative future-dated report exists for this symbol."""
+
+    NONE_SCHEDULED = "none_scheduled"
+    """The source resolved the symbol and shows no report on or after the
+    evaluation date. Authoritative absence."""
+
+    UNKNOWN = "unknown"
+    """No usable answer: payload missing, malformed, symbol unresolved, or the
+    source is not capable of a per-symbol answer. **Blocks new entries.**"""
+
+
 class EarningsEvent(BaseModel):
-    """Next scheduled earnings report. Drives the entry blackout window."""
+    """One scheduled earnings report, tied to the symbol it belongs to.
+
+    `symbol` is mandatory and is not decoration. Without it an event parsed from
+    a market-wide payload is indistinguishable from the right one, which is
+    exactly how a snapshot for NVO came to carry NVZMY's report date.
+
+    Deliberately a `date` and not a `datetime`. The broker publishes a bare
+    calendar date with no time and no timezone; inventing midnight to satisfy a
+    type would manufacture a precision the source does not have, and any
+    downstream comparison would silently pick up the local zone.
+    """
 
     model_config = ConfigDict(frozen=True)
 
+    symbol: str
     report_date: date
-    timing: str | None = None  # "am" | "pm"
+    timing: str | None = None  # "am" | "pm" | None when the broker omits it
     eps_estimate: Decimal | None = None
     verified: bool = False
 
     def days_until(self, as_of: date) -> int:
         return (self.report_date - as_of).days
+
+
+class EarningsAssessment(BaseModel):
+    """The normalized answer the blackout gate reads, and its provenance.
+
+    Carries enough to reconstruct the decision months later without calling the
+    broker again: which symbol, as of which date, from which source and
+    capability profile, and — when the answer was UNKNOWN — why.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str
+    status: EarningsStatus
+    as_of: date
+    source: str
+    profile_ref: str
+    event: EarningsEvent | None = None
+    reason: str | None = None
+
+    @property
+    def is_authoritative(self) -> bool:
+        return self.status is not EarningsStatus.UNKNOWN
+
+    def days_until(self) -> int | None:
+        return self.event.days_until(self.as_of) if self.event else None
 
 
 class MarketSnapshot(BaseModel):
@@ -113,7 +172,11 @@ class MarketSnapshot(BaseModel):
 
     bars: list[Bar] = Field(default_factory=list)
     indicators: Indicators = Field(default_factory=Indicators)
-    earnings: EarningsEvent | None = None
+    # The normalized earnings answer, not a raw event. `None` means no
+    # assessment was attached at all, and the risk gate treats that exactly
+    # like UNKNOWN — a snapshot that was never asked the question cannot be
+    # evidence that the answer was reassuring.
+    earnings: EarningsAssessment | None = None
 
     # Liquidity and context, sourced from fundamentals.
     average_volume_30d: Decimal | None = None
