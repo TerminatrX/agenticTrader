@@ -24,6 +24,11 @@ import, or stray call can place an order.
 
 ## How a cycle works
 
+Discovery and evaluation are separate commands because they cost different
+amounts. Discovery works on batched payloads — one `get_scans`, eight
+`run_scan`, and fundamentals at ten symbols per call — and its job is to decide
+which candidates justify the ~9 single-symbol calls that evaluation costs.
+
 ```
   Claude                                    Python core
   ──────                                    ───────────
@@ -129,6 +134,91 @@ The thesis and invalidation condition are written at entry, before the outcome
 is known. That is the difference between a post-mortem that reads what you
 believed and one that reconstructs what you wish you had believed.
 
+## Discovery
+
+The sector cap made a single-sector universe untenable, so candidate selection
+runs as its own phase against Robinhood's server-side scanner.
+
+`run_scan` returns **at most 200 rows**, offers no pagination, and reports a
+`total_items` that does not survive scrutiny. One scan of the tradable universe
+hit that cap — meaning the result was the first 200 by market cap, not
+everything matching. A biased universe that looks complete.
+
+The fix is structural rather than a re-sort. The universe is partitioned into
+eight market-cap bands, each a saved scan, sized so every one returns well
+clear of the cap:
+
+| | Band | | Band |
+|---|---|---|---|
+| B1 | $2B–$3B | B5 | $10B–$17.5B |
+| B2 | $3B–$4.5B | B6 | $17.5B–$35B |
+| B3 | $4.5B–$7B | B7 | $35B–$100B |
+| B4 | $7B–$10B | B8 | >$100B |
+
+The definition in force is `agentic-discovery@v3-2026-08-20`, fingerprinted
+`fca219ad…`. Verified live on 2026-08-20: **754 symbols, zero duplicates across
+bands**, every shard complete with at least 87 rows of headroom. If a band ever reaches
+200 the run **aborts**. The answer is to split that band again — never to accept
+a truncated universe, and never to relax the coverage requirement.
+
+That union check proves the eight bands did not overlap for the observed
+universe. It does not prove two inclusive `BETWEEN` predicates can never collide
+on a shared boundary; the runtime duplicate detector remains the guard for that.
+
+### Coverage and drift answer different questions
+
+```
+CoverageStatus          did we see the declared universe?
+DefinitionDriftStatus   does the declared universe still mean what we think?
+```
+
+Saved scans are editable in Legend. `ScanDefinition` pins what eight scan ids
+are believed to contain, fingerprinted with SHA-256, so a widened RSI band
+cannot leave runs labelled with a version that denoted a different universe.
+Severity is graded by whether a difference can change *membership*:
+
+| Drift | Severity | |
+|---|---|---|
+| Filter | **Blocking** | changes which symbols exist |
+| Shard definition | **Blocking** | changes which scans define the set |
+| Sort | Conditional | matters only when a shard is capped |
+| Display / title | Informational | columns cannot reach a trade |
+
+Session semantics are part of this. The broker bakes `session="all"` into the
+filter expression rather than exposing it as a field, and all-session and
+regular-hours RSI are different numbers for the same symbol — so it is extracted
+from the expression and compared. Drift is **never repaired automatically**:
+whether Legend or the definition should change is a human decision.
+
+### Two budgets, and three different reasons to stop
+
+Sector comes from authoritative fundamentals, never from a scanner column. That
+costs a call per ten symbols, so it gets a budget of its own, separate from the
+much more expensive per-symbol enrichment:
+
+```
+754 discovered
+  ├── 714  fundamentals_budget    deliberately not requested
+  └──  40  fundamentals_selected
+        ├──  0  fundamentals_missing   requested, broker returned nothing
+        └── 35  enrichment_budget      eligible, but not selected
+              └── 5 selected for full enrichment
+```
+
+Those three exits are kept distinct on purpose. "We chose not to ask", "we asked
+and got nothing back", and "we asked, got an answer, and the answer was that the
+sector is unknown" are different facts, and collapsing them would let a failed
+batch look like ordinary budget rationing.
+
+Selection is deterministic — seeded by `sha256(date|symbol)`, not builtin
+`hash()`, so a re-run on the same trading date plans exactly the same symbols
+and the agent can fetch them in a second pass without the set shifting.
+
+**Scanner values never reach a decision.** The RSI, market cap and volume in a
+scan row are discovery diagnostics only; the evaluator re-fetches everything
+authoritatively. A test feeds contradictory `source_values` for one symbol and
+asserts the resulting snapshots are identical.
+
 ## The strategy
 
 `trend_pullback` buys an orderly retracement inside an intact uptrend, and only
@@ -185,7 +275,7 @@ with a test proving it blocks.
 | `min_risk_reward` | Rejects setups whose target does not justify the stop. |
 | `max_position_pct`, `max_open_positions`, `max_portfolio_exposure_pct` | Concentration ceilings. |
 | `max_stop_pct` | A stop this wide means the setup is too loose to size. |
-| `earnings_blackout_days`, `symbol_cooldown_days` | Event and behavioural gates. |
+| `earnings_blackout_days`, `symbol_cooldown_days` | Event and behavioural gates. The earnings source has a **known gap** — see below. |
 | `min_avg_volume_30d` | Liquidity floor. |
 | `max_spread_pct` | Real bid/ask spread at submission — paid in full on a market order. |
 | `max_price_drift_pct` | How far price may move from the decision price before the setup is re-evaluated rather than chased. |
@@ -196,13 +286,27 @@ Three behaviours that are deliberate and will otherwise look like bugs:
   automatic control that strands you in losing positions until you notice does
   more damage than the loss that triggered it. It writes `HALT`, so the *next*
   cycle stops entirely — by then a human is involved.
-- **The sector cap binds immediately.** The default universe is all one sector,
-  so one position at the ceiling blocks the next. The fix is a more diversified
-  universe, never a looser cap.
+- **The sector cap is now load-bearing rather than instantly binding.** It was
+  written when the universe was a handful of same-sector names, where one
+  position at the ceiling blocked the next. Discovery now spans 754 symbols
+  across every sector and selection spreads enrichment over them, so the cap
+  does the job it was designed for instead of acting as a de-facto position
+  limit.
 - **`min_risk_reward` never fires for `trend_pullback`**, which builds its
   target at exactly 2R. It guards future strategies whose targets come from
   structure. Raising it above 2.0 blocks every entry instead of improving
   selectivity.
+
+**Known gap: the earnings blackout is not currently per-symbol verifiable.**
+`get_earnings_calendar` takes no symbol argument — it is a market-wide window
+scan bounded by `start_date` and a day count. A symbol's *absence* from that
+window is therefore not evidence that it has no earnings, only that it was not
+in the returned set. Treating absence as "no earnings" would quietly disable the
+control. `get_earnings_results` looks like the per-ticker path, but its
+semantics have not been validated, and the gate will not be rewired until they
+are. This is tracked as the top-priority item before anything ENTER-capable
+runs; it did not bind during shadow validation only because no candidate reached
+`enter`.
 
 Config is cross-validated, so contradictory setups fail at startup rather than
 behaving strangely later — a kill switch at or below the daily limit, or a
@@ -361,9 +465,10 @@ that distinction per capability rather than burying it in a comment.
 src/agentic_trader/
   models/        domain types crossing every layer
   market/        MCP payloads → snapshot; signals; regime
+  universe/      scan definition, coverage, drift, candidate selection
   strategies/    opinions only — no account access, no sizing
   risk/          limits, sizing, engine
-  agents/        orchestrator (one pure cycle), critic
+  agents/        orchestrator (one pure cycle), discovery, critic
   execution/     payload construction, shadow fills
   journal/       SQLite audit stream + trade records
   config/        schema-validated loading + integrity lock
@@ -373,6 +478,8 @@ config/
   risk.lock            SHA-256 baseline of the above
   strategies.yaml      per-strategy switches and params
   account.example.yaml template; copy to account.local.yaml (gitignored)
+tests/
+  fixtures/      live saved-scan configuration, for drift tests
 .claude/
   skills/        analyze-trade, critique-trade, review-performance
   hooks/         guard_risk_config.py — the deny hook
@@ -383,31 +490,44 @@ config/
 
 In rough priority order:
 
-1. **A more diversified universe and a scanner**, which the sector cap already
-   demands. Robinhood exposes `run_scan` and `get_scanner_filter_specs`
-   server-side, which may replace much of a hand-built scanner. Deliberately
-   *not* constrained by a price ceiling chosen to suit the current account.
-2. **Then, with ATR stops and a real universe known:** how much capital this
-   strategy needs for whole-share broker protection. Answering it earlier would
-   be guessing — ATR makes the stop distance vary per symbol, so the price
-   ceiling implied by `risk_budget / stop_distance` is no longer one number.
-3. **The protective-stop lifecycle** — submit, confirm acceptance, record the
-   broker order id, monitor, reconcile on restart. Gated on (2) — until
-   positions can be whole shares it could never leave its first state. Note
-   there is no replace/modify tool, so moving a stop means cancel-then-place
-   with an unprotected window in between.
-4. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
+1. **Make the earnings blackout deterministically verifiable per symbol** —
+   validate `get_earnings_results` semantics first, then rewire the gate. This
+   blocks anything ENTER-capable; a safety control that cannot be checked is
+   the same problem as the unfalsifiable preflight described above.
+2. **Close three journal and reproducibility gaps** the first live discovery run
+   exposed: `scan_runs` does not persist `trading_date` even though selection is
+   date-seeded; audit records do not persist execution mode; and indicator
+   lookback parameters are not pinned centrally, so two fetches of the same
+   indicator contract can return different series lengths.
+3. **How much capital this strategy needs for whole-share broker protection.**
+   Answering it earlier would be guessing — ATR makes stop distance vary per
+   symbol, so the price ceiling implied by `risk_budget / stop_distance` is not
+   one number. Now that a real universe exists, the question is answerable.
+4. **The protective-stop lifecycle** — submit, confirm acceptance, record the
+   broker order id, monitor, reconcile on restart. Gated on (3): until positions
+   can be whole shares it could never leave its first state. There is no
+   replace/modify tool, so moving a stop means cancel-then-place with an
+   unprotected window in between.
+5. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
    spread, slippage and stop-gap modelling, and a baseline-vs-critic A/B to
    establish whether the critic actually improves expectancy.
-5. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
+6. **Compute RSI/MACD/SMA/ATR locally from authoritative bars.** Six of the ~9
+   calls per symbol are indicator endpoints deriving from bars already fetched.
+7. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
    test suite (see safety rule 8).
 
 ## Status
 
 Shadow mode. `trend_pullback` implemented and tested; `momentum` stubbed.
-**No live trades placed.**
+Discovery runs live against an eight-shard universe. **No live trades placed.**
 
-160 tests, ruff clean. Test coverage is weighted toward the negative cases —
+Last end-to-end shadow run, 2026-08-20: 754 symbols discovered, 40 fundamentals
+requested, 5 selected and fully enriched, 5 evaluated. Four `watch`, one
+`no_signal`, zero entries — so the sizing, critic and risk path were exercised
+by unit tests but not by that run. Zero order, cancel or replace calls have ever
+been made.
+
+243 tests, ruff clean. Test coverage is weighted toward the negative cases —
 every risk gate has a test proving it *blocks*, because a limit that silently
 fails open is worse than no limit at all.
 
