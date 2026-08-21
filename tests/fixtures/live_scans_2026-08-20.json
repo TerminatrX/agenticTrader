@@ -1,0 +1,406 @@
+{
+  "_comment": "Live Robinhood saved-scan configuration observed 2026-08-20, reshaped from run_scan filters_applied into get_scans filter_summary form. Market rows and all account data deliberately excluded - this is configuration only.",
+  "data": {
+    "scans": [
+      {
+        "scan_id": "7e65d9ff-a2b9-4a82-9c84-bee57475ef50",
+        "title": "AgenticTrader Discovery v3 - B1 ($2B-$3B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": "BETWEEN",
+            "values": [
+              "2000000000",
+              "3000000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      },
+      {
+        "scan_id": "3eeeb183-4a96-442b-8b01-404f33978c2b",
+        "title": "AgenticTrader Discovery v3 - B2 ($3B-$4.5B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": "BETWEEN",
+            "values": [
+              "3000000000",
+              "4500000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      },
+      {
+        "scan_id": "3bf67683-fc75-4e67-a9f1-2a7500bb0256",
+        "title": "AgenticTrader Discovery v3 - B3 ($4.5B-$7B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": "BETWEEN",
+            "values": [
+              "4500000000",
+              "7000000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      },
+      {
+        "scan_id": "813dd065-f51b-47de-9eff-ef112295a3de",
+        "title": "AgenticTrader Discovery v3 - B4 ($7B-$10B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": "BETWEEN",
+            "values": [
+              "7000000000",
+              "10000000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      },
+      {
+        "scan_id": "bd7d315f-db05-4fda-b937-b31b1989ce24",
+        "title": "AgenticTrader Discovery v3 - B5 ($10B-$17.5B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": "BETWEEN",
+            "values": [
+              "10000000000",
+              "17500000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      },
+      {
+        "scan_id": "795e9148-25fa-4678-a2b6-13ced4cbb025",
+        "title": "AgenticTrader Discovery v3 - B6 ($17.5B-$35B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": "BETWEEN",
+            "values": [
+              "17500000000",
+              "35000000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      },
+      {
+        "scan_id": "cccffcd4-8c3d-452c-ba23-23c71308030e",
+        "title": "AgenticTrader Discovery v3 - B7 ($35B-$100B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": "BETWEEN",
+            "values": [
+              "35000000000",
+              "100000000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      },
+      {
+        "scan_id": "cc72022a-5f93-4c66-a69e-369dc6c89d92",
+        "title": "AgenticTrader Discovery v3 - B8 (>$100B)",
+        "sorting": "Market cap desc",
+        "cortex_managed": false,
+        "filter_summary": [
+          {
+            "filter_type": "Asset type",
+            "filter_type_enum": "FILTER_TYPE_INSTRUMENT_TYPE",
+            "predicate": "=",
+            "values": [
+              "STOCK"
+            ],
+            "expression": "type"
+          },
+          {
+            "filter_type": "Market cap",
+            "filter_type_enum": "FILTER_TYPE_MARKET_CAP",
+            "predicate": ">",
+            "values": [
+              "100000000000"
+            ],
+            "expression": "fundamental.marketCap"
+          },
+          {
+            "filter_type": "Average volume",
+            "filter_type_enum": "FILTER_TYPE_AVERAGE_VOLUME",
+            "predicate": ">",
+            "values": [
+              "500000"
+            ],
+            "interval": "1d",
+            "length": 30,
+            "expression": "volumeAvg(candlePeriod=\"1d\", candleCount=30, session=\"all\")"
+          },
+          {
+            "filter_type": "RSI",
+            "filter_type_enum": "FILTER_TYPE_RSI",
+            "predicate": "BETWEEN",
+            "values": [
+              "25",
+              "50"
+            ],
+            "interval": "1d",
+            "length": 14,
+            "expression": "rsi(candlePeriod=\"1d\", candleCount=14, session=\"all\")"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,5 +1,11 @@
 """Shared domain types passed between layers and across the CLI boundary."""
 
+from agentic_trader.models.capabilities import (
+    Capability,
+    CapabilityProfile,
+    Evidence,
+    capability_items,
+)
 from agentic_trader.models.market_snapshot import (
     Bar,
     EarningsEvent,
@@ -21,6 +27,9 @@ from agentic_trader.models.trade_intent import (
 
 __all__ = [
     "LIVE_PERMITTED_PROTECTION",
+    "Capability",
+    "CapabilityProfile",
+    "Evidence",
     "AccountState",
     "Bar",
     "Decision",
@@ -34,4 +43,5 @@ __all__ = [
     "Signal",
     "SignalStrength",
     "TradeIntent",
+    "capability_items",
 ]

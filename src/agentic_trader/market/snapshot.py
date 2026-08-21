@@ -220,6 +220,34 @@ def parse_indicators(payloads: dict[str, Any]) -> Indicators:
     return Indicators(as_of=min(stamps) if stamps else None, **fields)
 
 
+def parse_sectors(payloads: Any) -> dict[str, str | None]:
+    """Map symbol -> sector from one or more batched `get_equity_fundamentals`.
+
+    Authoritative, unlike anything a discovery source reports. This is the same
+    field `build_snapshot` puts on `MarketSnapshot.sector` and the same one
+    `risk.limits` gates concentration on, so the enrichment-budget selector and
+    the risk cap share one taxonomy rather than two that drift apart.
+
+    `get_equity_fundamentals` batches ten symbols per call, which is why sector
+    can be fetched for every discovered candidate while the per-symbol
+    indicators cannot.
+    """
+    out: dict[str, str | None] = {}
+    for payload in payloads if isinstance(payloads, list) else [payloads]:
+        data = _unwrap(payload)
+        if not isinstance(data, dict):
+            continue
+        for entry in data.get("results") or []:
+            if not isinstance(entry, dict):
+                continue
+            symbol = entry.get("symbol")
+            if not symbol:
+                continue
+            sector = entry.get("sector")
+            out[str(symbol).strip().upper()] = str(sector).strip() if sector else None
+    return out
+
+
 def parse_next_earnings(payload: Any, as_of: date) -> EarningsEvent | None:
     """Find the next unreported earnings event.
 
