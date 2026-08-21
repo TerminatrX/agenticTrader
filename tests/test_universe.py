@@ -19,6 +19,7 @@ import sqlite3
 from collections import Counter
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -30,12 +31,14 @@ from agentic_trader.universe import (
     ROBINHOOD_MCP_SCANNER,
     UNKNOWN_SECTOR_LIMIT,
     CoverageStatus,
+    DefinitionDriftStatus,
     FunnelStage,
     IdentityConflict,
     ScanCandidate,
     ScannerSource,
     ShardError,
     StaticSource,
+    check_definition_drift,
     funnel_counts,
     parse_scan_payload,
     rotation_key,
@@ -98,26 +101,26 @@ def test_zero_shards_is_incomplete_not_complete():
     batch = _scan([])
 
     assert batch.coverage is CoverageStatus.INCOMPLETE
-    assert len(batch.missing_shard_ids) == 5
+    assert len(batch.missing_shard_ids) == len(SHARDS)
 
 
-def test_four_of_five_shards_is_incomplete_even_when_each_is_short():
-    batch = _scan(_all_shards()[:4])
+def test_one_shard_short_is_incomplete_even_when_each_returned_is_short():
+    batch = _scan(_all_shards()[:-1])
 
     assert batch.coverage is CoverageStatus.INCOMPLETE
-    assert batch.missing_shard_ids == (SHARDS[4],)
+    assert batch.missing_shard_ids == (SHARDS[-1],)
 
 
-def test_all_five_short_shards_are_complete():
+def test_all_short_shards_are_complete():
     batch = _scan(_all_shards())
 
     assert batch.coverage is CoverageStatus.COMPLETE
     assert batch.report.reasons() == []
-    assert len(batch.candidates) == 5
+    assert len(batch.candidates) == len(SHARDS)
 
 
 def test_an_unexpected_shard_is_not_complete():
-    """All five expected ids present plus a sixth still satisfies "nothing
+    """Every expected id present plus one more still satisfies "nothing
     missing", while the stranger's candidates join the declared universe."""
     batch = _scan([*_all_shards(), _payload("some-other-scan", ["XYZ"])])
 
@@ -470,13 +473,13 @@ def test_the_discovery_definition_fingerprint_is_pinned():
     """Same reasoning: retuning RSI 25-50 to 20-55 must not leave the run
     labelled with the version that denoted the old universe.
 
-    v2 declares indicator session semantics explicitly. The universe it selects
-    is unchanged, but the declaration is not — and re-pinning without bumping is
-    exactly what this guard exists to prevent.
+    v3 re-shards the universe from five bands to eight, because two v2 bands
+    were within 20 rows of the scanner cap. Both the shard ids and the bands
+    changed, so the version had to move with them.
     """
-    assert CURRENT_DISCOVERY.definition_ref == "agentic-discovery@v2-2026-08-18"
+    assert CURRENT_DISCOVERY.definition_ref == "agentic-discovery@v3-2026-08-20"
     assert CURRENT_DISCOVERY.config_fingerprint == (
-        "a267b3add57036d2c8e82dc071d05e141269f1915f2413836177d4e9a6677761"
+        "fca219ad30643b26953c051edd887dbce744cd91201beca0a79e480771314fed"
     )
 
 
@@ -494,7 +497,7 @@ def test_every_shard_declares_the_stock_filter():
     """The Mega shard was created without it and repaired later; the definition
     and the live scans must agree on the declared universe."""
     assert CURRENT_DISCOVERY.base_filters["instrument_type"]["value"] == "STOCK"
-    assert len(CURRENT_DISCOVERY.expected_shard_ids) == 5
+    assert len(CURRENT_DISCOVERY.expected_shard_ids) == 8
 
 
 def test_the_vocabulary_mismatch_is_recorded():
@@ -555,7 +558,7 @@ def test_a_run_records_all_three_contract_identities(tmp_path):
 
     (run,) = repo.scan_runs()
     assert run["scanner_profile_ref"] == "robinhood-mcp-scanner@2026-08-18"
-    assert run["scan_definition_ref"] == "agentic-discovery@v2-2026-08-18"
+    assert run["scan_definition_ref"] == "agentic-discovery@v3-2026-08-20"
     assert run["scan_config_fingerprint"] == CURRENT_DISCOVERY.config_fingerprint
     assert json.loads(run["scan_config_json"])["base_filters"]["rsi"]["values"] == [25, 50]
 
@@ -608,5 +611,108 @@ def test_a_journal_from_the_previous_release_still_accepts_a_run(tmp_path):
     _record(repo, batch, result)
 
     (run,) = repo.scan_runs()
-    assert run["scan_definition_ref"] == "agentic-discovery@v2-2026-08-18"
+    assert run["scan_definition_ref"] == "agentic-discovery@v3-2026-08-20"
     assert "truncated_candidate_count" in run  # obsolete column left in place
+
+
+# --------------------------------------------------------------------------
+# v3 topology: the eight-band re-shard, verified against live configuration
+# captured on 2026-08-20.
+#
+# The fixture is real broker output, not a fixture derived from the definition
+# it is checked against. A definition-derived fixture can only prove the drift
+# checker is self-consistent; this one can fail if Legend and the repo diverge.
+# --------------------------------------------------------------------------
+
+_LIVE_SCANS = Path(__file__).parent / "fixtures" / "live_scans_2026-08-20.json"
+
+PROBE_SCAN_ID = "6bdcb42f-c651-41b9-98a3-d56ac256cda0"
+"""The original unsharded $2B+ scan. Retained in the account as a capability
+probe artifact; it also carries no instrument-type filter, so it never belonged
+in the declared universe."""
+
+
+def _live_payload():
+    return json.loads(_LIVE_SCANS.read_text(encoding="utf-8"))
+
+
+def test_v3_declares_exactly_the_eight_verified_shards():
+    assert CURRENT_DISCOVERY.expected_shard_ids == (
+        "7e65d9ff-a2b9-4a82-9c84-bee57475ef50",  # B1  $2B-$3B
+        "3eeeb183-4a96-442b-8b01-404f33978c2b",  # B2  $3B-$4.5B
+        "3bf67683-fc75-4e67-a9f1-2a7500bb0256",  # B3  $4.5B-$7B
+        "813dd065-f51b-47de-9eff-ef112295a3de",  # B4  $7B-$10B
+        "bd7d315f-db05-4fda-b937-b31b1989ce24",  # B5  $10B-$17.5B
+        "795e9148-25fa-4678-a2b6-13ced4cbb025",  # B6  $17.5B-$35B
+        "cccffcd4-8c3d-452c-ba23-23c71308030e",  # B7  $35B-$100B
+        "cc72022a-5f93-4c66-a69e-369dc6c89d92",  # B8  >$100B
+    )
+
+
+def test_the_unsharded_probe_is_not_part_of_the_universe():
+    assert PROBE_SCAN_ID not in CURRENT_DISCOVERY.expected_shard_ids
+
+
+def test_the_bands_are_contiguous_and_cover_without_gaps():
+    """Adjacent BETWEEN bands must meet exactly: a gap silently drops a slice of
+    the market, and no coverage check would ever notice."""
+    bounds = [s.filters["market_cap"] for s in CURRENT_DISCOVERY.shards]
+    for lower, upper in zip(bounds[:-1], bounds[1:], strict=True):
+        top = lower["values"][1]
+        floor = upper["values"][0] if "values" in upper else upper["value"]
+        assert top == floor, f"gap or overlap between {top} and {floor}"
+    assert bounds[0]["values"][0] == 2_000_000_000
+    assert bounds[-1] == {"predicate": ">", "value": 100_000_000_000}
+
+
+def test_live_configuration_matches_the_v3_definition():
+    report = check_definition_drift(_live_payload(), CURRENT_DISCOVERY)
+    assert report.as_dicts() == []
+    assert report.status is DefinitionDriftStatus.MATCHES
+    assert not report.has_blocking
+    assert not report.blocks(any_shard_capped=True)
+
+
+def test_a_removed_shard_blocks_against_live_configuration():
+    payload = _live_payload()
+    payload["data"]["scans"] = payload["data"]["scans"][:-1]
+    report = check_definition_drift(payload, CURRENT_DISCOVERY)
+    assert report.status is DefinitionDriftStatus.DRIFTED
+    assert report.has_blocking
+
+
+def test_a_changed_band_blocks_against_live_configuration():
+    payload = _live_payload()
+    for f in payload["data"]["scans"][0]["filter_summary"]:
+        if f["filter_type_enum"] == "FILTER_TYPE_MARKET_CAP":
+            f["values"] = ["1000000000", "3000000000"]
+    report = check_definition_drift(payload, CURRENT_DISCOVERY)
+    assert report.status is DefinitionDriftStatus.DRIFTED
+    assert report.has_blocking
+
+
+def test_regular_session_semantics_block_against_live_configuration():
+    """all-session and regular-session RSI are different numbers for the same
+    symbol; the change is invisible except in the expression."""
+    payload = _live_payload()
+    for f in payload["data"]["scans"][0]["filter_summary"]:
+        if "session=" in str(f.get("expression", "")):
+            f["expression"] = f["expression"].replace('session="all"', 'session="regular"')
+    report = check_definition_drift(payload, CURRENT_DISCOVERY)
+    assert report.status is DefinitionDriftStatus.DRIFTED
+    assert report.has_blocking
+
+
+def test_the_probe_scan_appearing_live_does_not_join_the_universe():
+    """Extra saved scans are irrelevant: the definition names its shards, so an
+    unrelated scan in the account cannot widen what we discover."""
+    payload = _live_payload()
+    payload["data"]["scans"].append({
+        "scan_id": PROBE_SCAN_ID,
+        "title": "AgenticTrader Discovery v1",
+        "sorting": "Market cap desc",
+        "cortex_managed": False,
+        "filter_summary": [],
+    })
+    report = check_definition_drift(payload, CURRENT_DISCOVERY)
+    assert report.status is DefinitionDriftStatus.MATCHES

@@ -163,13 +163,14 @@ def test_a_clean_run_discovers_selects_and_reports():
     assert result.aborted_reason is None
     assert result.coverage is CoverageStatus.COMPLETE
     assert result.drift_status is DefinitionDriftStatus.MATCHES
-    assert len(result.selected_symbols) == 20
+    assert len(result.batch.candidates) == len(SHARDS) * 4
+    assert len(result.selected_symbols) == 25   # the default enrichment budget
 
 
 def test_the_budget_bounds_what_gets_enriched():
     result = _run(run_payloads=_runs(per_shard=20), fundamentals_payloads=_fundamentals(20))
 
-    assert len(result.batch.candidates) == 100
+    assert len(result.batch.candidates) == len(SHARDS) * 20
     assert len(result.selected_symbols) == 25
 
 
@@ -317,7 +318,7 @@ def test_no_fundamentals_yet_returns_a_plan_rather_than_failures():
 
     assert result.selected_symbols == []
     assert result.unfetched == []            # no failures
-    assert len(result.fundamentals_requested) == 20
+    assert len(result.fundamentals_requested) == len(SHARDS) * 4
     assert all(
         c.stage is FunnelStage.FUNDAMENTALS_SELECTED
         for c in result.fundamentals_plan.selected
@@ -342,8 +343,8 @@ def test_an_attempted_fetch_that_returned_nothing_is_a_failure():
 
     # The plan still records what was asked for — that is what makes the
     # failure legible rather than looking like nothing was ever requested.
-    assert len(result.fundamentals_requested) == 20
-    assert len(result.unfetched) == 20
+    assert len(result.fundamentals_requested) == len(SHARDS) * 4
+    assert len(result.unfetched) == len(SHARDS) * 4
     assert all(c.exit_reason == FUNDAMENTALS_MISSING for c in result.unfetched)
     assert result.selected_symbols == []
 
@@ -352,7 +353,7 @@ def test_an_empty_payload_list_also_counts_as_attempted():
     """The agent made calls and got nothing usable back."""
     result = _run(fundamentals_payloads=[])
 
-    assert len(result.unfetched) == 20
+    assert len(result.unfetched) == len(SHARDS) * 4
     assert all(c.exit_reason == FUNDAMENTALS_MISSING for c in result.unfetched)
 
 
@@ -366,7 +367,7 @@ def test_the_fundamentals_budget_rotates_across_shards():
 
     assert len(result.fundamentals_requested) == 10
     shards = {c.shard_id for c in result.fundamentals_plan.selected}
-    assert len(shards) == 5   # every shard represented
+    assert len(shards) == len(SHARDS)   # every shard represented
 
 
 def test_unrequested_candidates_are_budget_deferred_not_missing():
@@ -376,7 +377,7 @@ def test_unrequested_candidates_are_budget_deferred_not_missing():
                   fundamentals_budget=10)
 
     deferred = result.fundamentals_plan.deferred
-    assert len(deferred) == 90
+    assert len(deferred) == len(SHARDS) * 20 - 10
     assert all(c.exit_reason == FUNDAMENTALS_BUDGET for c in deferred)
     assert all(c.exit_reason != FUNDAMENTALS_MISSING for c in deferred)
 
@@ -410,9 +411,9 @@ def test_a_clean_run_journals_identities_and_shards(tmp_path):
 
     (run,) = repo.scan_runs()
     assert run["coverage_complete"] == 1
-    assert run["scan_definition_ref"] == "agentic-discovery@v2-2026-08-18"
-    assert len(repo.scan_shards(result.run_id)) == 5
-    assert json.loads(run["funnel_counts_json"])["selected"] == 20
+    assert run["scan_definition_ref"] == "agentic-discovery@v3-2026-08-20"
+    assert len(repo.scan_shards(result.run_id)) == len(SHARDS)
+    assert json.loads(run["funnel_counts_json"])["selected"] == 25
 
 
 def test_a_drift_aborted_run_is_journalled_even_without_a_batch(tmp_path):
@@ -458,7 +459,7 @@ def test_the_cli_journals_a_drift_refusal(tmp_path, capsys):
     repo = JournalRepository(db)
     (run,) = repo.scan_runs()
     assert run["aborted_reason"] == DRIFT_ABORT
-    assert run["scan_definition_ref"] == "agentic-discovery@v2-2026-08-18"
+    assert run["scan_definition_ref"] == "agentic-discovery@v3-2026-08-20"
 
 
 def test_the_cli_journals_a_clean_run(tmp_path, capsys):
@@ -468,12 +469,12 @@ def test_the_cli_journals_a_clean_run(tmp_path, capsys):
     main(["--db", str(db), "discover", "--input", str(bundle), "--date", "2026-08-18"])
     out = json.loads(capsys.readouterr().out)
 
-    assert len(out["selected"]) == 20
+    assert len(out["selected"]) == 25
     repo = JournalRepository(db)
     (run,) = repo.scan_runs()
     assert run["aborted_reason"] is None
     assert run["coverage_complete"] == 1
-    assert len(repo.scan_candidates(run["run_id"])) == 20
+    assert len(repo.scan_candidates(run["run_id"])) == len(SHARDS) * 4
 
 
 def test_the_trading_date_is_required(tmp_path):
@@ -526,7 +527,7 @@ def test_only_selected_symbols_are_ever_evaluated(tmp_path):
         max_per_sector=2,
     ).selected_symbols
 
-    assert len(result.batch.candidates) == 5
+    assert len(result.batch.candidates) == len(SHARDS)
     assert len(selected) == 2
 
     # The agent enriches exactly the selection — nothing else has a bundle.

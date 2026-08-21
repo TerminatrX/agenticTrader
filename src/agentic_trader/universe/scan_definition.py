@@ -47,8 +47,8 @@ class ShardSpec:
 class ScanDefinition:
     """A named, versioned set of saved scans covering one declared universe.
 
-    The shard set is *expected*, not merely observed. A run that receives four
-    of five shards has not covered the universe this definition declares, and
+    The shard set is *expected*, not merely observed. A run that receives seven
+    of eight shards has not covered the universe this definition declares, and
     only a stated expectation makes that detectable — without it, four short
     shards look exactly like complete coverage.
     """
@@ -143,19 +143,26 @@ def _shard(scan_id: str, label: str, low: int | None, high: int | None) -> Shard
 # mismatch too many.
 CURRENT_DISCOVERY = ScanDefinition(
     name="agentic-discovery",
-    version="v2-2026-08-18",
-    as_of=date(2026, 8, 18),
+    version="v3-2026-08-20",
+    as_of=date(2026, 8, 20),
     base_filters=_BASE_FILTERS,
     sorting="Market cap desc",
     shards=(
-        _shard("cc72022a-5f93-4c66-a69e-369dc6c89d92", "Mega >$100B", 100_000_000_000, None),
-        _shard("cccffcd4-8c3d-452c-ba23-23c71308030e", "Large $20B-$100B",
-               20_000_000_000, 100_000_000_000),
-        _shard("795e9148-25fa-4678-a2b6-13ced4cbb025", "Mid $8B-$20B",
-               8_000_000_000, 20_000_000_000),
-        _shard("bd7d315f-db05-4fda-b937-b31b1989ce24", "Small $4B-$8B",
-               4_000_000_000, 8_000_000_000),
-        _shard("813dd065-f51b-47de-9eff-ef112295a3de", "Micro $2B-$4B",
-               2_000_000_000, 4_000_000_000),
+        _shard("7e65d9ff-a2b9-4a82-9c84-bee57475ef50", "B1 $2B-$3B",
+               2_000_000_000, 3_000_000_000),
+        _shard("3eeeb183-4a96-442b-8b01-404f33978c2b", "B2 $3B-$4.5B",
+               3_000_000_000, 4_500_000_000),
+        _shard("3bf67683-fc75-4e67-a9f1-2a7500bb0256", "B3 $4.5B-$7B",
+               4_500_000_000, 7_000_000_000),
+        _shard("813dd065-f51b-47de-9eff-ef112295a3de", "B4 $7B-$10B",
+               7_000_000_000, 10_000_000_000),
+        _shard("bd7d315f-db05-4fda-b937-b31b1989ce24", "B5 $10B-$17.5B",
+               10_000_000_000, 17_500_000_000),
+        _shard("795e9148-25fa-4678-a2b6-13ced4cbb025", "B6 $17.5B-$35B",
+               17_500_000_000, 35_000_000_000),
+        _shard("cccffcd4-8c3d-452c-ba23-23c71308030e", "B7 $35B-$100B",
+               35_000_000_000, 100_000_000_000),
+        _shard("cc72022a-5f93-4c66-a69e-369dc6c89d92", "B8 >$100B",
+               100_000_000_000, None),
     ),
 )

@@ -2,7 +2,7 @@
 
 Discovery is deliberately a *separate phase* from evaluation, because the two
 have different data costs. Everything here works on batched payloads the agent
-already fetched — `get_scans`, five `run_scan` responses, and batched
+already fetched — `get_scans`, eight `run_scan` responses, and batched
 fundamentals at ten symbols per call. Evaluation is what costs seven
 single-symbol calls per candidate, so this phase exists to decide which
 candidates are worth paying that for.
@@ -57,7 +57,7 @@ from agentic_trader.universe.selection import (
 COVERAGE_ABORT = "discovery_coverage_incomplete"
 """Exit reason when the declared universe was not fully reachable.
 
-The point of five shards is that every match is returned. A shard reaching the
+The point of eight shards is that every match is returned. A shard reaching the
 cap means it should be split again, not that the run should quietly continue
 collecting shadow observations from a biased first two hundred and record them
 as ordinary results.
