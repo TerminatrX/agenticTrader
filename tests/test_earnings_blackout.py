@@ -894,3 +894,123 @@ def test_the_risk_engine_carries_the_contract_explicitly(risk_config):
     other = dataclasses.replace(ROBINHOOD_MCP_EARNINGS, version="other")
     engine = RiskEngine(risk_config, earnings_capabilities=other)
     assert engine.earnings_capabilities is other
+
+
+# --------------------------------------------------------------------------
+# Temporal consistency. "Upcoming" and "already happened" are incompatible
+# claims, and pairing them produces a negative distance that fails the blackout
+# test (0 <= d <= N) while passing the warn test (d <= N + 5) -- the wrong way
+# round. A past report would clear the gate on a note reading "earnings in -1d".
+# --------------------------------------------------------------------------
+
+
+def _upcoming_on(report_date, *, as_of=TODAY, symbol="AAPL"):
+    return EarningsAssessment(
+        symbol=symbol, status=EarningsStatus.UPCOMING, as_of=as_of,
+        source=CURRENT_SOURCE, profile_ref=PROFILE,
+        event=EarningsEvent(symbol=symbol, report_date=report_date, verified=True),
+    )
+
+
+@pytest.mark.parametrize(
+    "report_date",
+    [date(2026, 8, 12), date(2026, 8, 1), date(2025, 1, 1)],
+)
+def test_upcoming_with_a_past_event_cannot_be_constructed(report_date):
+    with pytest.raises(ValidationError) as exc:
+        _upcoming_on(report_date)
+    assert "before the assessment date" in str(exc.value)
+
+
+def test_upcoming_on_the_assessment_date_is_valid():
+    """Same-day is genuinely upcoming until it is reported, and the 0-day
+    blackout is what catches it -- so it must remain constructable."""
+    assessment = _upcoming_on(TODAY)
+    assert assessment.days_until() == 0
+
+
+def test_a_past_event_smuggled_past_validation_is_blocked(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """`model_construct` skips validators, and persisted snapshots are replayed
+    without them. The gate must refuse independently of the model."""
+    smuggled = EarningsAssessment.model_construct(
+        symbol="AAPL", status=EarningsStatus.UPCOMING, as_of=TODAY,
+        source=CURRENT_SOURCE, profile_ref=PROFILE, reason=None,
+        event=EarningsEvent(symbol="AAPL", report_date=date(2026, 8, 12), verified=True),
+    )
+    assert smuggled.days_until() == -1
+
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, smuggled
+    )
+    assert not result.passed
+    assert any(EARNINGS_UNKNOWN in b for b in result.breaches)
+    assert any("before the evaluation date" in b for b in result.breaches)
+
+
+def test_a_past_event_never_becomes_a_mere_warning(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """The precise regression: a negative distance previously produced
+    "earnings in -1d" as a warning and cleared the gate."""
+    smuggled = EarningsAssessment.model_construct(
+        symbol="AAPL", status=EarningsStatus.UPCOMING, as_of=TODAY,
+        source=CURRENT_SOURCE, profile_ref=PROFILE, reason=None,
+        event=EarningsEvent(symbol="AAPL", report_date=date(2026, 8, 12), verified=True),
+    )
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, smuggled
+    )
+    assert not any("earnings in -" in w for w in result.warnings)
+    assert not any("-1d" in w for w in result.warnings)
+    assert _breached_on_earnings(result)
+
+
+def test_same_day_upcoming_is_blocked_by_the_zero_day_blackout(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """Blocked by the ordinary window, not by the temporal guard — the breach
+    names the report, not an unknown status."""
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config,
+        _upcoming_on(TODAY),
+    )
+    breaches = _breached_on_earnings(result)
+    assert breaches
+    assert any("earnings in 0d" in b for b in breaches)
+    assert not any(EARNINGS_UNKNOWN in b for b in result.breaches)
+
+
+def test_future_upcoming_from_the_pinned_source_is_unaffected(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """The guard must not disturb the ordinary forward-looking path."""
+    from datetime import timedelta
+
+    inside = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config,
+        _upcoming_on(TODAY + timedelta(days=2)),
+    )
+    assert any("earnings in 2d" in b for b in _breached_on_earnings(inside))
+    assert not any(EARNINGS_UNKNOWN in b for b in inside.breaches)
+
+    outside = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config,
+        _upcoming_on(TODAY + timedelta(days=30)),
+    )
+    assert not _breached_on_earnings(outside)
+    assert outside.passed
+
+
+def test_a_stale_assessment_is_caught_before_the_temporal_guard(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """An assessment made yesterday about a future event is refused for being
+    stale, not for being temporally inconsistent — it is internally coherent."""
+    yesterday = _upcoming_on(date(2026, 8, 20), as_of=date(2026, 8, 14))
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, yesterday
+    )
+    assert any("stale evidence" in b for b in result.breaches)
+    assert not any("before the evaluation date" in b for b in result.breaches)

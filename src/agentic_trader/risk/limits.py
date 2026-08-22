@@ -416,6 +416,17 @@ def _check_earnings_blackout(
 
     if status is EarningsStatus.UPCOMING and event is not None:
         days_out = event.days_until(today)
+        if days_out < 0:
+            # A report that already happened cannot be upcoming. Checked before
+            # any window comparison because a negative distance fails the
+            # blackout test and passes the warn test, which is the wrong way
+            # round: the entry would clear on a note reading "earnings in -1d".
+            result.breach(
+                f"{EARNINGS_UNKNOWN}: assessment claims upcoming earnings but "
+                f"event date {event.report_date} is before the evaluation date "
+                f"{today}"
+            )
+            return
         confidence = "confirmed" if event.verified else "tentative"
         session = f", {event.timing}" if event.timing else ""
         if 0 <= days_out <= config.earnings_blackout_days:

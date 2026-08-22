@@ -164,6 +164,17 @@ class EarningsAssessment(BaseModel):
                 raise ValueError(
                     f"event is for {self.event.symbol}, assessment is for {self.symbol}"
                 )
+            if self.event.report_date < self.as_of:
+                # "Upcoming" and "already happened" are not compatible claims.
+                # Left unchecked this yields a negative `days_until`, which
+                # misses the 0..N blackout test while still satisfying the
+                # `<= N + 5` warn test -- so a past report would clear the gate
+                # with an "earnings in -1d" note. Same-day stays valid: it is
+                # upcoming until it is reported, and the blackout catches it.
+                raise ValueError(
+                    f"UPCOMING event {self.event.report_date} is before the "
+                    f"assessment date {self.as_of}"
+                )
         elif self.event is not None:
             raise ValueError(f"{self.status.value} assessment must not carry an event")
 
