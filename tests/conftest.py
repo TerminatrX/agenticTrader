@@ -7,16 +7,19 @@ rounding and precision bugs.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
 
 from agentic_trader.config import RiskConfig
+from agentic_trader.market.earnings_capabilities import ROBINHOOD_MCP_EARNINGS
 from agentic_trader.models import (
     AccountState,
     Bar,
+    EarningsAssessment,
     EarningsEvent,
+    EarningsStatus,
     Indicators,
     MarketSnapshot,
     Position,
@@ -24,6 +27,37 @@ from agentic_trader.models import (
     Signal,
     SignalStrength,
 )
+
+
+def clear_earnings(
+    symbol: str,
+    *,
+    as_of: date,
+    report_date: date | None = None,
+    timing: str | None = None,
+    eps_estimate: Decimal | None = None,
+    verified: bool = True,
+) -> EarningsAssessment:
+    """An authoritative earnings assessment, for tests that are not about earnings.
+
+    Exists because the blackout gate now fails closed: a snapshot with no
+    assessment blocks every entry, so a fixture that omits one would make every
+    unrelated test fail for the wrong reason. Passing `report_date=None` models
+    a symbol the broker resolved with nothing scheduled.
+    """
+    if report_date is None:
+        return EarningsAssessment(
+            symbol=symbol, status=EarningsStatus.NONE_SCHEDULED, as_of=as_of,
+            source="get_earnings_results", profile_ref=ROBINHOOD_MCP_EARNINGS.profile_ref,
+        )
+    return EarningsAssessment(
+        symbol=symbol, status=EarningsStatus.UPCOMING, as_of=as_of,
+        source="get_earnings_results", profile_ref=ROBINHOOD_MCP_EARNINGS.profile_ref,
+        event=EarningsEvent(
+            symbol=symbol, report_date=report_date, timing=timing,
+            eps_estimate=eps_estimate, verified=verified,
+        ),
+    )
 
 
 @pytest.fixture
@@ -110,8 +144,10 @@ def bullish_pullback_snapshot() -> MarketSnapshot:
             sma_50=Decimal("309.48"),
             sma_200=Decimal("280.09"),
         ),
-        earnings=EarningsEvent(
-            report_date=datetime(2026, 10, 29).date(),
+        earnings=clear_earnings(
+            "AAPL",
+            as_of=date(2026, 8, 13),
+            report_date=date(2026, 10, 29),
             timing="pm",
             eps_estimate=Decimal("1.98"),
             verified=False,

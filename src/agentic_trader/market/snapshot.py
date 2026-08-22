@@ -19,7 +19,18 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from agentic_trader.models import Bar, EarningsEvent, Indicators, MarketSnapshot
+from agentic_trader.market.earnings_capabilities import (
+    ROBINHOOD_MCP_EARNINGS,
+    EarningsCapabilities,
+)
+from agentic_trader.models import (
+    Bar,
+    EarningsAssessment,
+    EarningsEvent,
+    EarningsStatus,
+    Indicators,
+    MarketSnapshot,
+)
 
 
 class SnapshotError(ValueError):
@@ -248,41 +259,146 @@ def parse_sectors(payloads: Any) -> dict[str, str | None]:
     return out
 
 
-def parse_next_earnings(payload: Any, as_of: date) -> EarningsEvent | None:
-    """Find the next unreported earnings event.
+def assess_earnings(
+    payload: Any,
+    symbol: str,
+    as_of: date,
+    *,
+    capabilities: EarningsCapabilities = ROBINHOOD_MCP_EARNINGS,
+) -> EarningsAssessment:
+    """Normalize a `get_earnings_results` response into a blackout answer.
 
-    `eps.actual is None` is the reliable "has not reported yet" marker; the date
-    alone is not, since a report filed this morning still carries today's date.
+    Always returns an assessment — never `None`, and never raises. Every path
+    that cannot establish an answer returns `UNKNOWN` with a reason, so the gate
+    has something explicit to refuse on and the journal has something to show.
+
+    Three rules earned by observation rather than assumed:
+
+    1. **Rows for other symbols are discarded.** Every entry must carry a
+       `symbol` matching the one asked about. A payload with no matching rows is
+       `UNKNOWN`, never "nothing scheduled" — that distinction is the entire
+       reason this function exists.
+    2. **Pendingness comes from the date, not from `eps.actual`.** That field is
+       unreliable in both directions (see `EARNINGS_ACTUAL_NOTE`). Using the
+       date can only over-block.
+    3. **A malformed date invalidates the whole assessment.** Skipping an
+       unparseable row could drop the very event that mattered and leave the
+       remaining rows looking like a clean bill of health.
     """
+    if not capabilities.usable_for_blackout:
+        return _unknown(
+            symbol, as_of, capabilities,
+            "earnings source not capable of a per-symbol answer",
+        )
+
     data = _unwrap(payload)
     if not isinstance(data, dict):
-        return None
-    upcoming: list[EarningsEvent] = []
-    for entry in data.get("results", []):
+        return _unknown(symbol, as_of, capabilities, "earnings payload missing or not an object")
+
+    wanted = symbol.strip().upper()
+    if wanted in {str(x).strip().upper() for x in (data.get("not_found") or [])}:
+        return _unknown(symbol, as_of, capabilities, f"broker could not resolve symbol {wanted}")
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        return _unknown(symbol, as_of, capabilities, "earnings payload has no results list")
+
+    mine: list[EarningsEvent] = []
+    for entry in results:
         if not isinstance(entry, dict):
-            continue
-        eps = entry.get("eps") or {}
-        report = entry.get("report") or {}
-        if eps.get("actual") is not None:
-            continue
+            return _unknown(
+                symbol, as_of, capabilities, "earnings payload contains a malformed entry"
+            )
+        if str(entry.get("symbol", "")).strip().upper() != wanted:
+            continue  # another company's row; never ours to interpret
+        report = entry.get("report")
+        if report is None:
+            report = {}
+        if not isinstance(report, dict):
+            return _unknown(symbol, as_of, capabilities, "malformed report object")
         raw_date = report.get("date")
-        if not raw_date:
-            continue
         try:
             report_date = date.fromisoformat(str(raw_date))
-        except ValueError:
-            continue
-        if report_date < as_of:
-            continue
-        upcoming.append(
-            EarningsEvent(
-                report_date=report_date,
-                timing=report.get("timing"),
-                eps_estimate=_dec(eps.get("estimate"), "eps.estimate"),
-                verified=bool(report.get("verified", False)),
+        except (TypeError, ValueError):
+            return _unknown(
+                symbol, as_of, capabilities, f"unparseable report date {raw_date!r}"
             )
+        if report_date < as_of:
+            continue  # already happened; the gate looks forward only
+        eps = entry.get("eps")
+        if eps is None:
+            eps = {}
+        if not isinstance(eps, dict):
+            return _unknown(symbol, as_of, capabilities, "malformed eps object")
+        timing = report.get("timing")
+        if timing is not None and not isinstance(timing, str):
+            return _unknown(symbol, as_of, capabilities, f"malformed timing {timing!r}")
+        try:
+            event = EarningsEvent(
+                symbol=wanted,
+                report_date=report_date,
+                timing=timing,
+                eps_estimate=_dec(eps.get("estimate"), "eps.estimate"),
+                # Only a real boolean counts as confirmation. `bool("no")` is
+                # True, so coercing a string here would upgrade a tentative
+                # date to confirmed -- wrong in the unsafe direction.
+                verified=report.get("verified") is True,
+            )
+        except Exception as exc:  # noqa: BLE001 - any construction failure is ignorance
+            # This function's contract is that it always returns an assessment.
+            # A validation error escaping here would surface as a crash in the
+            # middle of snapshot building, which is a far worse failure mode
+            # than a blocked entry.
+            return _unknown(
+                symbol, as_of, capabilities, f"could not normalize earnings entry: {exc}"
+            )
+        mine.append(event)
+
+    if not any(str(e.get("symbol", "")).strip().upper() == wanted
+               for e in results if isinstance(e, dict)):
+        # The symbol is absent from a response that resolved fine. That is a
+        # market-wide payload, a stale ticker, or the wrong tool -- all of which
+        # are ignorance, not an all-clear.
+        return _unknown(symbol, as_of, capabilities, f"{wanted} absent from earnings response")
+
+    if not mine:
+        # Rows for this symbol exist and every one is behind us. Whether that
+        # *means* nothing is coming is a separate claim about the source, and
+        # one nobody has established -- the endpoint can return future events,
+        # but "can" is not "always does when one exists". Until that is
+        # evidenced, this is ignorance rather than an all-clear.
+        if not capabilities.future_event_absence_authoritative.usable:
+            return _unknown(
+                symbol, as_of, capabilities,
+                f"{wanted} has no future-dated report and the source is not "
+                "established as authoritative about absence",
+            )
+        return EarningsAssessment(
+            symbol=wanted, status=EarningsStatus.NONE_SCHEDULED, as_of=as_of,
+            source=capabilities.source_tool, profile_ref=capabilities.profile_ref,
         )
-    return min(upcoming, key=lambda e: e.report_date) if upcoming else None
+
+    # Nearest first. Ties broken on the full tuple so a symbol carrying two rows
+    # for one date resolves identically on every replay.
+    nearest = min(mine, key=lambda e: (e.report_date, e.timing or "", not e.verified))
+    return EarningsAssessment(
+        symbol=wanted, status=EarningsStatus.UPCOMING, as_of=as_of,
+        source=capabilities.source_tool, profile_ref=capabilities.profile_ref,
+        event=nearest,
+    )
+
+
+def _unknown(
+    symbol: str, as_of: date, capabilities: EarningsCapabilities, reason: str
+) -> EarningsAssessment:
+    return EarningsAssessment(
+        symbol=symbol.strip().upper(),
+        status=EarningsStatus.UNKNOWN,
+        as_of=as_of,
+        source=capabilities.source_tool,
+        profile_ref=capabilities.profile_ref,
+        reason=reason,
+    )
 
 
 def build_snapshot(
@@ -373,7 +489,7 @@ def build_snapshot(
         book_as_of=book_as_of,
         bars=bars,
         indicators=indicator_state,
-        earnings=parse_next_earnings(earnings, now.date()) if earnings else None,
+        earnings=assess_earnings(earnings, symbol, now.date()),
         tradable=tradable,
         staleness_note=staleness_note,
         **{k: v for k, v in extras.items() if v is not None},

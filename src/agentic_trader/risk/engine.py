@@ -19,6 +19,10 @@ import uuid
 from datetime import UTC, date, datetime
 
 from agentic_trader.config import RiskConfig
+from agentic_trader.market.earnings_capabilities import (
+    ROBINHOOD_MCP_EARNINGS,
+    EarningsCapabilities,
+)
 from agentic_trader.models import (
     AccountState,
     Decision,
@@ -63,9 +67,20 @@ def build_client_key(
 class RiskEngine:
     """Stateless evaluator. Construct per cycle; hold no memory between calls."""
 
-    def __init__(self, config: RiskConfig, *, is_halted: bool = False) -> None:
+    def __init__(
+        self,
+        config: RiskConfig,
+        *,
+        is_halted: bool = False,
+        earnings_capabilities: EarningsCapabilities = ROBINHOOD_MCP_EARNINGS,
+    ) -> None:
         self.config = config
         self.is_halted = is_halted
+        # Held explicitly rather than reached for inside the gate. The earnings
+        # blackout's correctness depends on which source produced the evidence,
+        # so that dependency belongs in the engine's signature where it can be
+        # substituted in a test and seen in a review.
+        self.earnings_capabilities = earnings_capabilities
 
     def evaluate(
         self,
@@ -97,6 +112,7 @@ class RiskEngine:
             is_halted=self.is_halted,
             as_of=today,
             last_loss_exit=last_loss_exit,
+            earnings_capabilities=self.earnings_capabilities,
         )
         if not gates.passed:
             return RiskDecision(

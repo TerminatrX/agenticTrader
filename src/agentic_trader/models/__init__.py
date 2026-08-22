@@ -8,7 +8,9 @@ from agentic_trader.models.capabilities import (
 )
 from agentic_trader.models.market_snapshot import (
     Bar,
+    EarningsAssessment,
     EarningsEvent,
+    EarningsStatus,
     Indicators,
     MarketSnapshot,
 )
@@ -33,7 +35,9 @@ __all__ = [
     "AccountState",
     "Bar",
     "Decision",
+    "EarningsAssessment",
     "EarningsEvent",
+    "EarningsStatus",
     "Indicators",
     "MarketSnapshot",
     "Position",

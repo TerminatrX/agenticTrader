@@ -19,7 +19,7 @@ from agentic_trader.execution.shadow_executor import ShadowExecutor
 from agentic_trader.journal import JournalRepository
 from agentic_trader.journal.models import CycleOutcome, TradeRecord
 from agentic_trader.market.snapshot import SnapshotError, build_snapshot
-from agentic_trader.models import Side
+from agentic_trader.models import EarningsStatus, Side
 from agentic_trader.risk.engine import RiskEngine, build_client_key
 
 # Obviously fake — see the note in conftest.py.
@@ -119,16 +119,35 @@ def test_malformed_price_raises_rather_than_defaulting():
         build_snapshot("AAPL", quote=QUOTE, historicals=bad)
 
 
-def test_next_earnings_skips_already_reported_quarters():
+def test_earnings_rows_without_symbol_identity_are_not_trusted():
+    """The old parser read these rows happily. It never checked whose they were.
+
+    A row with no `symbol` cannot be shown to be about the symbol under
+    evaluation, so the assessment is UNKNOWN rather than a confident date.
+    """
     payload = {"data": {"results": [
         {"eps": {"actual": "2.02"}, "report": {"date": "2026-07-30", "verified": True}},
         {"eps": {"actual": None}, "report": {"date": "2026-10-29", "verified": False}},
     ]}}
     snapshot = build_snapshot("AAPL", quote=QUOTE, earnings=payload)
 
-    assert snapshot.earnings is not None
-    assert snapshot.earnings.report_date == date(2026, 10, 29)
-    assert snapshot.earnings.verified is False
+    assert snapshot.earnings.status is EarningsStatus.UNKNOWN
+    assert "absent from earnings response" in snapshot.earnings.reason
+
+
+def test_next_earnings_is_the_nearest_future_dated_row_for_this_symbol():
+    payload = {"data": {"results": [
+        {"symbol": "AAPL", "eps": {"actual": "2.02"},
+         "report": {"date": "2026-07-30", "timing": "pm", "verified": True}},
+        {"symbol": "AAPL", "eps": {"actual": None},
+         "report": {"date": "2026-10-29", "timing": "pm", "verified": False}},
+    ]}}
+    snapshot = build_snapshot("AAPL", quote=QUOTE, earnings=payload)
+
+    assert snapshot.earnings.status is EarningsStatus.UPCOMING
+    assert snapshot.earnings.event.symbol == "AAPL"
+    assert snapshot.earnings.event.report_date == date(2026, 10, 29)
+    assert snapshot.earnings.event.verified is False
 
 
 def test_missing_quote_falls_back_to_last_bar():

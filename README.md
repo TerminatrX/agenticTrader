@@ -275,7 +275,7 @@ with a test proving it blocks.
 | `min_risk_reward` | Rejects setups whose target does not justify the stop. |
 | `max_position_pct`, `max_open_positions`, `max_portfolio_exposure_pct` | Concentration ceilings. |
 | `max_stop_pct` | A stop this wide means the setup is too loose to size. |
-| `earnings_blackout_days`, `symbol_cooldown_days` | Event and behavioural gates. The earnings source has a **known gap** — see below. |
+| `earnings_blackout_days`, `symbol_cooldown_days` | Event and behavioural gates. Earnings fails closed on unknown — see below. |
 | `min_avg_volume_30d` | Liquidity floor. |
 | `max_spread_pct` | Real bid/ask spread at submission — paid in full on a market order. |
 | `max_price_drift_pct` | How far price may move from the decision price before the setup is re-evaluated rather than chased. |
@@ -297,16 +297,28 @@ Three behaviours that are deliberate and will otherwise look like bugs:
   structure. Raising it above 2.0 blocks every entry instead of improving
   selectivity.
 
-**Known gap: the earnings blackout is not currently per-symbol verifiable.**
-`get_earnings_calendar` takes no symbol argument — it is a market-wide window
-scan bounded by `start_date` and a day count. A symbol's *absence* from that
-window is therefore not evidence that it has no earnings, only that it was not
-in the returned set. Treating absence as "no earnings" would quietly disable the
-control. `get_earnings_results` looks like the per-ticker path, but its
-semantics have not been validated, and the gate will not be rewired until they
-are. This is tracked as the top-priority item before anything ENTER-capable
-runs; it did not bind during shadow validation only because no candidate reached
-`enter`.
+**The earnings blackout fails closed, and knows whose earnings it is looking
+at.** This gate was rebuilt after a live run showed it doing something worse
+than nothing. `get_earnings_calendar` takes no symbol argument — it is a
+market-wide window scan — and the parser reading it never checked the `symbol`
+field on a row. So a snapshot for NVO was assigned NVZMY's report date, from a
+payload NVO did not appear in, and all five candidates in that run were
+journalled with the same fabricated date.
+
+Two rules now hold. Evidence must be **provably about the symbol**: rows are
+matched on `symbol`, the source is the per-symbol `get_earnings_results`, and
+the gate re-checks identity before reading a date. And **not knowing blocks**:
+a missing payload, a malformed one, an unresolved ticker, evidence from another
+trading date, or a symbol absent from the response all resolve to
+`earnings_status_unknown` and refuse the entry. Only one silence is
+authoritative — the source resolved the symbol and every report it holds is in
+the past.
+
+Pendingness is decided by `report.date`, never by `eps.actual`. That field was
+observed unreliable in both directions: one symbol carried three past-dated
+reports whose `actual` was never filled in, and the calendar returned a
+future-dated row with `actual` already populated. Using the date can only
+over-block.
 
 Config is cross-validated, so contradictory setups fail at startup rather than
 behaving strangely later — a kill switch at or below the daily limit, or a
@@ -490,30 +502,26 @@ tests/
 
 In rough priority order:
 
-1. **Make the earnings blackout deterministically verifiable per symbol** —
-   validate `get_earnings_results` semantics first, then rewire the gate. This
-   blocks anything ENTER-capable; a safety control that cannot be checked is
-   the same problem as the unfalsifiable preflight described above.
-2. **Close three journal and reproducibility gaps** the first live discovery run
+1. **Close three journal and reproducibility gaps** the first live discovery run
    exposed: `scan_runs` does not persist `trading_date` even though selection is
    date-seeded; audit records do not persist execution mode; and indicator
    lookback parameters are not pinned centrally, so two fetches of the same
    indicator contract can return different series lengths.
-3. **How much capital this strategy needs for whole-share broker protection.**
+2. **How much capital this strategy needs for whole-share broker protection.**
    Answering it earlier would be guessing — ATR makes stop distance vary per
    symbol, so the price ceiling implied by `risk_budget / stop_distance` is not
    one number. Now that a real universe exists, the question is answerable.
-4. **The protective-stop lifecycle** — submit, confirm acceptance, record the
-   broker order id, monitor, reconcile on restart. Gated on (3): until positions
+3. **The protective-stop lifecycle** — submit, confirm acceptance, record the
+   broker order id, monitor, reconcile on restart. Gated on (2): until positions
    can be whole shares it could never leave its first state. There is no
    replace/modify tool, so moving a stop means cancel-then-place with an
    unprotected window in between.
-5. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
+4. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
    spread, slippage and stop-gap modelling, and a baseline-vs-critic A/B to
    establish whether the critic actually improves expectancy.
-6. **Compute RSI/MACD/SMA/ATR locally from authoritative bars.** Six of the ~9
+5. **Compute RSI/MACD/SMA/ATR locally from authoritative bars.** Six of the ~9
    calls per symbol are indicator endpoints deriving from bars already fetched.
-7. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
+6. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
    test suite (see safety rule 8).
 
 ## Status
@@ -527,7 +535,7 @@ requested, 5 selected and fully enriched, 5 evaluated. Four `watch`, one
 by unit tests but not by that run. Zero order, cancel or replace calls have ever
 been made.
 
-243 tests, ruff clean. Test coverage is weighted toward the negative cases —
+283 tests, ruff clean. Test coverage is weighted toward the negative cases —
 every risk gate has a test proving it *blocks*, because a limit that silently
 fails open is worse than no limit at all.
 

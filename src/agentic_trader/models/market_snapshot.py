@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 
 class Bar(BaseModel):
@@ -72,18 +74,120 @@ class Indicators(BaseModel):
         return self.rsi_14 > self.rsi_prev
 
 
+def _norm_symbol(value: str) -> str:
+    """One spelling of a ticker, so identity comparisons cannot miss on case.
+
+    Both models normalise, so `event.symbol == assessment.symbol` compares like
+    with like no matter which construction path produced them.
+    """
+    return value.strip().upper()
+
+
+class EarningsStatus(StrEnum):
+    """What we were able to establish about a symbol's next earnings report.
+
+    Three states, not two. The whole class of bug this replaces came from
+    collapsing "we know there is nothing scheduled" together with "we could not
+    find out" — the first is a fact about the company, the second is a fact
+    about our data, and only the first may permit an entry.
+    """
+
+    UPCOMING = "upcoming"
+    """An authoritative future-dated report exists for this symbol."""
+
+    NONE_SCHEDULED = "none_scheduled"
+    """The source resolved the symbol and shows no report on or after the
+    evaluation date. Authoritative absence."""
+
+    UNKNOWN = "unknown"
+    """No usable answer: payload missing, malformed, symbol unresolved, or the
+    source is not capable of a per-symbol answer. **Blocks new entries.**"""
+
+
 class EarningsEvent(BaseModel):
-    """Next scheduled earnings report. Drives the entry blackout window."""
+    """One scheduled earnings report, tied to the symbol it belongs to.
+
+    `symbol` is mandatory and is not decoration. Without it an event parsed from
+    a market-wide payload is indistinguishable from the right one, which is
+    exactly how a snapshot for NVO came to carry NVZMY's report date.
+
+    Deliberately a `date` and not a `datetime`. The broker publishes a bare
+    calendar date with no time and no timezone; inventing midnight to satisfy a
+    type would manufacture a precision the source does not have, and any
+    downstream comparison would silently pick up the local zone.
+    """
 
     model_config = ConfigDict(frozen=True)
 
+    symbol: Annotated[str, AfterValidator(_norm_symbol)]
     report_date: date
-    timing: str | None = None  # "am" | "pm"
+    timing: str | None = None  # "am" | "pm" | None when the broker omits it
     eps_estimate: Decimal | None = None
     verified: bool = False
 
     def days_until(self, as_of: date) -> int:
         return (self.report_date - as_of).days
+
+
+class EarningsAssessment(BaseModel):
+    """The normalized answer the blackout gate reads, and its provenance.
+
+    Carries enough to reconstruct the decision months later without calling the
+    broker again: which symbol, as of which date, from which source and
+    capability profile, and — when the answer was UNKNOWN — why.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: Annotated[str, AfterValidator(_norm_symbol)]
+    status: EarningsStatus
+    as_of: date
+    source: str
+    profile_ref: str
+    event: EarningsEvent | None = None
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _enforce_status_event_invariants(self) -> EarningsAssessment:
+        """Make the impossible combinations unconstructable.
+
+        The gate reads `status` and `event` as a pair. A model that permits
+        UPCOMING-with-no-event, or NONE_SCHEDULED-carrying-an-event, hands the
+        gate a contradiction to interpret — and every interpretation of a
+        contradiction is a guess. Rejecting them here means the gate's
+        defence-in-depth checks are a second line rather than the only one.
+        """
+        if self.status is EarningsStatus.UPCOMING:
+            if self.event is None:
+                raise ValueError("UPCOMING assessment must carry an event")
+            if self.event.symbol != self.symbol:
+                raise ValueError(
+                    f"event is for {self.event.symbol}, assessment is for {self.symbol}"
+                )
+            if self.event.report_date < self.as_of:
+                # "Upcoming" and "already happened" are not compatible claims.
+                # Left unchecked this yields a negative `days_until`, which
+                # misses the 0..N blackout test while still satisfying the
+                # `<= N + 5` warn test -- so a past report would clear the gate
+                # with an "earnings in -1d" note. Same-day stays valid: it is
+                # upcoming until it is reported, and the blackout catches it.
+                raise ValueError(
+                    f"UPCOMING event {self.event.report_date} is before the "
+                    f"assessment date {self.as_of}"
+                )
+        elif self.event is not None:
+            raise ValueError(f"{self.status.value} assessment must not carry an event")
+
+        if self.status is EarningsStatus.UNKNOWN and not (self.reason or "").strip():
+            raise ValueError("UNKNOWN assessment must record a reason")
+        return self
+
+    @property
+    def is_authoritative(self) -> bool:
+        return self.status is not EarningsStatus.UNKNOWN
+
+    def days_until(self) -> int | None:
+        return self.event.days_until(self.as_of) if self.event else None
 
 
 class MarketSnapshot(BaseModel):
@@ -113,7 +217,11 @@ class MarketSnapshot(BaseModel):
 
     bars: list[Bar] = Field(default_factory=list)
     indicators: Indicators = Field(default_factory=Indicators)
-    earnings: EarningsEvent | None = None
+    # The normalized earnings answer, not a raw event. `None` means no
+    # assessment was attached at all, and the risk gate treats that exactly
+    # like UNKNOWN — a snapshot that was never asked the question cannot be
+    # evidence that the answer was reassuring.
+    earnings: EarningsAssessment | None = None
 
     # Liquidity and context, sourced from fundamentals.
     average_volume_30d: Decimal | None = None
