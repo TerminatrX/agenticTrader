@@ -23,6 +23,7 @@ import pytest
 from agentic_trader.market.earnings_capabilities import ROBINHOOD_MCP_EARNINGS
 from agentic_trader.market.snapshot import assess_earnings
 from agentic_trader.models import EarningsAssessment, EarningsEvent, EarningsStatus
+from agentic_trader.models.capabilities import Evidence
 from agentic_trader.risk.limits import EARNINGS_UNKNOWN, check_limits
 
 TODAY = date(2026, 8, 13)
@@ -218,22 +219,63 @@ def test_an_unresolved_symbol_is_unknown_not_clear():
 # ------------------------------------------- J: authoritative absence may pass
 
 
-def test_resolved_symbol_with_only_past_reports_is_authoritatively_clear(
+def test_only_past_reports_is_unknown_not_an_all_clear(
     entry_signal, bullish_pullback_snapshot, account, risk_config
 ):
-    """The one case where silence means something: the source returned this
-    symbol's rows and every one is behind us."""
+    """The endpoint *can* return future events. That is not the same claim as
+    "it always does when one exists", and only the second would make absence
+    authoritative. Nobody has established it -- all twelve symbols probed on
+    2026-08-21 returned a future row, so the absent-future case was never even
+    observed. Until it is, this is ignorance and it blocks."""
     assessment = _assess(
         _row("AAPL", "2026-05-01", actual="1.50"),
         _row("AAPL", "2026-08-01", actual="1.60"),
     )
-    assert assessment.status is EarningsStatus.NONE_SCHEDULED
+    assert assessment.status is EarningsStatus.UNKNOWN
     assert assessment.event is None
+    assert "not established as authoritative about absence" in assessment.reason
+
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, assessment
+    )
+    assert not result.passed
+    assert any(EARNINGS_UNKNOWN in b for b in result.breaches)
+
+
+def test_absence_becomes_authoritative_only_when_the_capability_says_so(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """Proves the wiring, and documents exactly what evidence would unlock it:
+    flipping one capability to a verified True is the whole change."""
+    import dataclasses
+
+    from agentic_trader.models.capabilities import Capability, Evidence
+
+    established = dataclasses.replace(
+        ROBINHOOD_MCP_EARNINGS,
+        future_event_absence_authoritative=Capability(
+            True, Evidence.EMPIRICALLY_VERIFIED, "hypothetical, for this test only"
+        ),
+    )
+    assessment = assess_earnings(
+        _payload(_row("AAPL", "2026-05-01", actual="1.50")),
+        "AAPL", TODAY, capabilities=established,
+    )
+    assert assessment.status is EarningsStatus.NONE_SCHEDULED
 
     result = _gate(
         bullish_pullback_snapshot, entry_signal, account, risk_config, assessment
     )
     assert not _breached_on_earnings(result)
+
+
+def test_the_absence_capability_is_not_established():
+    """A guard against someone quietly upgrading this to True. It may only move
+    with evidence, and the evidence does not exist yet."""
+    cap = ROBINHOOD_MCP_EARNINGS.future_event_absence_authoritative
+    assert cap.supported is None
+    assert not cap.usable
+    assert cap.evidence is Evidence.UNKNOWN
 
 
 # ----------------------------------------------------------- K: multiple events
@@ -393,9 +435,9 @@ def test_scanner_source_values_cannot_influence_the_assessment():
 def test_the_earnings_capability_fingerprint_is_pinned():
     """Same contract as the other profiles: claims cannot move without the
     version moving with them."""
-    assert ROBINHOOD_MCP_EARNINGS.profile_ref == "robinhood-mcp-earnings@2026-08-21"
+    assert ROBINHOOD_MCP_EARNINGS.profile_ref == "robinhood-mcp-earnings@2026-08-21.1"
     assert ROBINHOOD_MCP_EARNINGS.content_fingerprint == (
-        "965ccb88631313ef7a6d2f7378aceb042f13bd950e6c5d3bf03899ec73f4ebc1"
+        "10d0b85d8e652e88f4580e2a9ee99ba4f27053d5d3767de38670ac597d77bca4"
     )
 
 
@@ -477,3 +519,167 @@ def test_captured_snapshots_serialise_the_assessment(bullish_pullback_snapshot):
     assert dumped["earnings"]["source"] == "get_earnings_results"
     assert dumped["earnings"]["event"]["report_date"] == "2026-10-29"
     assert datetime.now(UTC) is not None  # import guard
+
+
+# --------------------------------------------------------------------------
+# Model invariants. The gate reads `status` and `event` as a pair, so a model
+# permitting contradictory pairs would hand it something only a guess could
+# resolve. These make the contradictions unconstructable, and prove the gate
+# refuses them anyway for anything that bypasses validation.
+# --------------------------------------------------------------------------
+
+from pydantic import ValidationError  # noqa: E402
+
+
+def _raw(**kw) -> EarningsAssessment:
+    """Build an assessment bypassing validation, as `model_construct` does."""
+    base = {
+        "symbol": "AAPL", "status": EarningsStatus.UNKNOWN, "as_of": TODAY,
+        "source": "get_earnings_results", "profile_ref": PROFILE,
+        "event": None, "reason": "r",
+    }
+    return EarningsAssessment.model_construct(**{**base, **kw})
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "why"),
+    [
+        ({"status": EarningsStatus.UPCOMING, "event": None},
+         "UPCOMING with no event"),
+        ({"status": EarningsStatus.UPCOMING,
+          "event": EarningsEvent(symbol="MSFT", report_date=date(2026, 8, 20))},
+         "UPCOMING whose event belongs to another symbol"),
+        ({"status": EarningsStatus.NONE_SCHEDULED,
+          "event": EarningsEvent(symbol="AAPL", report_date=date(2026, 8, 20))},
+         "NONE_SCHEDULED carrying an event"),
+        ({"status": EarningsStatus.UNKNOWN, "reason": "r",
+          "event": EarningsEvent(symbol="AAPL", report_date=date(2026, 8, 20))},
+         "UNKNOWN carrying an event"),
+        ({"status": EarningsStatus.UNKNOWN, "reason": ""},
+         "UNKNOWN with no reason"),
+        ({"status": EarningsStatus.UNKNOWN, "reason": "   "},
+         "UNKNOWN with a whitespace reason"),
+    ],
+)
+def test_contradictory_assessments_cannot_be_constructed(kwargs, why):
+    with pytest.raises(ValidationError):
+        EarningsAssessment(
+            symbol="AAPL", as_of=TODAY, source="get_earnings_results",
+            profile_ref=PROFILE, **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"status": EarningsStatus.UPCOMING, "event": None},
+        {"status": EarningsStatus.UPCOMING,
+         "event": EarningsEvent(symbol="MSFT", report_date=date(2026, 12, 1))},
+        {"status": EarningsStatus.NONE_SCHEDULED,
+         "event": EarningsEvent(symbol="AAPL", report_date=date(2026, 12, 1))},
+        {"status": EarningsStatus.UNKNOWN,
+         "event": EarningsEvent(symbol="AAPL", report_date=date(2026, 12, 1))},
+    ],
+)
+def test_the_gate_refuses_contradictions_that_bypassed_validation(
+    entry_signal, bullish_pullback_snapshot, account, risk_config, kwargs
+):
+    """Defence in depth. `model_construct` skips validators, and a future
+    refactor could loosen the model — the gate must still fail closed."""
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, _raw(**kwargs)
+    )
+    assert not result.passed
+    assert any(EARNINGS_UNKNOWN in b for b in result.breaches)
+
+
+def test_symbol_case_is_normalised_on_both_models():
+    """Identity is compared between two models; if only one normalised, a
+    lowercase payload would look like another company's evidence."""
+    assessment = EarningsAssessment(
+        symbol="aapl", status=EarningsStatus.UPCOMING, as_of=TODAY,
+        source="get_earnings_results", profile_ref=PROFILE,
+        event=EarningsEvent(symbol=" AaPl ", report_date=date(2026, 12, 1)),
+    )
+    assert assessment.symbol == "AAPL"
+    assert assessment.event.symbol == "AAPL"
+
+
+# --------------------------------------------------------------------------
+# Malformed nested payloads. `assess_earnings` promises never to raise; a
+# ValidationError escaping mid-snapshot is a crash, which is a worse failure
+# mode than a blocked entry.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("entry", "fragment"),
+    [
+        ({"symbol": "AAPL", "report": "oops"}, "malformed report object"),
+        ({"symbol": "AAPL", "report": ["a"]}, "malformed report object"),
+        ({"symbol": "AAPL", "report": {"date": "2026-12-01"}, "eps": "oops"},
+         "malformed eps object"),
+        ({"symbol": "AAPL", "report": {"date": "2026-12-01"}, "eps": [1]},
+         "malformed eps object"),
+        ({"symbol": "AAPL", "report": {"date": "2026-12-01", "timing": {"x": 1}}},
+         "malformed timing"),
+        ({"symbol": "AAPL", "report": {"date": "2026-12-01", "timing": 7}},
+         "malformed timing"),
+        ({"symbol": "AAPL", "report": {"date": "2026-12-01"},
+          "eps": {"estimate": "not-a-number"}}, "could not normalize"),
+        ({"symbol": "AAPL", "report": {"date": None}}, "unparseable report date"),
+        ({"symbol": "AAPL", "report": {"date": ["2026-12-01"]}},
+         "unparseable report date"),
+    ],
+)
+def test_malformed_nested_payloads_are_unknown_not_exceptions(entry, fragment):
+    assessment = assess_earnings({"data": {"results": [entry]}}, "AAPL", TODAY)
+
+    assert assessment.status is EarningsStatus.UNKNOWN
+    assert fragment in assessment.reason
+    assert assessment.event is None
+
+
+def test_a_non_boolean_verified_never_upgrades_a_date_to_confirmed():
+    """`bool("no")` is True. Coercing would promote a tentative date to
+    confirmed — wrong in the unsafe direction."""
+    for raw in ["no", "false", 0, 1, "yes", None, {}]:
+        assessment = assess_earnings(
+            {"data": {"results": [{
+                "symbol": "AAPL", "eps": {},
+                "report": {"date": "2026-12-01", "verified": raw},
+            }]}}, "AAPL", TODAY,
+        )
+        assert assessment.event.verified is False, raw
+
+    confirmed = assess_earnings(
+        {"data": {"results": [{
+            "symbol": "AAPL", "eps": {},
+            "report": {"date": "2026-12-01", "verified": True},
+        }]}}, "AAPL", TODAY,
+    )
+    assert confirmed.event.verified is True
+
+
+def test_an_empty_result_set_without_not_found_is_unknown():
+    """Observed live: GOF, a closed-end fund, returns `results: []` with no
+    `not_found` — resolvable but carrying no earnings at all. An empty answer
+    has more than one cause, so none of them may clear a blackout."""
+    assessment = assess_earnings({"data": {"results": []}}, "GOF", TODAY)
+
+    assert assessment.status is EarningsStatus.UNKNOWN
+    assert assessment.event is None
+
+
+def test_assess_earnings_never_raises_on_arbitrary_junk():
+    junk = [
+        None, "", 0, [], {}, {"data": None}, {"data": []},
+        {"data": {"results": None}}, {"data": {"results": [None]}},
+        {"data": {"results": [{"symbol": None}]}},
+        {"data": {"results": [{}]}},
+        {"data": {"not_found": "AAPL"}},
+    ]
+    for payload in junk:
+        assessment = assess_earnings(payload, "AAPL", TODAY)
+        assert assessment.status is EarningsStatus.UNKNOWN, payload
+        assert assessment.reason

@@ -311,7 +311,11 @@ def assess_earnings(
             )
         if str(entry.get("symbol", "")).strip().upper() != wanted:
             continue  # another company's row; never ours to interpret
-        report = entry.get("report") or {}
+        report = entry.get("report")
+        if report is None:
+            report = {}
+        if not isinstance(report, dict):
+            return _unknown(symbol, as_of, capabilities, "malformed report object")
         raw_date = report.get("date")
         try:
             report_date = date.fromisoformat(str(raw_date))
@@ -321,16 +325,34 @@ def assess_earnings(
             )
         if report_date < as_of:
             continue  # already happened; the gate looks forward only
-        eps = entry.get("eps") or {}
-        mine.append(
-            EarningsEvent(
+        eps = entry.get("eps")
+        if eps is None:
+            eps = {}
+        if not isinstance(eps, dict):
+            return _unknown(symbol, as_of, capabilities, "malformed eps object")
+        timing = report.get("timing")
+        if timing is not None and not isinstance(timing, str):
+            return _unknown(symbol, as_of, capabilities, f"malformed timing {timing!r}")
+        try:
+            event = EarningsEvent(
                 symbol=wanted,
                 report_date=report_date,
-                timing=report.get("timing"),
+                timing=timing,
                 eps_estimate=_dec(eps.get("estimate"), "eps.estimate"),
-                verified=bool(report.get("verified", False)),
+                # Only a real boolean counts as confirmation. `bool("no")` is
+                # True, so coercing a string here would upgrade a tentative
+                # date to confirmed -- wrong in the unsafe direction.
+                verified=report.get("verified") is True,
             )
-        )
+        except Exception as exc:  # noqa: BLE001 - any construction failure is ignorance
+            # This function's contract is that it always returns an assessment.
+            # A validation error escaping here would surface as a crash in the
+            # middle of snapshot building, which is a far worse failure mode
+            # than a blocked entry.
+            return _unknown(
+                symbol, as_of, capabilities, f"could not normalize earnings entry: {exc}"
+            )
+        mine.append(event)
 
     if not any(str(e.get("symbol", "")).strip().upper() == wanted
                for e in results if isinstance(e, dict)):
@@ -340,6 +362,17 @@ def assess_earnings(
         return _unknown(symbol, as_of, capabilities, f"{wanted} absent from earnings response")
 
     if not mine:
+        # Rows for this symbol exist and every one is behind us. Whether that
+        # *means* nothing is coming is a separate claim about the source, and
+        # one nobody has established -- the endpoint can return future events,
+        # but "can" is not "always does when one exists". Until that is
+        # evidenced, this is ignorance rather than an all-clear.
+        if not capabilities.future_event_absence_authoritative.usable:
+            return _unknown(
+                symbol, as_of, capabilities,
+                f"{wanted} has no future-dated report and the source is not "
+                "established as authoritative about absence",
+            )
         return EarningsAssessment(
             symbol=wanted, status=EarningsStatus.NONE_SCHEDULED, as_of=as_of,
             source=capabilities.source_tool, profile_ref=capabilities.profile_ref,

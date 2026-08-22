@@ -71,6 +71,21 @@ class EarningsCapabilities(CapabilityProfile):
     unresolved_symbol_is_explicit: Capability
     """An unknown ticker is reported in `not_found`, not as an empty result."""
 
+    future_event_absence_authoritative: Capability
+    """Does "no future row" mean "no report is coming"?
+
+    **Not established, and deliberately not assumed.** The endpoint demonstrably
+    *can* return scheduled future events, but that is a different claim from
+    "it always does when one exists". Proving the second needs a symbol with a
+    known imminent report that the endpoint omits — evidence nobody has, since
+    all twelve symbols probed on 2026-08-21 returned a future row and none
+    exhibited the absent-future state at all.
+
+    Until it is established, a symbol whose rows are all historical resolves to
+    UNKNOWN rather than NONE_SCHEDULED. Absence of evidence is not evidence of
+    absence, and this is a hard entry gate.
+    """
+
     reported_marker_is_reliable: Capability
     """Whether `eps.actual` reliably distinguishes reported from upcoming.
 
@@ -124,7 +139,7 @@ EARNINGS_ACTUAL_NOTE = (
 
 ROBINHOOD_MCP_EARNINGS = EarningsCapabilities(
     profile_id="robinhood-mcp-earnings",
-    version="2026-08-21",
+    version="2026-08-21.1",
     as_of=date(2026, 8, 21),
     source_tool="get_earnings_results",
     symbol_scoped=Capability(
@@ -156,6 +171,14 @@ ROBINHOOD_MCP_EARNINGS = EarningsCapabilities(
     unresolved_symbol_is_explicit=Capability(
         True, E.EMPIRICALLY_VERIFIED,
         'ZZZZQQ returned {"results": [], "not_found": ["ZZZZQQ"]}.',
+    ),
+    future_event_absence_authoritative=Capability(
+        None, E.UNKNOWN,
+        "No basis either way. 12/12 symbols probed on 2026-08-21 returned a "
+        "future-dated row, so the absent-future case was never observed and "
+        "cannot be characterised. GOF returned results=[] with no not_found -- "
+        "resolvable but carrying no earnings at all -- which is a further "
+        "reminder that an empty answer has more than one cause.",
     ),
     reported_marker_is_reliable=Capability(
         False, E.EMPIRICALLY_VERIFIED, EARNINGS_ACTUAL_NOTE,

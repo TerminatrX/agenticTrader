@@ -165,6 +165,12 @@ def check_limits(
     # earnings field skipped the gate entirely, so a missing payload, a
     # malformed one, and a genuinely clear calendar all silently permitted an
     # entry. Absence of evidence now blocks.
+    # Structured as an allowlist: every path breaches except the one that
+    # positively establishes safety. An assessment carrying an impossible
+    # status/event combination therefore blocks rather than falling through a
+    # chain of `elif`s into silence. The model rejects those combinations too;
+    # this is the second line, for anything built via `model_construct` or a
+    # future refactor that loosens the model.
     assessment = snapshot.earnings
     if assessment is None:
         result.breach(
@@ -187,6 +193,25 @@ def check_limits(
         result.breach(
             f"{EARNINGS_UNKNOWN}: {assessment.reason or 'no reason recorded'} "
             f"(source {assessment.source})"
+        )
+    elif assessment.status is EarningsStatus.UPCOMING and assessment.event is None:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: assessment claims an upcoming report for "
+            f"{assessment.symbol} but carries no event"
+        )
+    elif assessment.status is not EarningsStatus.UPCOMING and assessment.event is not None:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: status {assessment.status.value} contradicts "
+            "the event it carries"
+        )
+    elif (
+        assessment.status is EarningsStatus.UPCOMING
+        and assessment.event is not None
+        and assessment.event.symbol != assessment.symbol
+    ):
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: event belongs to {assessment.event.symbol}, "
+            f"assessment claims {assessment.symbol}"
         )
     elif assessment.status is EarningsStatus.UPCOMING and assessment.event is not None:
         event = assessment.event
@@ -219,9 +244,17 @@ def check_limits(
                 f"earnings date {event.report_date} is unverified and may move "
                 "into the blackout window"
             )
-    # EarningsStatus.NONE_SCHEDULED falls through: the source resolved the
-    # symbol and shows nothing on or after today. That is the one case where
-    # silence is authoritative.
+    elif assessment.status is not EarningsStatus.NONE_SCHEDULED:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: unhandled earnings status "
+            f"{assessment.status.value!r}"
+        )
+    # Only NONE_SCHEDULED reaches here without a breach, and the normalizer
+    # emits it solely when the source is established as authoritative about the
+    # absence of a future report. That is currently NOT established, so this
+    # branch is unreachable in production -- deliberately. It exists so that
+    # establishing the capability later is a one-line change with a test behind
+    # it, rather than a rewrite of the gate.
 
     # --- Liquidity --------------------------------------------------------
 

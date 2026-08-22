@@ -10,8 +10,9 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 
 class Bar(BaseModel):
@@ -73,6 +74,15 @@ class Indicators(BaseModel):
         return self.rsi_14 > self.rsi_prev
 
 
+def _norm_symbol(value: str) -> str:
+    """One spelling of a ticker, so identity comparisons cannot miss on case.
+
+    Both models normalise, so `event.symbol == assessment.symbol` compares like
+    with like no matter which construction path produced them.
+    """
+    return value.strip().upper()
+
+
 class EarningsStatus(StrEnum):
     """What we were able to establish about a symbol's next earnings report.
 
@@ -109,7 +119,7 @@ class EarningsEvent(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    symbol: str
+    symbol: Annotated[str, AfterValidator(_norm_symbol)]
     report_date: date
     timing: str | None = None  # "am" | "pm" | None when the broker omits it
     eps_estimate: Decimal | None = None
@@ -129,13 +139,37 @@ class EarningsAssessment(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    symbol: str
+    symbol: Annotated[str, AfterValidator(_norm_symbol)]
     status: EarningsStatus
     as_of: date
     source: str
     profile_ref: str
     event: EarningsEvent | None = None
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def _enforce_status_event_invariants(self) -> EarningsAssessment:
+        """Make the impossible combinations unconstructable.
+
+        The gate reads `status` and `event` as a pair. A model that permits
+        UPCOMING-with-no-event, or NONE_SCHEDULED-carrying-an-event, hands the
+        gate a contradiction to interpret — and every interpretation of a
+        contradiction is a guess. Rejecting them here means the gate's
+        defence-in-depth checks are a second line rather than the only one.
+        """
+        if self.status is EarningsStatus.UPCOMING:
+            if self.event is None:
+                raise ValueError("UPCOMING assessment must carry an event")
+            if self.event.symbol != self.symbol:
+                raise ValueError(
+                    f"event is for {self.event.symbol}, assessment is for {self.symbol}"
+                )
+        elif self.event is not None:
+            raise ValueError(f"{self.status.value} assessment must not carry an event")
+
+        if self.status is EarningsStatus.UNKNOWN and not (self.reason or "").strip():
+            raise ValueError("UNKNOWN assessment must record a reason")
+        return self
 
     @property
     def is_authoritative(self) -> bool:
