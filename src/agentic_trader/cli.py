@@ -59,6 +59,7 @@ from agentic_trader.config import (
     write_risk_lock,
 )
 from agentic_trader.journal import JournalRepository
+from agentic_trader.market.acquisition import CURRENT_ACQUISITION
 from agentic_trader.market.market_regime import MarketContext, classify_market_regime
 from agentic_trader.market.snapshot import SnapshotError, build_snapshot
 from agentic_trader.market.symbol_regime import classify_symbol_regime
@@ -294,6 +295,10 @@ def cmd_discover(args: argparse.Namespace) -> int:
             repo.record_scan_run(
                 result.run_id,
                 result.batch,
+                # The date selection actually rotated on, carried from the
+                # result rather than re-derived here -- two sources for one
+                # input is how they drift apart.
+                trading_date=result.trading_date,
                 candidates=abort_candidates(result),
                 scanner_profile_ref=result.scanner_profile_ref,
                 scan_definition_ref=result.definition_ref,
@@ -350,6 +355,12 @@ def _render_result(result: CycleResult, *, symbol_regime: str) -> dict[str, Any]
         "symbol": result.symbol,
         "strategy": result.strategy,
         "outcome": result.outcome.value,
+        # Reported at cycle level rather than only under `plan`, because the
+        # outcomes that produce no plan are exactly the ones whose execution
+        # context could not otherwise be established.
+        "mode": result.mode.value,
+        "acquisition_profile_ref": result.acquisition.profile_ref,
+        "acquisition_config_fingerprint": result.acquisition.content_fingerprint,
         "symbol_regime": symbol_regime,
         "market_regime": (
             result.market_context.to_dict() if result.market_context else None
@@ -436,6 +447,47 @@ def cmd_report(args: argparse.Namespace) -> int:
             ],
             "rejection_reasons": repo.rejection_reasons(),
             "recent_audit": repo.recent_audit(limit=args.limit),
+        }
+    )
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- acquisition
+
+
+def cmd_acquisition_spec(args: argparse.Namespace) -> int:
+    """Emit the exact read-only calls to make for each symbol.
+
+    This command is the reason the acquisition profile exists. An agent or a
+    payload worker asks for a symbol and a date and receives fully-specified
+    MCP parameters -- interval, bounds, adjustment, output width, start time.
+    It chooses none of them. Prose saying "roughly 120 days back" is what
+    produced 30, 57, and 265-point histories for the same logical indicator.
+
+    Read-only by construction: every tool named here is a market-data lookup.
+    Nothing in this output can place, review, cancel, or modify an order.
+    """
+    try:
+        trading_date = date.fromisoformat(args.date)
+    except ValueError:
+        return _fail(f"--date must be YYYY-MM-DD, got {args.date!r}")
+
+    symbols = [s.strip().upper() for s in args.symbols if s.strip()]
+    if not symbols:
+        return _fail("at least one symbol is required")
+
+    profile = CURRENT_ACQUISITION
+    _emit(
+        {
+            "ok": True,
+            "acquisition_profile_ref": profile.profile_ref,
+            "acquisition_config_fingerprint": profile.content_fingerprint,
+            "trading_date": trading_date.isoformat(),
+            "end_time_policy": profile.end_time_policy,
+            "symbols": {
+                symbol: profile.request_plan(symbol, trading_date)["calls"]
+                for symbol in symbols
+            },
         }
     )
     return EXIT_OK
@@ -574,6 +626,22 @@ def build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--no-journal", action="store_true")
     dc.add_argument("--dry-run", action="store_true")
     dc.set_defaults(func=cmd_discover)
+
+    aq = sub.add_parser(
+        "acquisition-spec",
+        help="Emit the pinned read-only MCP calls for one or more symbols.",
+    )
+    aq.add_argument("symbols", nargs="+", help="Symbols to generate requests for.")
+    aq.add_argument(
+        "--date",
+        required=True,
+        help=(
+            "Trading date (YYYY-MM-DD). Required for the same reason discover "
+            "requires it: every start_time derives from this date, never from "
+            "the wall clock, so the same date regenerates the same requests."
+        ),
+    )
+    aq.set_defaults(func=cmd_acquisition_spec)
 
     rp = sub.add_parser("report", help="Performance and audit summary.")
     rp.add_argument("--strategy", help="Limit to one strategy.")

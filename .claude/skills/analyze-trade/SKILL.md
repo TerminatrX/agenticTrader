@@ -37,32 +37,45 @@ to the user. Pass the full value to MCP tools and into the bundle unchanged.
 
 ### 2. Fetch market data
 
-For each symbol, call these in parallel:
+**Ask Python what to fetch. Do not choose parameters yourself.**
 
-- `get_equity_quotes` — symbols: `[SYMBOL]`
-- `get_equity_historicals` — interval `day`, `start_time` ~90 days back
-- `get_equity_fundamentals` — for liquidity and the 52-week range
-- `get_earnings_results` — for the blackout gate
-- `get_equity_technical_indicators` six times, all interval `day`:
-  - `rsi` period 14, `output: "last:2"`, start ~120 days back
-  - `macd` (defaults), `output: "last:2"`, start ~200 days back
-  - `sma` period 20, `output: "latest"`, start ~90 days back
-  - `sma` period 50, `output: "latest"`, start ~200 days back
-  - `sma` period 200, `output: "latest"`, start ~500 days back
-  - `atr` period 14, `output: "latest"`, start ~120 days back
+```bash
+.venv/Scripts/python.exe -m agentic_trader.cli acquisition-spec AAPL MSFT --date 2026-08-22
+```
 
-ATR sets the stop distance, and the stop sets the position size — so omitting
-it does not merely lose an input, it silently changes how much the system buys.
-Without it the strategy falls back to a flat percentage and records
-`stop_basis: flat_pct`, which the critic penalizes. Fetch it.
+This emits, per symbol, the exact tool and the exact parameters for every call:
+`interval`, `bounds`, `adjustment_type`, `output`, and a `start_time` derived
+from the trading date. Make those calls **verbatim**. Do not round a
+`start_time`, widen a range, drop `bounds`, or substitute `latest` for
+`last:2`.
 
-`last:2` on RSI and MACD is required, not optional. The strategy compares the
-current bar to the prior one to decide whether momentum is stabilizing, and
-`latest` alone silently disables that check — the one that separates buying a
-pullback from catching a falling knife.
+The specification lives in `src/agentic_trader/market/acquisition.py`
+(`CURRENT_ACQUISITION`) and it is authoritative. This file deliberately does
+not restate the lookbacks: it used to, and three workers reading "start ~120
+days back" fetched 30, 57, and 265 points for one indicator. RSI, MACD and ATR
+are recursive — each value depends on the previous one back to a seed at the
+start of the range — so those are *different numbers for the same indicator on
+the same day*. The decisions happened to match. That was luck.
 
-Note the SMA start times: a 200-period average needs at least 200 bars of
-warm-up before the first value exists.
+Also fetch, which the spec does not cover because neither takes a lookback:
+
+- `get_equity_fundamentals` — liquidity and the 52-week range
+- `get_equity_positions` and `get_equity_orders` — see step 3
+
+Two things worth knowing rather than merely obeying:
+
+- **ATR sets the stop distance, and the stop sets the position size.** Omitting
+  it does not just lose an input, it silently changes how much the system buys:
+  the strategy falls back to a flat percentage, records `stop_basis: flat_pct`,
+  and the critic penalizes it.
+- **`last:2` on RSI and MACD is load-bearing.** The strategy compares the
+  current bar to the prior one to decide whether momentum is stabilizing.
+  `latest` alone disables that check in silence — the one that separates buying
+  a pullback from catching a falling knife.
+
+Record `acquisition_profile_ref` and `acquisition_config_fingerprint` from the
+spec output; `evaluate` journals them so a stored decision names the contract
+its inputs came from.
 
 ### 3. Build the bundle
 

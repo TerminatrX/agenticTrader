@@ -33,9 +33,15 @@ from agentic_trader.config import AppConfig
 from agentic_trader.execution.executor import ExecutionPlan, PreflightError, build_order_payload
 from agentic_trader.execution.shadow_executor import ShadowExecutor
 from agentic_trader.journal.models import AuditEntry, CycleOutcome, TradeRecord
+from agentic_trader.market.acquisition import (
+    CURRENT_ACQUISITION,
+    MarketDataAcquisitionProfile,
+)
 from agentic_trader.market.market_regime import MarketContext
 from agentic_trader.models import (
+    SELECTABLE_EXECUTION_MODES,
     AccountState,
+    ExecutionMode,
     MarketSnapshot,
     RiskDecision,
     Signal,
@@ -53,6 +59,12 @@ class CycleResult:
     symbol: str
     strategy: str
     outcome: CycleOutcome
+    # No default. A CycleResult that has not been told its mode must not be
+    # constructible, because `_build_audit` copies this straight onto the
+    # persisted record -- a default here would put an unexamined "shadow" into
+    # the journal for a cycle nobody confirmed was shadow.
+    mode: ExecutionMode
+    acquisition: MarketDataAcquisitionProfile = CURRENT_ACQUISITION
 
     signal: Signal | None = None
     risk_decision: RiskDecision | None = None
@@ -98,8 +110,9 @@ def run_cycle(
     config: AppConfig,
     *,
     strategy_name: str = "trend_pullback",
-    mode: str = "shadow",
+    mode: ExecutionMode | str = ExecutionMode.SHADOW,
     cycle_id: str | None = None,
+    acquisition: MarketDataAcquisitionProfile = CURRENT_ACQUISITION,
     known_client_keys: set[str] | None = None,
     last_loss_exit: date | None = None,
     recent_symbol_trades: int = 0,
@@ -111,11 +124,26 @@ def run_cycle(
     current = now or datetime.now(UTC)
     cid = cycle_id or uuid.uuid4().hex[:12]
 
+    # Normalized once, at the entry point, so every downstream record and gate
+    # reads one value of one type. A string that is not a mode is rejected here
+    # rather than defaulting to something safe-sounding: silently treating an
+    # unrecognized mode as shadow would make a typo look like a deliberate
+    # choice in the journal.
+    execution_mode = ExecutionMode(mode)
+    if execution_mode not in SELECTABLE_EXECUTION_MODES:
+        raise ValueError(
+            f"execution mode {execution_mode.value!r} is declared but not "
+            f"implemented in this build; selectable modes are "
+            f"{sorted(m.value for m in SELECTABLE_EXECUTION_MODES)}"
+        )
+
     result = CycleResult(
         cycle_id=cid,
         symbol=snapshot.symbol,
         strategy=strategy_name,
         outcome=CycleOutcome.NO_SIGNAL,
+        mode=execution_mode,
+        acquisition=acquisition,
         market_context=market_context,
     )
 
@@ -214,7 +242,12 @@ def run_cycle(
             max_spread_pct=config.risk.max_spread_pct,
             max_price_drift_pct=config.risk.max_price_drift_pct,
             allow_unprotected_shadow_entries=config.risk.allow_unprotected_shadow_entries,
-            mode="live" if mode == "live" else "shadow",
+            # Anything that is not shadow takes the non-shadow branch, which
+            # is where `build_order_payload` applies the structural protection
+            # floor. Written this way round on purpose: matching LIVE by name
+            # would route a mode added later -- APPROVAL, say -- into "shadow"
+            # and quietly past the one check that has no config override.
+            mode="shadow" if execution_mode is ExecutionMode.SHADOW else "live",
             known_client_keys=known_client_keys,
             now=current,
         )
@@ -232,13 +265,13 @@ def run_cycle(
     # Live submission happens in the agent, not here. This function's most
     # important property is that it cannot place an order.
 
-    if mode == "shadow":
+    if execution_mode is ExecutionMode.SHADOW:
         fill = ShadowExecutor().submit(plan, now=current)
         result.trade = TradeRecord(
             client_key=fill.client_key,
             symbol=fill.symbol,
             strategy=fill.strategy,
-            mode="shadow",
+            mode=execution_mode,
             opened_at=fill.submitted_at,
             entry_price=fill.fill_price,
             quantity=fill.quantity,
@@ -269,6 +302,9 @@ def _build_audit(
     plan = result.plan
     market = result.market_context
     return AuditEntry(
+        mode=result.mode,
+        acquisition_profile_ref=result.acquisition.profile_ref,
+        acquisition_config_fingerprint=result.acquisition.content_fingerprint,
         protection_state=plan.protection if plan is not None else None,
         capability_profile=plan.capability_profile if plan is not None else None,
         market_regime=market.regime.value if market is not None else None,

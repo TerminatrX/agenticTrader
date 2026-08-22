@@ -18,7 +18,7 @@ import json
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS audit (
     symbol          TEXT NOT NULL,
     strategy        TEXT NOT NULL,
     outcome         TEXT NOT NULL,
+    -- The execution context, stored rather than inferred. See AuditEntry.mode.
+    mode            TEXT,
+    -- The pinned request contract behind this decision's inputs.
+    acquisition_profile_ref TEXT,
+    acquisition_config_fingerprint TEXT,
     reference_price TEXT,
     confidence      REAL NOT NULL DEFAULT 0,
     signal_strength TEXT,
@@ -120,6 +125,11 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     run_id                   TEXT NOT NULL UNIQUE,
     source                   TEXT NOT NULL,
     scanner_profile_ref      TEXT,
+    -- The date selection was seeded with, stored because it is an *input*.
+    -- Not derivable from started_at: that is a UTC instant, and a run that
+    -- starts at 01:30 UTC seeds from the previous trading date. Inferring it
+    -- back would be wrong in exactly the cases worth auditing.
+    trading_date             TEXT,
     started_at               TEXT NOT NULL,
     completed_at             TEXT,
     shard_count              INTEGER NOT NULL DEFAULT 0,
@@ -189,6 +199,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_protective_broker_order
 # existed would otherwise fail on insert with a confusing "no such column".
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "audit": {
+        # Nullable for the same reason scan_runs.trading_date is: a row written
+        # before the column existed has no honest value, and NOT NULL DEFAULT
+        # 'shadow' would retroactively assert something nobody verified. New
+        # writes always carry it -- AuditEntry.mode is required.
+        "mode": "TEXT",
+        "acquisition_profile_ref": "TEXT",
+        "acquisition_config_fingerprint": "TEXT",
         "original_confidence": "REAL",
         "adjusted_confidence": "REAL",
         "thesis": "TEXT",
@@ -203,6 +220,12 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     # EXISTS leaves it alone — so the insert would fail on a missing column.
     # The obsolete column stays behind harmlessly; nothing reads it.
     "scan_runs": {
+        # Nullable on purpose. Rows written before this column existed genuinely
+        # do not know their trading date, and a NOT NULL DEFAULT would invent
+        # one -- stamping every historical run with a date it never used is
+        # worse than an honest NULL. New writes always carry it: the repository
+        # parameter is required, so the gap cannot spread forward.
+        "trading_date": "TEXT",
         "budget_deferred_count": "INTEGER NOT NULL DEFAULT 0",
         "scan_definition_ref": "TEXT",
         "scan_config_fingerprint": "TEXT",
@@ -259,6 +282,7 @@ class JournalRepository:
             conn.execute(
                 """INSERT INTO audit (
                     cycle_id, occurred_at, symbol, strategy, outcome,
+                    mode, acquisition_profile_ref, acquisition_config_fingerprint,
                     reference_price, confidence, signal_strength,
                     original_confidence, adjusted_confidence,
                     thesis, invalidation_reason,
@@ -266,13 +290,16 @@ class JournalRepository:
                     market_regime, market_context,
                     reasons, failed_conditions, risk_breaches, critic_notes,
                     snapshot_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     entry.cycle_id,
                     entry.occurred_at.isoformat(),
                     entry.symbol,
                     entry.strategy,
                     entry.outcome.value,
+                    entry.mode.value,
+                    entry.acquisition_profile_ref,
+                    entry.acquisition_config_fingerprint,
                     _s(entry.reference_price),
                     entry.confidence,
                     entry.signal_strength,
@@ -302,6 +329,20 @@ class JournalRepository:
         params.append(limit)
         with self._connect() as conn:
             return [_audit_row(r) for r in conn.execute(query, params).fetchall()]
+
+    def audit_for_cycle(self, cycle_id: str) -> list[dict[str, Any]]:
+        """Full audit rows for one cycle, snapshot included.
+
+        Separate from `recent_audit`, which trims to a summary for display.
+        Reconstructing a past decision needs the parts that summary drops: the
+        snapshot it was made from, and the contract identities that say what
+        the snapshot means.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM audit WHERE cycle_id = ? ORDER BY id", (cycle_id,)
+            ).fetchall()
+        return [_full_audit_row(r) for r in rows]
 
     # ----------------------------------------------------------------- trades
 
@@ -387,6 +428,7 @@ class JournalRepository:
         run_id: str,
         batch: Any | None,
         *,
+        trading_date: date,
         candidates: Sequence[Any] | None = None,
         scanner_profile_ref: str | None = None,
         scan_definition_ref: str | None = None,
@@ -408,6 +450,11 @@ class JournalRepository:
         included. A funnel that recorded only survivors could not distinguish
         "the strategy declined it" from "we never looked", and those two answer
         completely different questions about why a day produced no trades.
+
+        `trading_date` is required and has no default. It is the seed selection
+        rotated on, so a run that cannot state it cannot be reproduced -- and a
+        default here would let a caller silently fall back to the wall clock,
+        which is the exact failure this parameter exists to prevent.
         """
         rows = list(
             candidates
@@ -418,18 +465,20 @@ class JournalRepository:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO scan_runs (
-                    run_id, source, scanner_profile_ref, started_at, completed_at,
+                    run_id, source, scanner_profile_ref, trading_date,
+                    started_at, completed_at,
                     shard_count, returned_before_dedupe, unique_discovered,
                     duplicates_removed, selected_for_enrichment,
                     budget_deferred_count, coverage_status, coverage_complete,
                     scan_definition_ref, scan_config_fingerprint,
                     scan_config_json, coverage_reasons_json, funnel_counts_json,
                     drift_status, drift_findings_json, aborted_reason
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     source or (batch.source if batch is not None else "unknown"),
                     scanner_profile_ref,
+                    trading_date.isoformat(),
                     (started_at or (batch.started_at if batch is not None else datetime.now(UTC)))
                     .isoformat(),
                     (completed_at or datetime.now(UTC)).isoformat(),
@@ -617,6 +666,9 @@ def _audit_row(row: sqlite3.Row) -> dict[str, Any]:
         "symbol": row["symbol"],
         "strategy": row["strategy"],
         "outcome": row["outcome"],
+        "mode": row["mode"],
+        "acquisition_profile_ref": row["acquisition_profile_ref"],
+        "acquisition_config_fingerprint": row["acquisition_config_fingerprint"],
         "reference_price": row["reference_price"],
         "confidence": row["confidence"],
         "signal_strength": row["signal_strength"],
@@ -627,6 +679,19 @@ def _audit_row(row: sqlite3.Row) -> dict[str, Any]:
         "failed_conditions": json.loads(row["failed_conditions"] or "[]"),
         "risk_breaches": json.loads(row["risk_breaches"] or "[]"),
         "critic_notes": json.loads(row["critic_notes"] or "[]"),
+    }
+
+
+def _full_audit_row(row: sqlite3.Row) -> dict[str, Any]:
+    """Every persisted field, decoded. The reconstruction path."""
+    return {
+        **_audit_row(row),
+        "original_confidence": row["original_confidence"],
+        "adjusted_confidence": row["adjusted_confidence"],
+        "thesis": row["thesis"],
+        "invalidation_reason": row["invalidation_reason"],
+        "market_context": json.loads(row["market_context"] or "null"),
+        "snapshot_json": json.loads(row["snapshot_json"] or "null"),
     }
 
 

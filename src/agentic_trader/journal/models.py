@@ -22,7 +22,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agentic_trader.models import ProtectionState
+from agentic_trader.models import ExecutionMode, ProtectionState
 
 
 class CycleOutcome(StrEnum):
@@ -45,6 +45,25 @@ class AuditEntry(BaseModel):
     symbol: str
     strategy: str
     outcome: CycleOutcome
+
+    # Which execution context produced this. Required, with no default: a
+    # default would be an inference dressed as a fact, and the whole reason
+    # this field exists is that every available inference -- a TradeRecord
+    # appearing, an ExecutionPlan existing, an outcome value -- reads the
+    # consequence and guesses the context backwards. Five of the seven outcomes
+    # produce no trade and no plan in *any* mode, so for those the guess has
+    # nothing to go on at all.
+    mode: ExecutionMode
+
+    # Which pinned request contract produced the inputs behind this decision.
+    # The snapshot records what came back; these record what was asked for, and
+    # without them a replay cannot tell a decision made on 30 bars of RSI
+    # warm-up from the same decision made on 300.
+    #
+    # Optional because rows written before the contract existed genuinely have
+    # none. Every new write carries them.
+    acquisition_profile_ref: str | None = None
+    acquisition_config_fingerprint: str | None = None
 
     reference_price: Decimal | None = None
     confidence: float = 0.0
@@ -94,7 +113,11 @@ class TradeRecord(BaseModel):
     client_key: str
     symbol: str
     strategy: str
-    mode: str  # "shadow" | "live"
+
+    # Same type as `AuditEntry.mode`, so the two cannot describe one cycle in
+    # two vocabularies. Previously a bare `str`, which admitted "Shadow",
+    # "SHADOW", and typos as distinct modes.
+    mode: ExecutionMode
 
     opened_at: datetime
     entry_price: Decimal

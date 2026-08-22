@@ -389,6 +389,7 @@ def _record(repo, result):
     repo.record_scan_run(
         result.run_id,
         result.batch,
+        trading_date=result.trading_date,
         candidates=abort_candidates(result),
         scanner_profile_ref=result.scanner_profile_ref,
         scan_definition_ref=result.definition_ref,
