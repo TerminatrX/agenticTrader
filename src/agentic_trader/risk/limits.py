@@ -18,6 +18,10 @@ from datetime import date
 from decimal import Decimal
 
 from agentic_trader.config import RiskConfig
+from agentic_trader.market.earnings_capabilities import (
+    ROBINHOOD_MCP_EARNINGS,
+    EarningsCapabilities,
+)
 from agentic_trader.models import (
     AccountState,
     EarningsStatus,
@@ -68,6 +72,7 @@ def check_limits(
     is_halted: bool = False,
     as_of: date | None = None,
     last_loss_exit: date | None = None,
+    earnings_capabilities: EarningsCapabilities = ROBINHOOD_MCP_EARNINGS,
 ) -> LimitCheck:
     """Run every gate. Ordered cheapest-and-most-absolute first."""
     result = LimitCheck()
@@ -165,96 +170,9 @@ def check_limits(
     # earnings field skipped the gate entirely, so a missing payload, a
     # malformed one, and a genuinely clear calendar all silently permitted an
     # entry. Absence of evidence now blocks.
-    # Structured as an allowlist: every path breaches except the one that
-    # positively establishes safety. An assessment carrying an impossible
-    # status/event combination therefore blocks rather than falling through a
-    # chain of `elif`s into silence. The model rejects those combinations too;
-    # this is the second line, for anything built via `model_construct` or a
-    # future refactor that loosens the model.
-    assessment = snapshot.earnings
-    if assessment is None:
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: no earnings assessment attached to the snapshot "
-            f"for {signal.symbol} — cannot establish the blackout window"
-        )
-    elif assessment.symbol != signal.symbol.strip().upper():
-        # Defence in depth against the failure this milestone exists to fix:
-        # evidence about one company must never gate another.
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: earnings evidence is for {assessment.symbol}, "
-            f"not {signal.symbol}"
-        )
-    elif assessment.as_of != today:
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: earnings evidence is as of {assessment.as_of}, "
-            f"evaluating {today} — stale evidence cannot clear a blackout"
-        )
-    elif assessment.status is EarningsStatus.UNKNOWN:
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: {assessment.reason or 'no reason recorded'} "
-            f"(source {assessment.source})"
-        )
-    elif assessment.status is EarningsStatus.UPCOMING and assessment.event is None:
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: assessment claims an upcoming report for "
-            f"{assessment.symbol} but carries no event"
-        )
-    elif assessment.status is not EarningsStatus.UPCOMING and assessment.event is not None:
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: status {assessment.status.value} contradicts "
-            "the event it carries"
-        )
-    elif (
-        assessment.status is EarningsStatus.UPCOMING
-        and assessment.event is not None
-        and assessment.event.symbol != assessment.symbol
-    ):
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: event belongs to {assessment.event.symbol}, "
-            f"assessment claims {assessment.symbol}"
-        )
-    elif assessment.status is EarningsStatus.UPCOMING and assessment.event is not None:
-        event = assessment.event
-        days_out = event.days_until(today)
-        confidence = "confirmed" if event.verified else "tentative"
-        session = f", {event.timing}" if event.timing else ""
-        if 0 <= days_out <= config.earnings_blackout_days:
-            result.breach(
-                f"earnings in {days_out}d ({event.report_date}{session}, {confidence}) "
-                f"— inside {config.earnings_blackout_days}d blackout"
-            )
-        elif days_out <= config.earnings_blackout_days + 5:
-            result.warn(
-                f"earnings in {days_out}d ({event.report_date}{session}) — "
-                "position may need closing before the report"
-            )
-        if (
-            not event.verified
-            and config.earnings_blackout_days < days_out <= config.earnings_blackout_days + 5
-        ):
-            # A penciled-in date near the window can move into it. Recorded,
-            # not blocked: widening the window for unverified dates would be a
-            # policy change rather than a bug fix.
-            #
-            # Scoped to the warn band on purpose. The quarter after next is
-            # almost always unverified, so warning on every distant date would
-            # fire for nearly every symbol -- and a warning that always fires
-            # is one nobody reads.
-            result.warn(
-                f"earnings date {event.report_date} is unverified and may move "
-                "into the blackout window"
-            )
-    elif assessment.status is not EarningsStatus.NONE_SCHEDULED:
-        result.breach(
-            f"{EARNINGS_UNKNOWN}: unhandled earnings status "
-            f"{assessment.status.value!r}"
-        )
-    # Only NONE_SCHEDULED reaches here without a breach, and the normalizer
-    # emits it solely when the source is established as authoritative about the
-    # absence of a future report. That is currently NOT established, so this
-    # branch is unreachable in production -- deliberately. It exists so that
-    # establishing the capability later is a one-line change with a test behind
-    # it, rather than a rewrite of the gate.
+    _check_earnings_blackout(
+        signal, snapshot, config, today, earnings_capabilities, result
+    )
 
     # --- Liquidity --------------------------------------------------------
 
@@ -385,3 +303,152 @@ def unsettled_after_sale(account: AccountState, proceeds: Decimal) -> Decimal:
     actually be spendable rather than against total cash.
     """
     return account.unsettled_funds + proceeds
+
+
+def _check_earnings_blackout(
+    signal: Signal,
+    snapshot: MarketSnapshot,
+    config,
+    today: date,
+    capabilities: EarningsCapabilities,
+    result: LimitCheck,
+) -> None:
+    """The earnings blackout, for a new entry only. Fail closed at every step.
+
+    Structured as an allowlist: this function breaches on every path except the
+    ones that positively establish safety. That shape matters more than it
+    looks — the original bug was a single `if ... is not None` whose *else* was
+    silence, and an `elif` chain has the same hazard at its tail.
+
+    Provenance is checked before status is trusted. `EarningsAssessment` is a
+    plain model: it can be constructed directly, replayed from a persisted
+    snapshot, or built by a future caller against a different source. Its
+    `source` and `profile_ref` are claims *by* that caller, so the gate
+    verifies they name the contract this build actually validated rather than
+    taking the assessment's word for its own trustworthiness.
+    """
+    assessment = snapshot.earnings
+
+    if assessment is None:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: no earnings assessment attached to the snapshot "
+            f"for {signal.symbol} — cannot establish the blackout window"
+        )
+        return
+
+    # --- provenance, before any status is believed ---
+    if not capabilities.usable_for_blackout:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: earnings source {capabilities.profile_ref} is not "
+            "capable of a per-symbol blackout answer"
+        )
+        return
+    if assessment.source != capabilities.source_tool:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: evidence came from {assessment.source!r}, "
+            f"which is not the validated source {capabilities.source_tool!r}"
+        )
+        return
+    if assessment.profile_ref != capabilities.profile_ref:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: evidence cites capability profile "
+            f"{assessment.profile_ref!r}, current contract is "
+            f"{capabilities.profile_ref!r}"
+        )
+        return
+
+    # --- identity and freshness ---
+    if assessment.symbol != signal.symbol.strip().upper():
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: earnings evidence is for {assessment.symbol}, "
+            f"not {signal.symbol}"
+        )
+        return
+    if assessment.as_of != today:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: earnings evidence is as of {assessment.as_of}, "
+            f"evaluating {today} — stale evidence cannot clear a blackout"
+        )
+        return
+
+    status = assessment.status
+    event = assessment.event
+
+    # --- contradictions that validation would have caught, caught again ---
+    if status is EarningsStatus.UPCOMING and event is None:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: assessment claims an upcoming report for "
+            f"{assessment.symbol} but carries no event"
+        )
+        return
+    if status is not EarningsStatus.UPCOMING and event is not None:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: status {_status_label(status)} contradicts the "
+            "event it carries"
+        )
+        return
+    if event is not None and event.symbol != assessment.symbol:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: event belongs to {event.symbol}, assessment "
+            f"claims {assessment.symbol}"
+        )
+        return
+
+    if status is EarningsStatus.UNKNOWN:
+        result.breach(
+            f"{EARNINGS_UNKNOWN}: {assessment.reason or 'no reason recorded'} "
+            f"(source {assessment.source})"
+        )
+        return
+
+    if status is EarningsStatus.NONE_SCHEDULED:
+        # The only silence that may clear an entry, and only when the source is
+        # established as authoritative about absence. Checked here as well as in
+        # the normalizer because a NONE_SCHEDULED model can be constructed or
+        # replayed without ever passing through it.
+        if not capabilities.future_event_absence_authoritative.usable:
+            result.breach(
+                f"{EARNINGS_UNKNOWN}: {assessment.symbol} reports no scheduled "
+                f"earnings, but {capabilities.profile_ref} is not established as "
+                "authoritative about the absence of a future report"
+            )
+        return
+
+    if status is EarningsStatus.UPCOMING and event is not None:
+        days_out = event.days_until(today)
+        confidence = "confirmed" if event.verified else "tentative"
+        session = f", {event.timing}" if event.timing else ""
+        if 0 <= days_out <= config.earnings_blackout_days:
+            result.breach(
+                f"earnings in {days_out}d ({event.report_date}{session}, {confidence}) "
+                f"— inside {config.earnings_blackout_days}d blackout"
+            )
+        elif days_out <= config.earnings_blackout_days + 5:
+            result.warn(
+                f"earnings in {days_out}d ({event.report_date}{session}) — "
+                "position may need closing before the report"
+            )
+        if (
+            not event.verified
+            and config.earnings_blackout_days < days_out <= config.earnings_blackout_days + 5
+        ):
+            # A penciled-in date near the window can move into it. Scoped to the
+            # warn band because the quarter after next is almost always
+            # unverified, and a warning that always fires is one nobody reads.
+            result.warn(
+                f"earnings date {event.report_date} is unverified and may move "
+                "into the blackout window"
+            )
+        return
+
+    # Any status this function does not know how to clear, including a value
+    # smuggled past validation by `model_construct`.
+    result.breach(
+        f"{EARNINGS_UNKNOWN}: unhandled earnings status {_status_label(status)}"
+    )
+
+
+def _status_label(status) -> str:
+    """`status` may not be an EarningsStatus at all if validation was bypassed."""
+    return repr(getattr(status, "value", status))
+

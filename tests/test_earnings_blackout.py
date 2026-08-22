@@ -51,13 +51,15 @@ def _assess(*rows, symbol="AAPL", as_of=TODAY, not_found=None):
     return assess_earnings(_payload(*rows, not_found=not_found), symbol, as_of)
 
 
-def _gate(snapshot, signal, account, config, assessment, *, as_of=TODAY):
+def _gate(snapshot, signal, account, config, assessment, *, as_of=TODAY,
+          capabilities=ROBINHOOD_MCP_EARNINGS):
     return check_limits(
         signal,
         snapshot.model_copy(update={"earnings": assessment}),
         account,
         config,
         as_of=as_of,
+        earnings_capabilities=capabilities,
     )
 
 
@@ -263,10 +265,19 @@ def test_absence_becomes_authoritative_only_when_the_capability_says_so(
     )
     assert assessment.status is EarningsStatus.NONE_SCHEDULED
 
-    result = _gate(
+    # The gate must be told the same contract. Handed the real one, which does
+    # not establish absence, the very same assessment is refused.
+    allowed = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, assessment,
+        capabilities=established,
+    )
+    assert not _breached_on_earnings(allowed)
+
+    refused = _gate(
         bullish_pullback_snapshot, entry_signal, account, risk_config, assessment
     )
-    assert not _breached_on_earnings(result)
+    assert not refused.passed
+    assert any(EARNINGS_UNKNOWN in b for b in refused.breaches)
 
 
 def test_the_absence_capability_is_not_established():
@@ -683,3 +694,203 @@ def test_assess_earnings_never_raises_on_arbitrary_junk():
         assessment = assess_earnings(payload, "AAPL", TODAY)
         assert assessment.status is EarningsStatus.UNKNOWN, payload
         assert assessment.reason
+
+
+# --------------------------------------------------------------------------
+# Provenance. `EarningsAssessment` is a plain model: it can be constructed
+# directly, replayed from a persisted snapshot, or produced by a future caller
+# against a different source. `source` and `profile_ref` are therefore claims
+# *by* the caller, and a hard gate must verify them rather than accept an
+# assessment's word for its own trustworthiness.
+# --------------------------------------------------------------------------
+
+import dataclasses  # noqa: E402
+
+from agentic_trader.models.capabilities import Capability  # noqa: E402
+
+CURRENT_SOURCE = ROBINHOOD_MCP_EARNINGS.source_tool
+
+
+def _none_scheduled(*, source=CURRENT_SOURCE, profile_ref=PROFILE, symbol="AAPL"):
+    return EarningsAssessment(
+        symbol=symbol, status=EarningsStatus.NONE_SCHEDULED, as_of=TODAY,
+        source=source, profile_ref=profile_ref,
+    )
+
+
+def _upcoming(days=30, *, source=CURRENT_SOURCE, profile_ref=PROFILE, symbol="AAPL"):
+    from datetime import timedelta
+
+    return EarningsAssessment(
+        symbol=symbol, status=EarningsStatus.UPCOMING, as_of=TODAY,
+        source=source, profile_ref=profile_ref,
+        event=EarningsEvent(
+            symbol=symbol, report_date=TODAY + timedelta(days=days), verified=True
+        ),
+    )
+
+
+def test_hand_built_none_scheduled_is_blocked_while_absence_is_unestablished(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """(1) The normalizer will not emit this today, but the risk boundary must
+    not depend on that. A directly-constructed NONE_SCHEDULED with impeccable
+    provenance still cannot clear the gate while the capability says absence
+    proves nothing."""
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, _none_scheduled()
+    )
+    assert not result.passed
+    assert any(EARNINGS_UNKNOWN in b for b in result.breaches)
+    assert any("authoritative about the absence" in b for b in result.breaches)
+
+
+@pytest.mark.parametrize(
+    ("assessment_factory", "fragment"),
+    [
+        (lambda: _none_scheduled(source="get_earnings_calendar"),
+         "not the validated source"),
+        (lambda: _none_scheduled(source="hand_written"), "not the validated source"),
+        (lambda: _none_scheduled(profile_ref="robinhood-mcp-earnings@2026-08-21"),
+         "current contract is"),
+        (lambda: _none_scheduled(profile_ref="anything"), "current contract is"),
+        (lambda: _upcoming(source="get_earnings_calendar"), "not the validated source"),
+        (lambda: _upcoming(profile_ref="robinhood-mcp-earnings@1999-01-01"),
+         "current contract is"),
+    ],
+)
+def test_evidence_from_the_wrong_source_or_profile_is_refused(
+    entry_signal, bullish_pullback_snapshot, account, risk_config,
+    assessment_factory, fragment,
+):
+    """(2)(3)(4)(5) Wrong tool or a stale profile pin blocks, for both
+    NONE_SCHEDULED and UPCOMING. `get_earnings_calendar` is named explicitly
+    because it is the endpoint that caused the original cross-symbol bug and
+    the one somebody would most plausibly reach for again."""
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config,
+        assessment_factory(),
+    )
+    assert not result.passed
+    assert any(EARNINGS_UNKNOWN in b for b in result.breaches)
+    assert any(fragment in b for b in result.breaches)
+
+
+def test_upcoming_from_the_pinned_source_behaves_normally(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """(6) The provenance checks must not break the ordinary path."""
+    far = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, _upcoming(30)
+    )
+    assert not _breached_on_earnings(far)
+
+    near = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, _upcoming(2)
+    )
+    assert _breached_on_earnings(near)
+    assert not any(EARNINGS_UNKNOWN in b for b in near.breaches)
+
+
+def test_matching_provenance_plus_established_absence_permits_none_scheduled(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """(7) Both halves are required: the capability must establish absence AND
+    the assessment must cite that same contract."""
+    established = dataclasses.replace(
+        ROBINHOOD_MCP_EARNINGS,
+        version="hypothetical",
+        future_event_absence_authoritative=Capability(
+            True, Evidence.EMPIRICALLY_VERIFIED, "hypothetical, for this test only"
+        ),
+    )
+    matching = _none_scheduled(profile_ref=established.profile_ref)
+
+    allowed = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, matching,
+        capabilities=established,
+    )
+    assert not _breached_on_earnings(allowed)
+
+    # Same capability, but evidence citing the old contract: still refused.
+    stale = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config,
+        _none_scheduled(), capabilities=established,
+    )
+    assert not stale.passed
+    assert any("current contract is" in b for b in stale.breaches)
+
+
+def test_a_garbage_status_fails_closed_without_raising(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """(8) `model_construct` skips validation entirely, so `status` need not be
+    an EarningsStatus at all. The gate must refuse it rather than crash - an
+    exception escaping the risk engine is a worse failure than a blocked
+    entry."""
+    smuggled = EarningsAssessment.model_construct(
+        symbol="AAPL", status="garbage", as_of=TODAY,
+        source=CURRENT_SOURCE, profile_ref=PROFILE, event=None, reason=None,
+    )
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, smuggled
+    )
+    assert not result.passed
+    assert any(EARNINGS_UNKNOWN in b for b in result.breaches)
+    assert any("unhandled earnings status" in b for b in result.breaches)
+
+
+def test_an_incapable_source_blocks_even_with_perfect_evidence(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """If the contract is ever downgraded below symbol-scoped, the gate goes
+    dark rather than continuing to trust evidence gathered under the old one."""
+    crippled = dataclasses.replace(
+        ROBINHOOD_MCP_EARNINGS,
+        symbol_scoped=Capability(
+            False, Evidence.EMPIRICALLY_VERIFIED, "market-wide only"
+        ),
+    )
+    result = _gate(
+        bullish_pullback_snapshot, entry_signal, account, risk_config, _upcoming(30),
+        capabilities=crippled,
+    )
+    assert not result.passed
+    assert any("not capable of a per-symbol" in b for b in result.breaches)
+
+
+def test_provenance_is_never_checked_on_an_exit(
+    bullish_pullback_snapshot, account, risk_config, held_position
+):
+    """Exits bypass the whole block, so no provenance failure can strand a
+    position - the same guarantee as before, re-asserted now that there are
+    more ways to fail."""
+    from agentic_trader.models import Side, Signal, SignalStrength
+
+    holding = account.model_copy(update={"positions": [held_position]})
+    result = check_limits(
+        Signal(
+            symbol="AAPL", strategy="trend_pullback", strength=SignalStrength.EXIT,
+            side=Side.SELL, confidence=0.9, reference_price=Decimal("302.25"),
+            reasons=["lost the 50-day"],
+        ),
+        bullish_pullback_snapshot.model_copy(
+            update={"earnings": _none_scheduled(source="get_earnings_calendar")}
+        ),
+        holding,
+        risk_config,
+        as_of=TODAY,
+    )
+    assert not any("earnings" in b.lower() for b in result.breaches)
+
+
+def test_the_risk_engine_carries_the_contract_explicitly(risk_config):
+    """The dependency lives in the engine's signature, not buried in the gate,
+    so it can be substituted in a test and seen in a review."""
+    from agentic_trader.risk.engine import RiskEngine
+
+    assert RiskEngine(risk_config).earnings_capabilities is ROBINHOOD_MCP_EARNINGS
+
+    other = dataclasses.replace(ROBINHOOD_MCP_EARNINGS, version="other")
+    engine = RiskEngine(risk_config, earnings_capabilities=other)
+    assert engine.earnings_capabilities is other
