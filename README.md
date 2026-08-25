@@ -476,7 +476,8 @@ that distinction per capability rather than burying it in a comment.
 ```
 src/agentic_trader/
   models/        domain types crossing every layer
-  market/        MCP payloads → snapshot; signals; regime; acquisition contract
+  market/        MCP payloads → snapshot; signals; regime; acquisition contract;
+                 local indicators (diagnostics only)
   universe/      scan definition, coverage, drift, candidate selection
   strategies/    opinions only — no account access, no sizing
   risk/          limits, sizing, engine
@@ -497,6 +498,82 @@ tests/
   hooks/         guard_risk_config.py — the deny hook
   settings.json  wires the hook (tracked, so protection travels with the repo)
 ```
+
+## Local indicators — measured, not adopted
+
+The six broker indicator endpoints all derive from bars we already fetch, so
+computing them locally would cut roughly two-thirds of the per-symbol calls. The
+question is whether it changes what the strategy decides.
+
+`market/local_indicators.py` writes RSI, MACD, SMA and ATR out by hand — no
+pandas-ta, no TA-Lib — because the point is to *localize* any disagreement to a
+formula, and an opaque dependency answers that with another opaque dependency.
+Every seed and recurrence is stated in the docstring and pinned by a
+hand-calculable test whose oracle is arithmetic, never the broker.
+
+**They are diagnostics.** Nothing in `strategies/`, `risk/`, the critic, or
+`build_snapshot` imports them, and a test enforces that. Broker values remain
+the authoritative decision inputs until a separate cutover milestone says
+otherwise.
+
+### How much history a recurrence needs
+
+The binding constraint is **MACD at 277 bars — not SMA200 at 200**, which is the
+obvious guess and the wrong one. MACD's signal EMA smooths an already-smoothed
+line, so the two seeds compose. SMA is a finite window and needs no allowance at
+all; its minimum and its converged requirement are the same number.
+
+| | minimum bars | converged bars |
+|---|---|---|
+| sma_20 / 50 / 200 | 20 / 50 / 200 | same |
+| rsi_14 | 16 | 203 |
+| atr_14 | 15 | 202 |
+| **macd** | 35 | **277** |
+
+That set the historicals lookback to **420 calendar days** (~290 bars). An
+earlier estimate of ~330 days would have yielded ~228 bars and been short; a
+test asserts so, to stop the number quietly regressing.
+
+### What the comparison found
+
+12 symbols spanning ~$12 to ~$300 and deliberately including the volatile names,
+30 sessions each, both sides computed over the identical 289-bar window.
+
+Those requests were **not** the production shape, and the evidence says so.
+`local-indicator-comparison@v1-2026-08-25` gives every call one shared
+`start_time` and a wider trim, because the question is whether two
+implementations agree on *identical* inputs — production gives each indicator
+its own lookback, which would have measured range and formula differences at
+once. The report records both identities separately:
+`production_acquisition_*` for the contract this validates *for*,
+`validation_comparison_*` for the requests that actually produced the numbers.
+
+- **Zero decision disagreements** in 348 comparisons, under both EMA seed
+  conventions.
+- Numeric agreement at float64 round-trip: SMA to 4e-13, ATR to 1.8e-8, MACD to
+  6.8e-8, RSI to 1.2e-7. The residual is consistent with the provider computing
+  in float64 while this implementation uses `Decimal` — not with any formula
+  difference.
+- Zero ATR-driven disagreements on stop basis, tradability, or position size.
+
+Full results in `validation/local_indicator_equivalence_2026-08-25.json`.
+
+Numeric tolerance is the weaker half of that test and is recorded as such.
+`macd_hist > macd_hist_prev` is a *direction* comparison between two noisy
+numbers: it can flip while absolute error stays far inside any tolerance one
+would write down. So decision-flag agreement is the binding criterion and
+numeric tolerance merely necessary.
+
+### One thing worth knowing before cutover
+
+The pinned per-indicator broker lookbacks are *shorter* than the convergence
+requirement — RSI and ATR request 180 calendar days (~124 bars) against ~203
+needed. Truncating to that window moves RSI by up to 5.8e-3 points and the MACD
+histogram by up to 4.1e-4: four orders of magnitude more than the local-vs-broker
+disagreement. **Lookback, not formula, is the dominant source of variation.**
+Cutover would therefore shift values slightly, toward better convergence, and
+needs before/after decision parity tests rather than an assumption of no-op.
+
 
 ## Reproducibility
 
@@ -555,6 +632,15 @@ set the clock to `occurred_at`. The freshness controls have no historical
 override on the normal path, and should not — they must keep measuring against
 the real decision time or they stop being freshness controls.
 
+**Scope of that claim.** The journal preserves the market snapshot, trading
+date, acquisition identity, execution mode, and decision timestamp needed to
+replay the *market-data side* of a historical decision when supplied the same
+normalized account and configuration inputs. It is not a standalone event
+store: `AccountState` (buying power, open positions, open orders, realized
+daily P&L, sector exposure) and `AppConfig` identity are still supplied from
+outside the row, and both change outcomes. Capturing them is future
+reproducibility work, deliberately not attempted here.
+
 Old journals migrate additively and keep an honest `NULL` in the new columns.
 Back-filling them would assert a mode, a date, and a contract nobody
 verified.
@@ -575,13 +661,10 @@ In rough priority order:
 3. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
    spread, slippage and stop-gap modelling, and a baseline-vs-critic A/B to
    establish whether the critic actually improves expectancy.
-4. **Compute RSI/MACD/SMA/ATR locally from authoritative bars.** Six of the ~9
-   calls per symbol are indicator endpoints deriving from bars already fetched.
-   The local values must be run *side by side* against broker output on the
-   same bars, and agree within stated tolerances, before either replaces a
-   decision input. The acquisition profile's historicals lookback is sized for
-   what the core reads today (20 bars) and will need widening to ~200 for
-   SMA200 — a deliberate version bump, not a quiet widening.
+4. **Cut over to locally computed indicators.** Equivalence is now measured and
+   documented (see below); what remains is removing the six broker indicator
+   calls, making bars authoritative, and proving decision parity before and
+   after. Separate branch, separately reviewed.
 5. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
    test suite (see safety rule 8).
 
