@@ -509,12 +509,20 @@ things are recorded because none of them can be inferred afterwards:
 | `audit.mode` | Five of seven outcomes produce neither a trade nor an execution plan in *any* mode. There is nothing for an inference to read. |
 | `audit.trading_date` | Every ranged request is `trading_date - lookback`, so this decided which bars the broker computed over. `captured_at` says when the snapshot was assembled - a different question that coincides only by habit. |
 | `audit.acquisition_profile_ref` + fingerprint | Says which pinned request contract produced the inputs. Without it a decision made on 30 bars of RSI warm-up is indistinguishable from the same decision made on 300. |
+| `audit.occurred_at` | The instant the decision was evaluated. `now` reaches quote age, price drift, and the risk gate's `as_of`, so a replay given any other clock re-decides rather than reproduces. |
 
 `market/acquisition.py` pins the request shape — interval, `bounds`,
-adjustment, output width, and a `start_time` derived from the trading date
-rather than the wall clock. It describes **what is asked for**; no returned
-value, timestamp, or count reaches its fingerprint, so the identity stays
+adjustment, output width, symbol-parameter shape, and a `start_time` derived
+from the trading date rather than the wall clock. It covers every market-data
+call an evaluation makes: quote, historicals, fundamentals, earnings, and the
+six indicators. It describes **what is asked for**; no returned value,
+timestamp, ticker, or count reaches its fingerprint, so the identity stays
 stable while the market does not.
+
+Fundamentals is in the contract rather than in prose because it feeds two hard
+gates — `average_volume_30d` for liquidity, `sector` for the exposure cap. A
+decision input specified only in a skill file is a decision input the audit row
+cannot account for.
 
 The lookbacks are derived rather than chosen. Each is the indicator's warm-up
 plus the trailing points the strategy reads, plus a convergence allowance for
@@ -536,9 +544,16 @@ because it would be reached for on precisely the day it should not be.
 One thing this does *not* buy: omitting `end_time` makes the generated request
 byte-identical on every regeneration, but the broker's effective upper bound is
 request-time dependent, so the same request on two days can return different
-data. Replay rests on the persisted `snapshot_json` - the contract says what
-was asked for, the snapshot says what came back, and neither substitutes for
-the other.
+data.
+
+**Replay is a property of the journal, not of the bundle.** Re-running a saved
+bundle later does not reproduce the original decision — `build_snapshot` stamps
+`captured_at` from the current clock, earnings normalization keys on that date,
+and quote age and drift measure against the instant given. Replay instead reads
+the row: rehydrate `snapshot_json`, pass the stored mode and `trading_date`, and
+set the clock to `occurred_at`. The freshness controls have no historical
+override on the normal path, and should not — they must keep measuring against
+the real decision time or they stop being freshness controls.
 
 Old journals migrate additively and keep an honest `NULL` in the new columns.
 Back-filling them would assert a mode, a date, and a contract nobody

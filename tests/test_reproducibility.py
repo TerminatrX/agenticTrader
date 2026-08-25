@@ -44,9 +44,9 @@ DAY = date(2026, 8, 18)
 
 # Pinned identity. A change to any request semantics must land here as a
 # deliberate edit, in the same commit as the change that caused it.
-ACQUISITION_REF = "agentic-acquisition@v1-2026-08-22"
+ACQUISITION_REF = "agentic-acquisition@v2-2026-08-24"
 ACQUISITION_FINGERPRINT = (
-    "de87e98f6bc5db437130e2fb7f7a82d8ba614700a66ba80dc47717b518734579"
+    "1c5c71d594495a6fc8b69d0a2acfef1a3bfae364477659cdfff971a2e4eedf5c"
 )
 
 
@@ -512,6 +512,58 @@ def test_changing_historical_request_semantics_changes_the_fingerprint(field, va
     assert altered.content_fingerprint != CURRENT_ACQUISITION.content_fingerprint
 
 
+@pytest.mark.parametrize("label", ["quote", "fundamentals", "earnings"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tool", "some_other_tool"),
+        ("symbol_param", "ticker"),
+        # Differs from every current value, including fundamentals' own
+        # ("bounds", "regular") -- so no case skips itself into passing.
+        ("extra_params", (("bounds", "extended"),)),
+    ],
+)
+def test_changing_a_single_call_spec_changes_the_fingerprint(label, field, value):
+    """The un-ranged endpoints are part of the contract too. `symbol_param` in
+    particular: the three do not agree on it, and getting it wrong produces a
+    rejected call rather than a wrong number -- but it is still a request
+    semantic, so it is pinned."""
+    original = getattr(CURRENT_ACQUISITION, label)
+    assert getattr(original, field) != value, "test would prove nothing"
+
+    altered = dataclasses.replace(
+        CURRENT_ACQUISITION, **{label: dataclasses.replace(original, **{field: value})}
+    )
+    assert altered.content_fingerprint != CURRENT_ACQUISITION.content_fingerprint
+
+
+def test_fundamentals_is_part_of_the_contract():
+    """It feeds two hard gates -- average_volume_30d for liquidity, sector for
+    the exposure cap -- so specifying it only in skill prose left a decision
+    input outside the contract the audit row names."""
+    plan = CURRENT_ACQUISITION.request_plan("AAPL", DAY)
+    fundamentals = plan["calls"]["fundamentals"]
+
+    assert fundamentals["tool"] == "get_equity_fundamentals"
+    assert fundamentals["params"] == {"symbols": ["AAPL"], "bounds": "regular"}
+
+    joined = "|".join(CURRENT_ACQUISITION.fingerprint_items())
+    assert "fundamentals.tool=get_equity_fundamentals" in joined
+    assert "fundamentals.bounds=regular" in joined
+
+
+def test_the_symbol_parameter_shape_matches_each_endpoint():
+    """Two take a `symbols` array, one takes a scalar. Declared per endpoint
+    rather than inferred from the label, which is what an earlier version did
+    -- making the request shape depend on a string chosen for display."""
+    plan = CURRENT_ACQUISITION.request_plan("AAPL", DAY)
+
+    assert plan["calls"]["quote"]["params"]["symbols"] == ["AAPL"]
+    assert plan["calls"]["fundamentals"]["params"]["symbols"] == ["AAPL"]
+    assert plan["calls"]["earnings"]["params"]["symbol"] == "AAPL"
+    assert "symbols" not in plan["calls"]["earnings"]["params"]
+
+
 def test_the_end_time_policy_is_fingerprinted():
     altered = dataclasses.replace(CURRENT_ACQUISITION, end_time_policy="pinned_to_date")
     assert altered.content_fingerprint != CURRENT_ACQUISITION.content_fingerprint
@@ -545,21 +597,37 @@ def test_prose_notes_do_not_affect_the_fingerprint():
 
 
 def test_returned_market_values_cannot_reach_the_fingerprint():
-    """(the negative half of I) The profile describes the request. Nothing it
-    hashes is a price, a timestamp, a symbol, or a count of what came back —
-    otherwise a stored fingerprint would change with the market and stop
-    identifying a contract at all."""
+    """(the negative half of I) The profile describes the request, so its
+    identity must not move with the market. A fingerprint that changed with a
+    price or a returned count would stop identifying a contract at all.
+
+    Stated as the property rather than as a word search: the fingerprint is
+    invariant under symbol and date, and carries no concrete ticker or
+    response field. A blunt token list is tempting and wrong -- `symbol_param`
+    is a *parameter name*, which is exactly the kind of request semantic that
+    belongs in the hash.
+    """
+    from datetime import timedelta
+
     items = CURRENT_ACQUISITION.fingerprint_items()
     assert items, "a profile that hashes nothing pins nothing"
 
-    forbidden = ("price", "value=", "close", "volume", "as_of", "captured", "symbol")
-    for item in items:
-        lowered = item.lower()
-        for token in forbidden:
-            assert token not in lowered, f"{item!r} leaks response data into the contract"
+    # Invariance is the real claim. Nothing about a particular evaluation --
+    # which symbol, which day -- may reach the contract identity.
+    baseline = CURRENT_ACQUISITION.content_fingerprint
+    for symbol in ("AAPL", "MSFT", "ZZZZ"):
+        for day in (DAY, DAY + timedelta(days=97), date(2019, 1, 2)):
+            CURRENT_ACQUISITION.request_plan(symbol, day)
+            assert CURRENT_ACQUISITION.content_fingerprint == baseline
 
-    # And it is stable across evaluations, which a market-dependent hash is not.
-    assert CURRENT_ACQUISITION.content_fingerprint == CURRENT_ACQUISITION.content_fingerprint
+    joined = "|".join(items).lower()
+    for ticker in ("aapl", "msft", "spy", "qqq"):
+        assert ticker not in joined, f"a concrete ticker reached the contract: {ticker}"
+
+    # Response fields, as opposed to request parameters. `value=` and
+    # `captured` have no business here; `bounds=regular` and `period=14` do.
+    for token in ("price", "value=", "close=", "last_trade", "captured", "returned_at"):
+        assert token not in joined, f"{token!r} leaks response data into the contract"
 
 
 # ------------------------------------------------------- the request itself
@@ -606,6 +674,13 @@ def test_the_generated_request_does_not_read_the_wall_clock():
         assert "end_time" not in call["params"]
         assert call["params"]["start_time"].endswith("T00:00:00Z")
     assert CURRENT_ACQUISITION.end_time_policy.startswith("omitted")
+
+    # The un-ranged endpoints carry no time parameter at all, invented or
+    # otherwise -- they have no window to choose.
+    for label in ("quote", "fundamentals", "earnings"):
+        params = plan["calls"][label]["params"]
+        assert "start_time" not in params
+        assert "end_time" not in params
 
 
 def test_replay_rests_on_the_snapshot_not_on_the_request_being_reissuable():
@@ -668,12 +743,14 @@ def test_no_acquisition_call_can_touch_an_order():
     """(S) Every tool named is a market-data read. Worth asserting rather than
     assuming, because this output is handed to a worker as instructions."""
     plan = CURRENT_ACQUISITION.request_plan("AAPL", DAY)
-    tools = {plan["calls"][k]["tool"] for k in ("quote", "historicals", "earnings")}
+    single = ("quote", "historicals", "fundamentals", "earnings")
+    tools = {plan["calls"][k]["tool"] for k in single}
     tools |= {c["tool"] for c in plan["calls"]["indicators"].values()}
 
     assert tools == {
         "get_equity_quotes",
         "get_equity_historicals",
+        "get_equity_fundamentals",
         "get_earnings_results",
         "get_equity_technical_indicators",
     }
@@ -819,32 +896,58 @@ def test_a_stored_cycle_independently_identifies_its_own_context(
     assert row["protection_state"] == ProtectionState.UNAVAILABLE.value
 
 
-def test_a_reloaded_snapshot_replays_to_the_same_decision(
+def test_a_reloaded_snapshot_replays_using_the_recorded_decision_time(
     tmp_path, bullish_pullback_snapshot, account, risk_config
 ):
-    """(Q, P) Replay from the persisted snapshot alone — no broker, no wall
-    clock. The stored row plus committed code has to be enough."""
-    db = tmp_path / "j.db"
-    config = _app_config(tmp_path, risk_config)
-    captured = bullish_pullback_snapshot.captured_at
+    """(Q, P) Replay from the journal alone -- no broker, no wall clock.
 
-    original = run_cycle(
-        bullish_pullback_snapshot, account, config,
-        mode=ExecutionMode.SHADOW, trading_date=DAY, cycle_id="replay-1", now=captured,
-    )
-    JournalRepository(db).record_audit(original.audit)
+    The clock the replay uses is `audit.occurred_at`, because that is the one
+    the original cycle used. `run_cycle` threads `now` into the risk gate's
+    `as_of`, the critic, and preflight quote-age and drift, so replaying under
+    a different instant re-decides rather than reproduces.
 
-    (row,) = JournalRepository(db).audit_for_cycle("replay-1")
+    `snapshot.captured_at` is deliberately *not* substituted for it. The two
+    answer different questions -- when the inputs were assembled versus when
+    the decision was evaluated -- and this fixture holds them 45 seconds apart
+    precisely so that using the wrong one could not silently pass.
+    """
+    from datetime import timedelta
 
     from agentic_trader.models import MarketSnapshot
 
+    db = tmp_path / "j.db"
+    config = _app_config(tmp_path, risk_config)
+
+    # Decided slightly after the snapshot was assembled, as a real cycle is:
+    # inside preflight's 120s quote-age bound, and on the same calendar day so
+    # the earnings assessment stays current.
+    decided_at = bullish_pullback_snapshot.captured_at + timedelta(seconds=45)
+    assert decided_at != bullish_pullback_snapshot.captured_at
+
+    original = run_cycle(
+        bullish_pullback_snapshot, account, config,
+        mode=ExecutionMode.SHADOW, trading_date=DAY,
+        cycle_id="replay-1", now=decided_at,
+    )
+    JournalRepository(db).record_audit(original.audit)
+
+    # Everything below comes off the row. Nothing is carried in memory.
+    (row,) = JournalRepository(db).audit_for_cycle("replay-1")
     rehydrated = MarketSnapshot.model_validate(row["snapshot_json"])
+    occurred_at = datetime.fromisoformat(row["occurred_at"])
+
+    assert occurred_at == decided_at
+    assert occurred_at != rehydrated.captured_at, (
+        "the row must distinguish decision time from capture time, or this "
+        "test cannot tell which one the replay used"
+    )
+
     replayed = run_cycle(
         rehydrated, account, config,
         mode=ExecutionMode(row["mode"]),
         trading_date=date.fromisoformat(row["trading_date"]),
         cycle_id="replay-2",
-        now=rehydrated.captured_at,
+        now=occurred_at,
     )
 
     assert replayed.outcome is original.outcome
@@ -855,10 +958,36 @@ def test_a_reloaded_snapshot_replays_to_the_same_decision(
     assert replayed.risk_decision.approved_notional == (
         original.risk_decision.approved_notional
     )
+    assert replayed.risk_decision.breached_limits == (
+        original.risk_decision.breached_limits
+    )
+    assert replayed.plan.payload["ref_id"] == original.plan.payload["ref_id"]
     assert replayed.audit.mode is original.audit.mode
+    assert replayed.audit.trading_date == original.audit.trading_date
     assert replayed.audit.acquisition_config_fingerprint == (
         original.audit.acquisition_config_fingerprint
     )
+
+
+def test_the_recorded_decision_time_is_not_the_capture_time(
+    tmp_path, bullish_pullback_snapshot, account, risk_config
+):
+    """Guards the fixture above. If a future change made `occurred_at` default
+    to `captured_at`, the replay proof would still pass while silently no
+    longer proving anything."""
+    from datetime import timedelta
+
+    decided_at = bullish_pullback_snapshot.captured_at + timedelta(seconds=45)
+    result = run_cycle(
+        bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
+        mode=ExecutionMode.SHADOW, trading_date=DAY, now=decided_at,
+    )
+
+    assert result.audit.occurred_at == decided_at
+    assert result.audit.occurred_at != bullish_pullback_snapshot.captured_at
+    # And neither is the trading date, which is a third distinct thing.
+    assert result.audit.trading_date == DAY
+    assert result.audit.trading_date != result.audit.occurred_at.date()
 
 
 def test_replay_does_not_consult_the_current_default_profile(

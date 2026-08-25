@@ -4,8 +4,14 @@ Despite the name, this is not a loop and it owns no schedule. The agent drives
 the loop: it fetches data through MCP tools, calls `run_cycle`, and — only if
 the result says so, and only after the critic and any human gate agree —
 submits the order. `run_cycle` itself is deterministic and side-effect-free, so
-the same inputs always produce the same decision and any past cycle can be
-replayed from its stored snapshot.
+the same inputs always produce the same decision.
+
+"The same inputs" includes the clock. `now` reaches the risk gate's `as_of`,
+the critic, and preflight quote-age and drift, so a past cycle replays only
+when it is given the instant it originally ran -- persisted as
+`AuditEntry.occurred_at`, alongside the snapshot and the trading date. Passing
+the snapshot alone, or substituting `captured_at`, re-decides rather than
+replays.
 
 The pipeline:
 

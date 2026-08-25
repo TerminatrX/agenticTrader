@@ -2,8 +2,27 @@
 
 The agent fetches data with MCP tools, pipes the raw payloads here, and gets
 back a decision. Everything crosses the boundary as JSON on stdin and stdout so
-that the interface is inspectable, diffable, and replayable: capture a request
-bundle, and you can reproduce the exact decision offline forever.
+that the interface is inspectable and diffable.
+
+Replay is a property of the **journal**, not of the bundle. Re-running a saved
+bundle later does not reproduce the original decision: `build_snapshot` stamps
+`captured_at` from the current clock, the earnings assessment is normalized
+against that date, and `run_cycle` measures quote age, price drift and the risk
+gate's `as_of` against the instant it is given. A bundle replayed tomorrow is
+evaluated as tomorrow.
+
+What does support replay is the audit row, which records the three things
+separately because they answer different questions:
+
+    acquisition contract + trading_date   what was requested
+    snapshot_json                         what came back
+    occurred_at                           when the decision was evaluated
+
+Replaying with all three -- rehydrate the snapshot, pass the stored mode and
+trading date, and set `now` to `occurred_at` -- reproduces the decision. The
+freshness controls deliberately have no historical-timestamp override on the
+normal path: they must keep measuring against the real decision time, or they
+stop being freshness controls.
 
     agentic-trader evaluate  < bundle.json
     agentic-trader report    --json
@@ -25,8 +44,8 @@ The `evaluate` bundle:
       // payloads are genuinely not what the current profile would have asked
       // for, and recording them as such would be a false provenance claim.
       "trading_date": "2026-08-22",
-      "acquisition_profile_ref": "agentic-acquisition@v1-2026-08-22",
-      "acquisition_config_fingerprint": "de87e98f...",
+      "acquisition_profile_ref": "agentic-acquisition@v2-2026-08-24",
+      "acquisition_config_fingerprint": "1c5c71d5...",
 
       "account": { ...AccountState... },
       "payloads": {

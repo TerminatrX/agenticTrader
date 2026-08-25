@@ -95,8 +95,12 @@ Claude owns the loop. Python owns the decisions.
 call can place an order. The only side effects are journal writes.
 
 The Python core is a pure function from (market payloads + account state) to a
-decision. That makes every decision reproducible: the snapshot is persisted
-with the audit entry, so any past cycle can be replayed exactly.
+decision. That makes every decision reproducible, from the journal rather than
+from the bundle: the audit entry persists the snapshot (what came back), the
+acquisition contract and trading date (what was requested), and `occurred_at`
+(when it was evaluated). Replay needs all three — `now` feeds quote age, drift
+and the risk gate's `as_of`, so re-running a saved bundle today is evaluated as
+today rather than reproducing the original.
 
 ### The seam
 

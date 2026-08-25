@@ -65,7 +65,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from agentic_trader.models.capabilities import CapabilityProfile
 
@@ -253,20 +253,42 @@ class IndicatorSpec:
 class SingleCallSpec:
     """An endpoint taking no range or window -- one call, one symbol.
 
-    Quote and earnings both land here. Neither accepts a lookback, and the
-    honest record of that is a spec with no lookback field rather than an
-    invented one that reads as though a window were chosen.
+    Quote, fundamentals and earnings all land here. None accepts a lookback,
+    and the honest record of that is a spec with no lookback field rather than
+    an invented one that reads as though a window were chosen.
+
+    `symbol_param` is declared rather than inferred. These three endpoints do
+    not agree on it -- two take a `symbols` array, one takes a scalar `symbol`
+    -- and an earlier version keyed that off the label, so the shape of the
+    request depended on a string chosen for display. Naming the parameter makes
+    it explicit, fingerprintable, and wrong in an obvious way if it is wrong.
     """
 
     label: str
     tool: str
+
+    #: The endpoint's symbol parameter: a scalar `symbol` or a `symbols` array.
+    symbol_param: Literal["symbol", "symbols"]
+
+    #: Pinned non-symbol arguments, as ordered pairs so the spec stays frozen
+    #: and hashes deterministically. Only parameters the schema documents.
+    extra_params: tuple[tuple[str, str], ...] = ()
+
     note: str = ""
 
     def request(self, symbol: str) -> dict[str, Any]:
-        return {"symbols": [symbol]} if self.label == "quote" else {"symbol": symbol}
+        params: dict[str, Any] = {
+            self.symbol_param: [symbol] if self.symbol_param == "symbols" else symbol
+        }
+        params.update(dict(self.extra_params))
+        return params
 
     def fingerprint_items(self) -> tuple[str, ...]:
-        return (f"{self.label}.tool={self.tool}",)
+        return (
+            f"{self.label}.tool={self.tool}",
+            f"{self.label}.symbol_param={self.symbol_param}",
+            *(f"{self.label}.{k}={v}" for k, v in self.extra_params),
+        )
 
 
 @dataclass(frozen=True)
@@ -276,6 +298,7 @@ class MarketDataAcquisitionProfile(CapabilityProfile):
     historicals: HistoricalsSpec
     indicators: tuple[IndicatorSpec, ...]
     quote: SingleCallSpec
+    fundamentals: SingleCallSpec
     earnings: SingleCallSpec
 
     end_time_policy: str = "omitted_defaults_to_request_time"
@@ -338,6 +361,10 @@ class MarketDataAcquisitionProfile(CapabilityProfile):
                     "tool": self.historicals.tool,
                     "params": self.historicals.request(ticker, trading_date),
                 },
+                "fundamentals": {
+                    "tool": self.fundamentals.tool,
+                    "params": self.fundamentals.request(ticker),
+                },
                 "earnings": {
                     "tool": self.earnings.tool,
                     "params": self.earnings.request(ticker),
@@ -359,6 +386,7 @@ class MarketDataAcquisitionProfile(CapabilityProfile):
             f"end_time_policy={self.end_time_policy}",
             *self.historicals.fingerprint_items(),
             *self.quote.fingerprint_items(),
+            *self.fundamentals.fingerprint_items(),
             *self.earnings.fingerprint_items(),
         ]
         # Sorted by key so reordering the declaration is not a contract change,
@@ -426,8 +454,8 @@ _MACD = IndicatorSpec(
 
 CURRENT_ACQUISITION = MarketDataAcquisitionProfile(
     profile_id="agentic-acquisition",
-    version="v1-2026-08-22",
-    as_of=date(2026, 8, 22),
+    version="v2-2026-08-24",
+    as_of=date(2026, 8, 24),
     historicals=HistoricalsSpec(
         tool="get_equity_historicals",
         # Explicit, never omitted -- an omitted interval lets the server pick
@@ -457,15 +485,34 @@ CURRENT_ACQUISITION = MarketDataAcquisitionProfile(
     quote=SingleCallSpec(
         label="quote",
         tool="get_equity_quotes",
+        symbol_param="symbols",
         note=(
             "No lookback exists and none is invented. Freshness is enforced "
             "downstream by preflight, which bounds quote age from the venue "
             "timestamps rather than by anything requested here."
         ),
     ),
+    fundamentals=SingleCallSpec(
+        label="fundamentals",
+        tool="get_equity_fundamentals",
+        symbol_param="symbols",
+        # Pinned rather than omitted, for the same reason `interval` is: the
+        # schema documents `regular` as the default, but a default is a choice
+        # the server makes, and this one governs the day-level volume fields.
+        # `average_volume_30d` is a hard liquidity gate, so the session it was
+        # measured over is part of what the gate means.
+        extra_params=(("bounds", "regular"),),
+        note=(
+            "Not optional decoration. average_volume_30d gates liquidity and "
+            "sector gates the exposure cap, so fundamentals feeds two hard "
+            "risk checks -- which is exactly why leaving it specified only in "
+            "skill prose put a decision input outside the contract."
+        ),
+    ),
     earnings=SingleCallSpec(
         label="earnings",
         tool="get_earnings_results",
+        symbol_param="symbol",
         note=(
             "One symbol per call. get_earnings_calendar takes no symbol "
             "argument and must never be substituted -- doing so attributed one "

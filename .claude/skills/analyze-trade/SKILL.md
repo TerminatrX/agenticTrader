@@ -57,9 +57,13 @@ are recursive — each value depends on the previous one back to a seed at the
 start of the range — so those are *different numbers for the same indicator on
 the same day*. The decisions happened to match. That was luck.
 
-Also fetch, which the spec does not cover because neither takes a lookback:
+**Call exactly what the spec emits — nothing more, nothing less.** It covers
+the quote, historicals, fundamentals, earnings, and all six indicators, each
+with its full parameter set. If you find yourself deciding a parameter, stop:
+that decision belongs in the profile, not here.
 
-- `get_equity_fundamentals` — liquidity and the 52-week range
+Two account calls sit outside the market-data contract and are still needed:
+
 - `get_equity_positions` and `get_equity_orders` — see step 3
 
 Two things worth knowing rather than merely obeying:
