@@ -3,8 +3,66 @@
   "generated": "2026-08-25",
   "verdict": "LOCAL_INDICATORS_EQUIVALENT",
   "scope": "Equivalence measured only. Broker indicators remain the authoritative decision inputs; no local value reaches MarketSnapshot on this branch.",
-  "acquisition_profile_ref": "agentic-acquisition@v3-2026-08-25",
-  "acquisition_config_fingerprint": "1aeb6fe90b857bd862950b3e1b9d1a1a95ffd7e282fe5a1b998fb5a790e52b93",
+  "production_acquisition_profile_ref": "agentic-acquisition@v3-2026-08-25",
+  "production_acquisition_fingerprint": "1aeb6fe90b857bd862950b3e1b9d1a1a95ffd7e282fe5a1b998fb5a790e52b93",
+  "production_acquisition_note": "The trading contract this milestone validates FOR, not the contract the measurements were taken under. Its six indicator calls each carry their own lookback and output width; the experiment deliberately did not use them. Retained unchanged by this branch.",
+  "validation_comparison_profile_ref": "local-indicator-comparison@v1-2026-08-25",
+  "validation_comparison_fingerprint": "43cafd8ad390d7f25cc76d79d25118dff54bf14a5f7c346b3380d6ca194b1486",
+  "validation_comparison_request_semantics": {
+    "common_start_time": "2025-07-01T00:00:00Z",
+    "interval": "day",
+    "bounds": "regular",
+    "adjustment_type": "split",
+    "output": "last:30",
+    "historicals_tool": "get_equity_historicals",
+    "indicator_tool": "get_equity_technical_indicators",
+    "indicators": {
+      "rsi": {
+        "type": "rsi",
+        "period": 14
+      },
+      "macd": {
+        "type": "macd",
+        "fast_period": 12,
+        "slow_period": 26,
+        "signal_period": 9
+      },
+      "sma_20": {
+        "type": "sma",
+        "period": 20
+      },
+      "sma_50": {
+        "type": "sma",
+        "period": 50
+      },
+      "sma_200": {
+        "type": "sma",
+        "period": 200
+      },
+      "atr": {
+        "type": "atr",
+        "period": 14
+      }
+    },
+    "why_it_differs_from_production": "Every call shares one start_time so both sides compute over identical bars, which is what isolates formula differences from range differences. Production gives each indicator its own lookback, sized for what production needs. Using the production shape would have measured both effects at once and been unable to separate them.",
+    "output_cannot_change_values": "output widened to last:30 purely to yield more comparable points. The endpoint schema states the indicator is computed over the full range first and output only trims the response."
+  },
+  "validation_comparison_provenance": {
+    "recovered_from_saved_payloads": [
+      "interval (echoed as data.interval)",
+      "bounds (echoed as data.bounds)",
+      "indicator periods (echoed as indicators[].params)",
+      "common_start_time (historicals first bar == 2025-07-01T00:00:00Z)",
+      "output (series length == 30 on every indicator file)"
+    ],
+    "not_echoed_by_the_endpoint": [
+      "adjustment_type",
+      "indicator start_time"
+    ],
+    "verification_method": "Re-issued read-only calls under this profile and compared against the saved payloads. AAPL rsi and CRWD macd matched bit for bit at every shared timestamp. The check is decisive because RSI and MACD are recursive: a different start_time moves the seed and shifts the values, so an exact match is evidence the window matches.",
+    "contrast_observation": "An earlier alignment probe of the same AAPL RSI bar under a different start_time (2025-09-01 rather than 2025-07-01) returned 47.85832247478841 against 47.85832254013297 -- a 6.5e-08 difference. A wrong window is therefore visible, which is what makes the exact match meaningful rather than vacuous.",
+    "verified_on": "2026-08-25"
+  },
   "inputs": {
     "symbols": [
       "AAPL",
@@ -28,7 +86,8 @@
     "interval": "day",
     "bounds": "regular",
     "adjustment_type": "split",
-    "note": "Both sides computed over the identical 289-bar regular-session window, so the comparison isolates formula differences from range differences."
+    "note": "Both sides computed over the identical 289-bar regular-session window produced by the validation comparison profile above -- not by the production acquisition profile, whose indicator ranges differ.",
+    "requests_issued_under": "local-indicator-comparison@v1-2026-08-25"
   },
   "bar_requirements": {
     "sma_20": {
@@ -175,7 +234,15 @@
       "rsi_points_max": "5.772e-03",
       "macd_histogram_max": "4.106e-04"
     },
-    "implication": "Lookback, not formula, is the dominant source of variation -- roughly four orders of magnitude above the local-vs-broker agreement error. Cutover would therefore change values slightly, toward better convergence, and needs before/after decision parity tests."
+    "implication": "Lookback, not formula, is the dominant source of variation -- roughly four orders of magnitude above the local-vs-broker agreement error. Cutover would therefore change values slightly, toward better convergence, and needs before/after decision parity tests.",
+    "production_ranges_at_v3": {
+      "historicals_calendar_days": 420,
+      "rsi_calendar_days": 180,
+      "atr_calendar_days": 180,
+      "macd_calendar_days": 210,
+      "sma_200_calendar_days": 330,
+      "note": "Unchanged by this branch. Listed so the gap between the production shape and the validation shape is explicit rather than implied."
+    }
   },
-  "conclusion": "All eight fields agree to within float64 round-trip on identical inputs, and all ten decision flags agree on every comparable observation. The residuals are consistent with the provider computing in float64 while this implementation computes in Decimal, not with any formula difference. Equivalence is established for the sampled window; replacement remains a separate reviewed milestone."
+  "conclusion": "All eight fields agree to within float64 round-trip on identical inputs, and all ten decision flags agree on every comparable observation. The residuals are consistent with the provider computing in float64 while this implementation computes in Decimal, not with any formula difference. Equivalence is established for the sampled window under the validation comparison profile; whether the production per-indicator ranges yield the same agreement is a separate question the cutover milestone must answer, and the production_lookback_finding below is why it is not assumed."
 }

@@ -29,9 +29,10 @@ cross `max_stop_pct` and decline the setup outright.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
+from agentic_trader.models.capabilities import CapabilityProfile
 from agentic_trader.strategies.stops import StopPlan, build_stop
 
 
@@ -346,6 +347,181 @@ def summarize(field: str, deltas: list[ValueDelta]) -> FieldSummary:
     )
 
 
+# ------------------------------------------------------ the validation contract
+
+
+@dataclass(frozen=True)
+class ComparisonIndicatorSpec:
+    """One broker indicator request as issued for the equivalence experiment."""
+
+    key: str
+    indicator_type: str
+    period: int | None = None
+    fast_period: int | None = None
+    slow_period: int | None = None
+    signal_period: int | None = None
+
+    def params(self, symbol: str, profile: ComparisonProfile) -> dict[str, object]:
+        out: dict[str, object] = {
+            "symbol": symbol,
+            "type": self.indicator_type,
+            "interval": profile.interval,
+            "bounds": profile.bounds,
+            "adjustment_type": profile.adjustment_type,
+            "output": profile.output,
+            "start_time": profile.common_start_time,
+        }
+        for name in ("period", "fast_period", "slow_period", "signal_period"):
+            value = getattr(self, name)
+            if value is not None:
+                out[name] = value
+        return out
+
+    def fingerprint_items(self) -> tuple[str, ...]:
+        items = [f"indicator.{self.key}.type={self.indicator_type}"]
+        for name in ("period", "fast_period", "slow_period", "signal_period"):
+            value = getattr(self, name)
+            if value is not None:
+                items.append(f"indicator.{self.key}.{name}={value}")
+        return tuple(items)
+
+
+@dataclass(frozen=True)
+class ComparisonProfile(CapabilityProfile):
+    """The request shape that produced the local-vs-broker equivalence evidence.
+
+    **Not the production contract, and deliberately a separate identity.**
+    `agentic-acquisition` gives each indicator its own lookback and its own
+    output width, sized for what production needs. This experiment gives all
+    six the *same* window and a wider trim, because the question being asked is
+    different: whether two implementations agree on identical inputs. Feeding
+    each side a different range would measure range differences and formula
+    differences at once and be unable to separate them.
+
+    Recording only the production ref against these measurements -- which the
+    first version of the validation report did -- makes it look as though the
+    production request shape produced them. It did not. That is a provenance
+    error rather than a formula error, and this profile is the fix: two
+    identities, each describing what it actually is.
+
+    Nothing here may reach a decision. It documents an experiment.
+    """
+
+    #: One window shared by every call, so both sides see identical bars.
+    common_start_time: str
+
+    interval: str
+    bounds: str
+    adjustment_type: str
+
+    #: Response trim. Wider than production so there are many comparable points
+    #: per symbol. It cannot change a value: the schema states the indicator is
+    #: computed over the full range first and `output` only trims the response.
+    output: str
+
+    historicals_tool: str
+    indicator_tool: str
+
+    indicators: tuple[ComparisonIndicatorSpec, ...]
+
+    def historicals_params(self, symbol: str) -> dict[str, object]:
+        return {
+            "symbols": [symbol],
+            "interval": self.interval,
+            "bounds": self.bounds,
+            "adjustment_type": self.adjustment_type,
+            "start_time": self.common_start_time,
+        }
+
+    def indicator_params(self, key: str, symbol: str) -> dict[str, object]:
+        for spec in self.indicators:
+            if spec.key == key:
+                return spec.params(symbol, self)
+        raise KeyError(f"no comparison spec named {key!r} in {self.profile_ref}")
+
+    @property
+    def indicator_keys(self) -> tuple[str, ...]:
+        return tuple(s.key for s in self.indicators)
+
+    def request_plan(self, symbol: str) -> dict[str, object]:
+        ticker = symbol.upper()
+        return {
+            "symbol": ticker,
+            "comparison_profile_ref": self.profile_ref,
+            "comparison_fingerprint": self.content_fingerprint,
+            "calls": {
+                "historicals": {
+                    "tool": self.historicals_tool,
+                    "params": self.historicals_params(ticker),
+                },
+                "indicators": {
+                    spec.key: {
+                        "tool": self.indicator_tool,
+                        "params": spec.params(ticker, self),
+                    }
+                    for spec in self.indicators
+                },
+            },
+        }
+
+    def fingerprint_items(self) -> tuple[str, ...]:
+        items = [
+            f"profile_id={self.profile_id}",
+            f"version={self.version}",
+            f"common_start_time={self.common_start_time}",
+            f"interval={self.interval}",
+            f"bounds={self.bounds}",
+            f"adjustment_type={self.adjustment_type}",
+            f"output={self.output}",
+            f"historicals_tool={self.historicals_tool}",
+            f"indicator_tool={self.indicator_tool}",
+        ]
+        for spec in sorted(self.indicators, key=lambda s: s.key):
+            items.extend(spec.fingerprint_items())
+        return tuple(items)
+
+
+LOCAL_INDICATOR_COMPARISON = ComparisonProfile(
+    profile_id="local-indicator-comparison",
+    version="v1-2026-08-25",
+    as_of=date(2026, 8, 25),
+    # One window for every call. 2025-07-01 through the request instant yields
+    # 289 regular-session bars, comfortably past the 277-bar binding
+    # requirement, and gives both sides byte-identical inputs.
+    common_start_time="2025-07-01T00:00:00Z",
+    interval="day",
+    bounds="regular",
+    adjustment_type="split",
+    output="last:30",
+    historicals_tool="get_equity_historicals",
+    indicator_tool="get_equity_technical_indicators",
+    indicators=(
+        ComparisonIndicatorSpec("rsi", "rsi", period=14),
+        ComparisonIndicatorSpec(
+            "macd", "macd", fast_period=12, slow_period=26, signal_period=9
+        ),
+        ComparisonIndicatorSpec("sma_20", "sma", period=20),
+        ComparisonIndicatorSpec("sma_50", "sma", period=50),
+        ComparisonIndicatorSpec("sma_200", "sma", period=200),
+        ComparisonIndicatorSpec("atr", "atr", period=14),
+    ),
+)
+"""The contract the 2026-08-25 equivalence measurements were taken under.
+
+Derived from the saved payloads rather than from memory. Every indicator
+response echoes `interval`, `bounds` and its `params`; the historicals payload
+first bar pins `common_start_time`; the 30-point series length pins `output`.
+
+`adjustment_type` and the indicator `start_time` are *not* echoed by the
+endpoint, so neither could be recovered from the artifacts. They were verified
+empirically instead, by re-issuing calls under this profile and confirming the
+returned values matched the saved payloads exactly. That check is meaningful
+precisely because RSI, ATR and MACD are recursive: a different `start_time`
+moves the seed and changes the values, so identical output is evidence the
+window matches.
+"""
+
+
 # --------------------------------------------------------------- tolerances
 
 PROPOSED_TOLERANCES: dict[str, Decimal] = {
@@ -408,8 +584,11 @@ def within_tolerance(delta: ValueDelta) -> bool | None:
 
 
 __all__ = [
+    "LOCAL_INDICATOR_COMPARISON",
     "PROPOSED_TOLERANCES",
     "REQUIRED_DECISION_AGREEMENT",
+    "ComparisonIndicatorSpec",
+    "ComparisonProfile",
     "DecisionFlags",
     "FieldSummary",
     "StopImpact",

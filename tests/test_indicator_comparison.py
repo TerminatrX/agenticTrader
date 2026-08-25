@@ -9,7 +9,7 @@ to hold that open rather than trusting that nobody wired them in.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -24,6 +24,23 @@ from agentic_trader.market.indicator_comparison import (
 
 D = Decimal
 TS = datetime(2026, 8, 24, tzinfo=UTC)
+
+COMPARISON_REF = "local-indicator-comparison@v1-2026-08-25"
+COMPARISON_FINGERPRINT = (
+    "43cafd8ad390d7f25cc76d79d25118dff54bf14a5f7c346b3380d6ca194b1486"
+)
+
+
+def _report() -> dict:
+    import json
+    import pathlib as _pathlib
+
+    path = (
+        _pathlib.Path(__file__).resolve().parents[1]
+        / "validation" / "local_indicator_equivalence_2026-08-25.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
+
 
 
 def _flags(**overrides) -> DecisionFlags:
@@ -455,8 +472,10 @@ def test_the_validation_report_matches_the_current_contract():
     )
     report = json.loads(path.read_text(encoding="utf-8"))
 
-    assert report["acquisition_profile_ref"] == CURRENT_ACQUISITION.profile_ref
-    assert report["acquisition_config_fingerprint"] == (
+    assert report["production_acquisition_profile_ref"] == (
+        CURRENT_ACQUISITION.profile_ref
+    )
+    assert report["production_acquisition_fingerprint"] == (
         CURRENT_ACQUISITION.content_fingerprint
     )
     assert report["binding_requirement_bars"] == required_bars()
@@ -477,3 +496,233 @@ def test_the_validation_report_carries_no_account_data():
     text = path.read_text(encoding="utf-8").lower()
     for token in ("account", "balance", "buying_power", "unsettled", "positions"):
         assert token not in text, token
+
+
+# ================================================ validation provenance
+#
+# The first version of this milestone recorded only the production acquisition
+# identity against the equivalence measurements. That was wrong: the experiment
+# necessarily used a different request shape -- one shared window and a wider
+# trim -- because it is asking whether two implementations agree on *identical*
+# inputs, and production gives each indicator its own range. Naming only the
+# production ref made the production shape look like the one that produced the
+# numbers. These tests keep the two identities apart.
+
+
+def test_the_comparison_profile_identity_is_pinned():
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_COMPARISON
+
+    assert LOCAL_INDICATOR_COMPARISON.profile_ref == COMPARISON_REF
+    assert LOCAL_INDICATOR_COMPARISON.content_fingerprint == COMPARISON_FINGERPRINT
+
+
+def test_the_report_names_the_production_contract():
+    """(1) Which trading contract this evidence is intended to validate for."""
+    from agentic_trader.market.acquisition import CURRENT_ACQUISITION
+
+    report = _report()
+    assert report["production_acquisition_profile_ref"] == CURRENT_ACQUISITION.profile_ref
+    assert report["production_acquisition_fingerprint"] == (
+        CURRENT_ACQUISITION.content_fingerprint
+    )
+
+
+def test_the_report_names_the_contract_the_measurements_were_taken_under():
+    """(2) And it is a different identity from the production one."""
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_COMPARISON
+
+    report = _report()
+    assert report["validation_comparison_profile_ref"] == (
+        LOCAL_INDICATOR_COMPARISON.profile_ref
+    )
+    assert report["validation_comparison_fingerprint"] == (
+        LOCAL_INDICATOR_COMPARISON.content_fingerprint
+    )
+    assert (
+        report["validation_comparison_profile_ref"]
+        != report["production_acquisition_profile_ref"]
+    )
+    assert (
+        report["validation_comparison_fingerprint"]
+        != report["production_acquisition_fingerprint"]
+    )
+
+
+def test_the_report_records_the_full_comparison_request_semantics():
+    semantics = _report()["validation_comparison_request_semantics"]
+    assert semantics["common_start_time"] == "2025-07-01T00:00:00Z"
+    assert semantics["interval"] == "day"
+    assert semantics["bounds"] == "regular"
+    assert semantics["adjustment_type"] == "split"
+    assert semantics["output"] == "last:30"
+    assert semantics["indicators"]["rsi"] == {"type": "rsi", "period": 14}
+    assert semantics["indicators"]["macd"] == {
+        "type": "macd", "fast_period": 12, "slow_period": 26, "signal_period": 9,
+    }
+    for key, period in (("sma_20", 20), ("sma_50", 50), ("sma_200", 200)):
+        assert semantics["indicators"][key] == {"type": "sma", "period": period}
+    assert semantics["indicators"]["atr"] == {"type": "atr", "period": 14}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("common_start_time", "2025-01-01T00:00:00Z"),   # (3)
+        ("interval", "week"),                             # (4)
+        ("bounds", "extended"),                           # (4)
+        ("adjustment_type", "none"),                      # (4)
+        ("output", "last:5"),                             # (4)
+        ("historicals_tool", "something_else"),
+        ("indicator_tool", "something_else"),
+    ],
+)
+def test_changing_any_comparison_semantic_changes_its_fingerprint(field, value):
+    """(3)(4) Every field that alters what was requested is inside the hash."""
+    import dataclasses
+
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_COMPARISON
+
+    assert getattr(LOCAL_INDICATOR_COMPARISON, field) != value, "proves nothing"
+    altered = dataclasses.replace(LOCAL_INDICATOR_COMPARISON, **{field: value})
+    assert altered.content_fingerprint != LOCAL_INDICATOR_COMPARISON.content_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("key", "field", "value"),
+    [
+        ("rsi", "period", 21),
+        ("atr", "period", 20),
+        ("sma_200", "period", 100),
+        ("macd", "fast_period", 8),
+        ("macd", "slow_period", 30),
+        ("macd", "signal_period", 5),
+        ("sma_20", "indicator_type", "ema"),
+    ],
+)
+def test_changing_an_indicator_semantic_changes_the_comparison_fingerprint(
+    key, field, value
+):
+    """(5) RSI, MACD, SMA and ATR parameters each move the identity."""
+    import dataclasses
+
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_COMPARISON
+
+    original = next(
+        s for s in LOCAL_INDICATOR_COMPARISON.indicators if s.key == key
+    )
+    assert getattr(original, field) != value, "proves nothing"
+    mutated = dataclasses.replace(original, **{field: value})
+    altered = dataclasses.replace(
+        LOCAL_INDICATOR_COMPARISON,
+        indicators=tuple(
+            mutated if s.key == key else s
+            for s in LOCAL_INDICATOR_COMPARISON.indicators
+        ),
+    )
+    assert altered.content_fingerprint != LOCAL_INDICATOR_COMPARISON.content_fingerprint
+
+
+def test_every_compared_indicator_shares_one_source_window():
+    """(6) The property the whole experiment rests on.
+
+    If any indicator were given a different range, the comparison would be
+    measuring range differences alongside formula differences and could not
+    separate them. Asserted across the generated requests, not assumed.
+    """
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_COMPARISON
+
+    plan = LOCAL_INDICATOR_COMPARISON.request_plan("AAPL")
+    calls = [plan["calls"]["historicals"], *plan["calls"]["indicators"].values()]
+
+    starts = {c["params"]["start_time"] for c in calls}
+    assert starts == {"2025-07-01T00:00:00Z"}, starts
+
+    for axis in ("interval", "bounds", "adjustment_type"):
+        assert len({c["params"][axis] for c in calls}) == 1, axis
+
+    outputs = {
+        c["params"]["output"] for c in plan["calls"]["indicators"].values()
+    }
+    assert outputs == {"last:30"}
+    assert set(plan["calls"]["indicators"]) == {
+        "rsi", "macd", "sma_20", "sma_50", "sma_200", "atr",
+    }
+
+
+def test_production_keeps_its_own_per_indicator_lookbacks():
+    """(7) This branch must not have quietly flattened production onto the
+    validation shape. Production indicator ranges differ from each other and
+    from the comparison window, and that is intended."""
+    from agentic_trader.market.acquisition import CURRENT_ACQUISITION
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_COMPARISON
+
+    lookbacks = {
+        s.key: s.lookback_calendar_days for s in CURRENT_ACQUISITION.indicators
+    }
+    assert lookbacks == {
+        "rsi": 180, "macd": 210, "sma_20": 90, "sma_50": 90,
+        "sma_200": 330, "atr": 180,
+    }
+    assert len(set(lookbacks.values())) > 1, "production is still per-indicator"
+
+    plan = CURRENT_ACQUISITION.request_plan("AAPL", date(2026, 8, 25))
+    starts = {
+        c["params"]["start_time"] for c in plan["calls"]["indicators"].values()
+    }
+    assert len(starts) > 1, "production indicators do not share one window"
+    assert LOCAL_INDICATOR_COMPARISON.common_start_time not in starts
+
+    # And production keeps its narrower trims.
+    outputs = {c["params"]["output"] for c in plan["calls"]["indicators"].values()}
+    assert outputs == {"last:2", "latest"}
+
+
+def test_the_comparison_profile_cannot_reach_a_decision():
+    """(8) Same structural guarantee the local indicators carry."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "agentic_trader"
+    decision_paths = [
+        root / "strategies",
+        root / "risk",
+        root / "agents",
+        root / "market" / "snapshot.py",
+        root / "market" / "signals.py",
+        root / "market" / "symbol_regime.py",
+        root / "market" / "acquisition.py",
+    ]
+    offenders = []
+    for path in decision_paths:
+        files = path.rglob("*.py") if path.is_dir() else [path]
+        for file in files:
+            text = file.read_text(encoding="utf-8")
+            if "indicator_comparison" in text or "LOCAL_INDICATOR_COMPARISON" in text:
+                offenders.append(str(file.relative_to(root)))
+    assert offenders == [], f"the comparison profile reached: {offenders}"
+
+
+def test_the_equivalence_verdict_survives_the_corrected_provenance():
+    """(9) Separating the identities corrects who-measured-what. It does not
+    touch the measurements, so the verdict stands on the same evidence."""
+    report = _report()
+    assert report["verdict"] == "LOCAL_INDICATORS_EQUIVALENT"
+    assert report["decision_equivalence"]["total_disagreements"] == 0
+    assert report["decision_equivalence"]["comparisons"] == 348
+    assert report["inputs"]["symbol_count"] == 12
+    assert report["inputs"]["bars_per_symbol"] == 289
+    assert report["inputs"]["requests_issued_under"] == COMPARISON_REF
+    for field, block in report["numeric"].items():
+        assert block["result"] == "PASS", field
+
+
+def test_the_report_records_how_the_unechoed_fields_were_verified():
+    """`adjustment_type` and the indicator `start_time` are not echoed by the
+    endpoint, so the report must say how they were established rather than
+    leaving them as an assertion."""
+    provenance = _report()["validation_comparison_provenance"]
+    assert set(provenance["not_echoed_by_the_endpoint"]) == {
+        "adjustment_type", "indicator start_time",
+    }
+    assert "matched bit for bit" in provenance["verification_method"]
+    assert "recursive" in provenance["verification_method"]
+    assert provenance["recovered_from_saved_payloads"]

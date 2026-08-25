@@ -148,7 +148,7 @@ restate a lookback in prose; point at the profile.
 | `agents/critic.py` | Mechanical re-derivation of the trade |
 | `market/acquisition.py` | `MarketDataAcquisitionProfile` — the pinned request contract. **What to ask for, never what came back** |
 | `market/local_indicators.py` | Deterministic RSI/MACD/SMA/ATR from bars. **Diagnostics only — broker values decide** |
-| `market/indicator_comparison.py` | Local-vs-broker equivalence measurement. **Never consulted by a decision** |
+| `market/indicator_comparison.py` | Local-vs-broker equivalence measurement, plus the pinned validation request contract. **Never consulted by a decision** |
 | `agents/orchestrator.py` | One cycle, as a pure function |
 | `execution/executor.py` | Builds the payload. **Does not submit** |
 | `execution/shadow_executor.py` | Simulated fills with pessimistic slippage |

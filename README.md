@@ -537,7 +537,16 @@ test asserts so, to stop the number quietly regressing.
 ### What the comparison found
 
 12 symbols spanning ~$12 to ~$300 and deliberately including the volatile names,
-30 sessions each, both sides computed over the identical 289-bar window:
+30 sessions each, both sides computed over the identical 289-bar window.
+
+Those requests were **not** the production shape, and the evidence says so.
+`local-indicator-comparison@v1-2026-08-25` gives every call one shared
+`start_time` and a wider trim, because the question is whether two
+implementations agree on *identical* inputs — production gives each indicator
+its own lookback, which would have measured range and formula differences at
+once. The report records both identities separately:
+`production_acquisition_*` for the contract this validates *for*,
+`validation_comparison_*` for the requests that actually produced the numbers.
 
 - **Zero decision disagreements** in 348 comparisons, under both EMA seed
   conventions.
