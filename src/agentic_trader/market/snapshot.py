@@ -4,8 +4,13 @@ This module is the boundary between the agent and the deterministic core. The
 orchestrating agent calls MCP tools, hands the raw JSON here unmodified, and
 receives a normalized snapshot. Keeping the parsing on this side of the line —
 rather than asking the agent to reshape JSON in prose — is what makes a cycle
-reproducible: the same payloads always yield the same snapshot, and the
-snapshot is what gets persisted for replay.
+reproducible: the same payloads and the same `now` always yield the same
+snapshot, and the snapshot is what gets persisted for replay.
+
+`now` is load-bearing rather than incidental. It stamps `captured_at` and dates
+the earnings assessment, so re-parsing an old payload today produces a snapshot
+that is *not* the one the decision was made from. Replay reads the persisted
+snapshot instead of rebuilding it.
 
 Parsers here are deliberately forgiving about *missing* data and strict about
 *malformed* data. A missing RSI yields a snapshot without RSI, and strategies

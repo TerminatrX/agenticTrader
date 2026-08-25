@@ -521,6 +521,7 @@ def _record(repo, batch, result, run_id="run-1"):
     repo.record_scan_run(
         run_id,
         batch,
+        trading_date=DAY,
         candidates=[*result.selected, *result.deferred],
         scanner_profile_ref=ROBINHOOD_MCP_SCANNER.profile_ref,
         scan_definition_ref=CURRENT_DISCOVERY.definition_ref,

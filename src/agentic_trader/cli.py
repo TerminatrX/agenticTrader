@@ -2,8 +2,27 @@
 
 The agent fetches data with MCP tools, pipes the raw payloads here, and gets
 back a decision. Everything crosses the boundary as JSON on stdin and stdout so
-that the interface is inspectable, diffable, and replayable: capture a request
-bundle, and you can reproduce the exact decision offline forever.
+that the interface is inspectable and diffable.
+
+Replay is a property of the **journal**, not of the bundle. Re-running a saved
+bundle later does not reproduce the original decision: `build_snapshot` stamps
+`captured_at` from the current clock, the earnings assessment is normalized
+against that date, and `run_cycle` measures quote age, price drift and the risk
+gate's `as_of` against the instant it is given. A bundle replayed tomorrow is
+evaluated as tomorrow.
+
+What does support replay is the audit row, which records the three things
+separately because they answer different questions:
+
+    acquisition contract + trading_date   what was requested
+    snapshot_json                         what came back
+    occurred_at                           when the decision was evaluated
+
+Replaying with all three -- rehydrate the snapshot, pass the stored mode and
+trading date, and set `now` to `occurred_at` -- reproduces the decision. The
+freshness controls deliberately have no historical-timestamp override on the
+normal path: they must keep measuring against the real decision time, or they
+stop being freshness controls.
 
     agentic-trader evaluate  < bundle.json
     agentic-trader report    --json
@@ -16,6 +35,18 @@ The `evaluate` bundle:
       "symbol": "AAPL",
       "mode": "shadow",                  // "shadow" | "live"
       "strategy": "trend_pullback",
+
+      // Required. Copy all three verbatim from `acquisition-spec`, which is
+      // what produced the payloads below. `trading_date` is the date every
+      // start_time was derived from; the other two say which contract was in
+      // force. A bundle whose contract does not match the one in force is
+      // refused rather than re-stamped -- the lookbacks differ, so the
+      // payloads are genuinely not what the current profile would have asked
+      // for, and recording them as such would be a false provenance claim.
+      "trading_date": "2026-08-22",
+      "acquisition_profile_ref": "agentic-acquisition@v2-2026-08-24",
+      "acquisition_config_fingerprint": "1c5c71d5...",
+
       "account": { ...AccountState... },
       "payloads": {
         "quote":        <get_equity_quotes response>,
@@ -59,6 +90,7 @@ from agentic_trader.config import (
     write_risk_lock,
 )
 from agentic_trader.journal import JournalRepository
+from agentic_trader.market.acquisition import CURRENT_ACQUISITION
 from agentic_trader.market.market_regime import MarketContext, classify_market_regime
 from agentic_trader.market.snapshot import SnapshotError, build_snapshot
 from agentic_trader.market.symbol_regime import classify_symbol_regime
@@ -108,6 +140,53 @@ def _default_db(config_root: Path) -> Path:
 
 
 # ------------------------------------------------------------------- evaluate
+
+
+def _check_acquisition_provenance(bundle: dict[str, Any]) -> str | None:
+    """Return an error message if the bundle's contract claim is unusable.
+
+    Both halves are checked. The ref alone would accept a profile edited
+    without a version bump; the fingerprint alone would accept a value copied
+    from an unrelated contract. Together they say "these payloads were fetched
+    under exactly this contract", which is the claim the audit row will make.
+    """
+    ref = bundle.get("acquisition_profile_ref")
+    fingerprint = bundle.get("acquisition_config_fingerprint")
+
+    if not ref or not fingerprint:
+        missing = [
+            name
+            for name, value in (
+                ("acquisition_profile_ref", ref),
+                ("acquisition_config_fingerprint", fingerprint),
+            )
+            if not value
+        ]
+        return (
+            f"bundle is missing {' and '.join(missing)} — copy the values "
+            "verbatim from `acquisition-spec`, which is what fetched these "
+            "payloads. Evaluating without them would record a decision whose "
+            "inputs cannot be traced to a contract."
+        )
+
+    if ref != CURRENT_ACQUISITION.profile_ref:
+        return (
+            f"bundle was fetched under acquisition contract {ref!r} but the "
+            f"contract in force is {CURRENT_ACQUISITION.profile_ref!r}. "
+            "Re-fetch with the current profile; the payloads are not "
+            "re-stamped, because the lookbacks that produced them differ."
+        )
+
+    if fingerprint != CURRENT_ACQUISITION.content_fingerprint:
+        return (
+            f"bundle claims contract {ref!r} but carries fingerprint "
+            f"{fingerprint!r}, and the contract in force hashes to "
+            f"{CURRENT_ACQUISITION.content_fingerprint!r}. The profile was "
+            "edited without a version bump, or the value was copied from "
+            "elsewhere. Re-run `acquisition-spec` and re-fetch."
+        )
+
+    return None
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
@@ -171,6 +250,37 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     if mode not in ("shadow", "live"):
         return _fail(f"mode must be 'shadow' or 'live', got {mode!r}")
 
+    # --- acquisition provenance -------------------------------------------
+    #
+    # The bundle must state which contract fetched its payloads, and that claim
+    # must match the contract in force. Without this the whole milestone is
+    # decorative: `run_cycle` would fall back to CURRENT_ACQUISITION and a
+    # payload gathered weeks ago under different lookbacks would be journalled
+    # as though it came from today's profile -- a false provenance record,
+    # which is worse than none at all.
+    #
+    # There is deliberately no override flag. Replaying a bundle built under an
+    # older contract means checking out the commit that defined it; a bypass
+    # here would be reached for on exactly the day it should not be.
+    provenance_error = _check_acquisition_provenance(bundle)
+    if provenance_error:
+        return _fail(provenance_error)
+
+    try:
+        trading_date = date.fromisoformat(bundle["trading_date"])
+    except (KeyError, TypeError):
+        return _fail(
+            "bundle is missing 'trading_date' — copy it from the "
+            "acquisition-spec output that produced these payloads. It is the "
+            "date every start_time was derived from, and it is not "
+            "recoverable from the payloads themselves."
+        )
+    except ValueError:
+        return _fail(
+            f"bundle 'trading_date' must be YYYY-MM-DD, got "
+            f"{bundle['trading_date']!r}"
+        )
+
     strategy_name = bundle.get("strategy", args.strategy)
 
     # Journal lookups feed the cooldown gate and duplicate-order guard. A
@@ -212,6 +322,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             config,
             strategy_name=strategy_name,
             mode=mode,
+            trading_date=trading_date,
             known_client_keys=known_keys,
             last_loss_exit=last_loss,
             recent_symbol_trades=recent_trades,
@@ -294,6 +405,10 @@ def cmd_discover(args: argparse.Namespace) -> int:
             repo.record_scan_run(
                 result.run_id,
                 result.batch,
+                # The date selection actually rotated on, carried from the
+                # result rather than re-derived here -- two sources for one
+                # input is how they drift apart.
+                trading_date=result.trading_date,
                 candidates=abort_candidates(result),
                 scanner_profile_ref=result.scanner_profile_ref,
                 scan_definition_ref=result.definition_ref,
@@ -350,6 +465,12 @@ def _render_result(result: CycleResult, *, symbol_regime: str) -> dict[str, Any]
         "symbol": result.symbol,
         "strategy": result.strategy,
         "outcome": result.outcome.value,
+        # Reported at cycle level rather than only under `plan`, because the
+        # outcomes that produce no plan are exactly the ones whose execution
+        # context could not otherwise be established.
+        "mode": result.mode.value,
+        "acquisition_profile_ref": result.acquisition.profile_ref,
+        "acquisition_config_fingerprint": result.acquisition.content_fingerprint,
         "symbol_regime": symbol_regime,
         "market_regime": (
             result.market_context.to_dict() if result.market_context else None
@@ -436,6 +557,47 @@ def cmd_report(args: argparse.Namespace) -> int:
             ],
             "rejection_reasons": repo.rejection_reasons(),
             "recent_audit": repo.recent_audit(limit=args.limit),
+        }
+    )
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- acquisition
+
+
+def cmd_acquisition_spec(args: argparse.Namespace) -> int:
+    """Emit the exact read-only calls to make for each symbol.
+
+    This command is the reason the acquisition profile exists. An agent or a
+    payload worker asks for a symbol and a date and receives fully-specified
+    MCP parameters -- interval, bounds, adjustment, output width, start time.
+    It chooses none of them. Prose saying "roughly 120 days back" is what
+    produced 30, 57, and 265-point histories for the same logical indicator.
+
+    Read-only by construction: every tool named here is a market-data lookup.
+    Nothing in this output can place, review, cancel, or modify an order.
+    """
+    try:
+        trading_date = date.fromisoformat(args.date)
+    except ValueError:
+        return _fail(f"--date must be YYYY-MM-DD, got {args.date!r}")
+
+    symbols = [s.strip().upper() for s in args.symbols if s.strip()]
+    if not symbols:
+        return _fail("at least one symbol is required")
+
+    profile = CURRENT_ACQUISITION
+    _emit(
+        {
+            "ok": True,
+            "acquisition_profile_ref": profile.profile_ref,
+            "acquisition_config_fingerprint": profile.content_fingerprint,
+            "trading_date": trading_date.isoformat(),
+            "end_time_policy": profile.end_time_policy,
+            "symbols": {
+                symbol: profile.request_plan(symbol, trading_date)["calls"]
+                for symbol in symbols
+            },
         }
     )
     return EXIT_OK
@@ -574,6 +736,22 @@ def build_parser() -> argparse.ArgumentParser:
     dc.add_argument("--no-journal", action="store_true")
     dc.add_argument("--dry-run", action="store_true")
     dc.set_defaults(func=cmd_discover)
+
+    aq = sub.add_parser(
+        "acquisition-spec",
+        help="Emit the pinned read-only MCP calls for one or more symbols.",
+    )
+    aq.add_argument("symbols", nargs="+", help="Symbols to generate requests for.")
+    aq.add_argument(
+        "--date",
+        required=True,
+        help=(
+            "Trading date (YYYY-MM-DD). Required for the same reason discover "
+            "requires it: every start_time derives from this date, never from "
+            "the wall clock, so the same date regenerates the same requests."
+        ),
+    )
+    aq.set_defaults(func=cmd_acquisition_spec)
 
     rp = sub.add_parser("report", help="Performance and audit summary.")
     rp.add_argument("--strategy", help="Limit to one strategy.")

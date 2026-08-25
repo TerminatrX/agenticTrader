@@ -16,8 +16,10 @@ from agentic_trader.models.market_snapshot import (
 )
 from agentic_trader.models.trade_intent import (
     LIVE_PERMITTED_PROTECTION,
+    SELECTABLE_EXECUTION_MODES,
     AccountState,
     Decision,
+    ExecutionMode,
     Position,
     ProtectionState,
     RiskDecision,
@@ -29,9 +31,11 @@ from agentic_trader.models.trade_intent import (
 
 __all__ = [
     "LIVE_PERMITTED_PROTECTION",
+    "SELECTABLE_EXECUTION_MODES",
     "Capability",
     "CapabilityProfile",
     "Evidence",
+    "ExecutionMode",
     "AccountState",
     "Bar",
     "Decision",

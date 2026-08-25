@@ -476,7 +476,7 @@ that distinction per capability rather than burying it in a comment.
 ```
 src/agentic_trader/
   models/        domain types crossing every layer
-  market/        MCP payloads → snapshot; signals; regime
+  market/        MCP payloads → snapshot; signals; regime; acquisition contract
   universe/      scan definition, coverage, drift, candidate selection
   strategies/    opinions only — no account access, no sizing
   risk/          limits, sizing, engine
@@ -498,30 +498,91 @@ tests/
   settings.json  wires the hook (tracked, so protection travels with the repo)
 ```
 
+## Reproducibility
+
+A stored decision has to be readable without the session that made it. Three
+things are recorded because none of them can be inferred afterwards:
+
+| Recorded | Why not inferred |
+|---|---|
+| `scan_runs.trading_date` | Selection is seeded by trading date. `started_at` is a UTC instant, and a run starting 01:30 UTC seeds from the *previous* trading date — so deriving it back is wrong in exactly the case worth auditing. |
+| `audit.mode` | Five of seven outcomes produce neither a trade nor an execution plan in *any* mode. There is nothing for an inference to read. |
+| `audit.trading_date` | Every ranged request is `trading_date - lookback`, so this decided which bars the broker computed over. `captured_at` says when the snapshot was assembled - a different question that coincides only by habit. |
+| `audit.acquisition_profile_ref` + fingerprint | Says which pinned request contract produced the inputs. Without it a decision made on 30 bars of RSI warm-up is indistinguishable from the same decision made on 300. |
+| `audit.occurred_at` | The instant the decision was evaluated. `now` reaches quote age, price drift, and the risk gate's `as_of`, so a replay given any other clock re-decides rather than reproduces. |
+
+`market/acquisition.py` pins the request shape — interval, `bounds`,
+adjustment, output width, symbol-parameter shape, and a `start_time` derived
+from the trading date rather than the wall clock. It covers every market-data
+call an evaluation makes: quote, historicals, fundamentals, earnings, and the
+six indicators. It describes **what is asked for**; no returned value,
+timestamp, ticker, or count reaches its fingerprint, so the identity stays
+stable while the market does not.
+
+Fundamentals is in the contract rather than in prose because it feeds two hard
+gates — `average_volume_30d` for liquidity, `sector` for the exposure cap. A
+decision input specified only in a skill file is a decision input the audit row
+cannot account for.
+
+The lookbacks are derived rather than chosen. Each is the indicator's warm-up
+plus the trailing points the strategy reads, plus a convergence allowance for
+recursive smoothers, converted at ~252 trading days a year with a holiday
+buffer — and a test asserts each pinned value still covers its own derivation.
+RSI, MACD and ATR each depend on the previous value back to a seed at the start
+of the range, so a short range returns a genuinely different number; SMA is a
+finite window and is immune, which is why the problem stayed invisible until
+three workers fetched 30, 57, and 265 points for one indicator.
+
+`evaluate` **requires** all three in the bundle and refuses one whose contract
+does not match the profile in force - missing, blank, stale, or wrong all fail
+closed, and nothing is journalled. The payloads are never re-stamped: a bundle
+fetched under different lookbacks genuinely is not what the current contract
+would have asked for, and recording it as such would be a false provenance
+claim, which reads back exactly like a true one. There is no override flag,
+because it would be reached for on precisely the day it should not be.
+
+One thing this does *not* buy: omitting `end_time` makes the generated request
+byte-identical on every regeneration, but the broker's effective upper bound is
+request-time dependent, so the same request on two days can return different
+data.
+
+**Replay is a property of the journal, not of the bundle.** Re-running a saved
+bundle later does not reproduce the original decision — `build_snapshot` stamps
+`captured_at` from the current clock, earnings normalization keys on that date,
+and quote age and drift measure against the instant given. Replay instead reads
+the row: rehydrate `snapshot_json`, pass the stored mode and `trading_date`, and
+set the clock to `occurred_at`. The freshness controls have no historical
+override on the normal path, and should not — they must keep measuring against
+the real decision time or they stop being freshness controls.
+
+Old journals migrate additively and keep an honest `NULL` in the new columns.
+Back-filling them would assert a mode, a date, and a contract nobody
+verified.
+
 ## Next
 
 In rough priority order:
 
-1. **Close three journal and reproducibility gaps** the first live discovery run
-   exposed: `scan_runs` does not persist `trading_date` even though selection is
-   date-seeded; audit records do not persist execution mode; and indicator
-   lookback parameters are not pinned centrally, so two fetches of the same
-   indicator contract can return different series lengths.
-2. **How much capital this strategy needs for whole-share broker protection.**
+1. **How much capital this strategy needs for whole-share broker protection.**
    Answering it earlier would be guessing — ATR makes stop distance vary per
    symbol, so the price ceiling implied by `risk_budget / stop_distance` is not
    one number. Now that a real universe exists, the question is answerable.
-3. **The protective-stop lifecycle** — submit, confirm acceptance, record the
+2. **The protective-stop lifecycle** — submit, confirm acceptance, record the
    broker order id, monitor, reconcile on restart. Gated on (2): until positions
    can be whole shares it could never leave its first state. There is no
    replace/modify tool, so moving a stop means cancel-then-place with an
    unprotected window in between.
-4. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
+3. **Normalized journal**, a session-aware `ShadowExecutor` with realistic
    spread, slippage and stop-gap modelling, and a baseline-vs-critic A/B to
    establish whether the critic actually improves expectancy.
-5. **Compute RSI/MACD/SMA/ATR locally from authoritative bars.** Six of the ~9
+4. **Compute RSI/MACD/SMA/ATR locally from authoritative bars.** Six of the ~9
    calls per symbol are indicator endpoints deriving from bars already fetched.
-6. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
+   The local values must be run *side by side* against broker output on the
+   same bars, and agree within stated tolerances, before either replaces a
+   decision input. The acquisition profile's historicals lookback is sized for
+   what the core reads today (20 bars) and will need widening to ~200 for
+   SMA200 — a deliberate version bump, not a quiet widening.
+5. **`ApprovalExecutor`** — last, and gated on evidence rather than on a green
    test suite (see safety rule 8).
 
 ## Status

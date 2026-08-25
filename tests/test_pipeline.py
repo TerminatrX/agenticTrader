@@ -25,6 +25,10 @@ from agentic_trader.risk.engine import RiskEngine, build_client_key
 # Obviously fake — see the note in conftest.py.
 TEST_ACCOUNT = "TEST0000"
 
+# The acquisition date these fixtures were built for. Explicit rather than
+# today, so the suite does not change behaviour overnight.
+EVAL_DATE = date(2026, 8, 13)
+
 QUOTE = {
     "data": {
         "results": [
@@ -288,7 +292,7 @@ def test_full_cycle_produces_a_shadow_fill_and_audit(
 ):
     result = run_cycle(
         bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-        mode="shadow", now=bullish_pullback_snapshot.captured_at,
+        mode="shadow", trading_date=EVAL_DATE, now=bullish_pullback_snapshot.captured_at,
     )
 
     assert result.outcome is CycleOutcome.SHADOW_FILLED
@@ -304,7 +308,7 @@ def test_halt_file_stops_the_cycle(
     (tmp_path / "HALT").write_text("stop")
     result = run_cycle(
         bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-        mode="shadow", now=bullish_pullback_snapshot.captured_at,
+        mode="shadow", trading_date=EVAL_DATE, now=bullish_pullback_snapshot.captured_at,
     )
 
     assert result.outcome is CycleOutcome.REJECTED_BY_RISK
@@ -325,7 +329,7 @@ def test_every_cycle_produces_an_audit_entry(
     )
     result = run_cycle(
         flat, account, _app_config(tmp_path, risk_config),
-        mode="shadow", now=flat.captured_at,
+        mode="shadow", trading_date=EVAL_DATE, now=flat.captured_at,
     )
 
     assert result.outcome is CycleOutcome.NO_SIGNAL

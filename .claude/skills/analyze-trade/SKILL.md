@@ -37,32 +37,55 @@ to the user. Pass the full value to MCP tools and into the bundle unchanged.
 
 ### 2. Fetch market data
 
-For each symbol, call these in parallel:
+**Ask Python what to fetch. Do not choose parameters yourself.**
 
-- `get_equity_quotes` — symbols: `[SYMBOL]`
-- `get_equity_historicals` — interval `day`, `start_time` ~90 days back
-- `get_equity_fundamentals` — for liquidity and the 52-week range
-- `get_earnings_results` — for the blackout gate
-- `get_equity_technical_indicators` six times, all interval `day`:
-  - `rsi` period 14, `output: "last:2"`, start ~120 days back
-  - `macd` (defaults), `output: "last:2"`, start ~200 days back
-  - `sma` period 20, `output: "latest"`, start ~90 days back
-  - `sma` period 50, `output: "latest"`, start ~200 days back
-  - `sma` period 200, `output: "latest"`, start ~500 days back
-  - `atr` period 14, `output: "latest"`, start ~120 days back
+```bash
+.venv/Scripts/python.exe -m agentic_trader.cli acquisition-spec AAPL MSFT --date 2026-08-22
+```
 
-ATR sets the stop distance, and the stop sets the position size — so omitting
-it does not merely lose an input, it silently changes how much the system buys.
-Without it the strategy falls back to a flat percentage and records
-`stop_basis: flat_pct`, which the critic penalizes. Fetch it.
+This emits, per symbol, the exact tool and the exact parameters for every call:
+`interval`, `bounds`, `adjustment_type`, `output`, and a `start_time` derived
+from the trading date. Make those calls **verbatim**. Do not round a
+`start_time`, widen a range, drop `bounds`, or substitute `latest` for
+`last:2`.
 
-`last:2` on RSI and MACD is required, not optional. The strategy compares the
-current bar to the prior one to decide whether momentum is stabilizing, and
-`latest` alone silently disables that check — the one that separates buying a
-pullback from catching a falling knife.
+The specification lives in `src/agentic_trader/market/acquisition.py`
+(`CURRENT_ACQUISITION`) and it is authoritative. This file deliberately does
+not restate the lookbacks: it used to, and three workers reading "start ~120
+days back" fetched 30, 57, and 265 points for one indicator. RSI, MACD and ATR
+are recursive — each value depends on the previous one back to a seed at the
+start of the range — so those are *different numbers for the same indicator on
+the same day*. The decisions happened to match. That was luck.
 
-Note the SMA start times: a 200-period average needs at least 200 bars of
-warm-up before the first value exists.
+**Call exactly what the spec emits — nothing more, nothing less.** It covers
+the quote, historicals, fundamentals, earnings, and all six indicators, each
+with its full parameter set. If you find yourself deciding a parameter, stop:
+that decision belongs in the profile, not here.
+
+Two account calls sit outside the market-data contract and are still needed:
+
+- `get_equity_positions` and `get_equity_orders` — see step 3
+
+Two things worth knowing rather than merely obeying:
+
+- **ATR sets the stop distance, and the stop sets the position size.** Omitting
+  it does not just lose an input, it silently changes how much the system buys:
+  the strategy falls back to a flat percentage, records `stop_basis: flat_pct`,
+  and the critic penalizes it.
+- **`last:2` on RSI and MACD is load-bearing.** The strategy compares the
+  current bar to the prior one to decide whether momentum is stabilizing.
+  `latest` alone disables that check in silence — the one that separates buying
+  a pullback from catching a falling knife.
+
+Keep the `acquisition-spec` output. Its `trading_date`,
+`acquisition_profile_ref`, and `acquisition_config_fingerprint` go into the
+bundle in step 3 **verbatim** — `evaluate` requires all three and refuses a
+bundle whose contract does not match the one in force.
+
+Do not hand-edit them to make a stale bundle pass. The refusal means the
+payloads were fetched under different lookbacks, so they are genuinely not what
+the current contract would have asked for; re-run `acquisition-spec` and
+re-fetch.
 
 ### 3. Build the bundle
 
@@ -75,6 +98,11 @@ your positions, so they must never be written into the project tree.
   "symbol": "AAPL",
   "mode": "shadow",
   "strategy": "trend_pullback",
+
+  "trading_date": "<--date you passed to acquisition-spec>",
+  "acquisition_profile_ref": "<verbatim from acquisition-spec>",
+  "acquisition_config_fingerprint": "<verbatim from acquisition-spec>",
+
   "account": {
     "account_number": "<from get_accounts, agentic_allowed:true>",
     "is_cash_account": true,

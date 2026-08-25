@@ -95,14 +95,19 @@ Claude owns the loop. Python owns the decisions.
 call can place an order. The only side effects are journal writes.
 
 The Python core is a pure function from (market payloads + account state) to a
-decision. That makes every decision reproducible: the snapshot is persisted
-with the audit entry, so any past cycle can be replayed exactly.
+decision. That makes every decision reproducible, from the journal rather than
+from the bundle: the audit entry persists the snapshot (what came back), the
+acquisition contract and trading date (what was requested), and `occurred_at`
+(when it was evaluated). Replay needs all three — `now` feeds quote age, drift
+and the risk gate's `as_of`, so re-running a saved bundle today is evaluated as
+today rather than reproducing the original.
 
 ### The seam
 
 Everything crosses the boundary as JSON:
 
 ```bash
+.venv/Scripts/python.exe -m agentic_trader.cli acquisition-spec AAPL --date 2026-08-22
 .venv/Scripts/python.exe -m agentic_trader.cli evaluate --input bundle.json
 .venv/Scripts/python.exe -m agentic_trader.cli report
 .venv/Scripts/python.exe -m agentic_trader.cli config-check
@@ -111,6 +116,14 @@ Everything crosses the boundary as JSON:
 `evaluate` takes raw MCP responses **verbatim**. Do not reshape, round, or
 clean them — the parser expects the broker's exact format, and hand-editing
 numbers destroys reproducibility.
+
+**Ask `acquisition-spec` what to fetch; do not choose parameters yourself.**
+`market/acquisition.py` pins interval, `bounds`, adjustment, output width, and
+a `start_time` derived from the trading date, for every market-data call. Prose
+used to specify these, and three workers reading "start ~120 days back" fetched
+30, 57, and 265 points for one indicator — RSI, MACD and ATR are recursive, so
+those are different numbers for the same indicator on the same day. Never
+restate a lookback in prose; point at the profile.
 
 ## Layout
 
@@ -127,6 +140,7 @@ numbers destroys reproducibility.
 | `risk/sizing.py` | Dollar-denominated position sizing |
 | `risk/engine.py` | The only path from signal to executable order |
 | `agents/critic.py` | Mechanical re-derivation of the trade |
+| `market/acquisition.py` | `MarketDataAcquisitionProfile` — the pinned request contract. **What to ask for, never what came back** |
 | `agents/orchestrator.py` | One cycle, as a pure function |
 | `execution/executor.py` | Builds the payload. **Does not submit** |
 | `execution/shadow_executor.py` | Simulated fills with pessimistic slippage |

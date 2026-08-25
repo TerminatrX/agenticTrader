@@ -89,6 +89,54 @@ class ProtectionState(StrEnum):
     """The resting stop was cancelled and not replaced."""
 
 
+class ExecutionMode(StrEnum):
+    """Which execution context produced a decision.
+
+    Stored on every evaluation because it is *decision context*, not a
+    consequence of one. The tempting shortcuts -- did a TradeRecord appear, is
+    there an ExecutionPlan, does a broker order id exist -- all read the
+    outcome and infer the context backwards, and every one of them is silent
+    exactly where it matters: a cycle rejected by risk produces none of those
+    artefacts in any mode, so an inference cannot tell a shadow rejection from
+    a live one. Only the caller knows, so only the caller may say.
+
+    The whole vocabulary is declared even though this build reaches one value
+    of it, following `ProtectionState` for the same reason: the domain
+    describes the world rather than the build, and an enum that grew as
+    implementation caught up would make journalled history mean different
+    things in different versions. What a given build may *select* is declared
+    separately, in `SELECTABLE_EXECUTION_MODES`.
+    """
+
+    SHADOW = "shadow"
+    """Simulated end to end. The pipeline runs in full and nothing reaches the
+    broker. The only mode this build can select."""
+
+    APPROVAL = "approval"
+    """A human confirmed each order before submission. **Not implemented** --
+    no ApprovalExecutor exists. Declared so that when it lands, historical
+    shadow records do not have to be reinterpreted against a changed enum."""
+
+    LIVE = "live"
+    """Submitted to the broker. Reachable only through the agent, never from
+    inside `src/`, and gated on protection state before any payload is built."""
+
+
+SELECTABLE_EXECUTION_MODES = frozenset({ExecutionMode.SHADOW, ExecutionMode.LIVE})
+"""Modes a caller of this build may ask for.
+
+APPROVAL is absent because nothing implements it; naming it in the enum is a
+record of intent, and this frozenset is what keeps that record from being
+mistaken for a working feature. An allowlist rather than a denylist, so a mode
+added later is unselectable until somebody deliberately admits it.
+
+LIVE remains selectable because it always has been -- the live path is gated by
+protection state and by human confirmation at the agent, not by this set, and
+narrowing it here would be a behaviour change this milestone has no business
+making.
+"""
+
+
 # The only states under which a position may be carried outside shadow mode.
 # Everything else — UNAVAILABLE, PENDING, FAILED, and any state added later —
 # fails closed. Written as an allowlist rather than a denylist so a new state

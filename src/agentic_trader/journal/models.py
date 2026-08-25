@@ -15,14 +15,14 @@ eventually be revised into agreeing with whatever you hoped happened.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agentic_trader.models import ProtectionState
+from agentic_trader.models import ExecutionMode, ProtectionState
 
 
 class CycleOutcome(StrEnum):
@@ -45,6 +45,38 @@ class AuditEntry(BaseModel):
     symbol: str
     strategy: str
     outcome: CycleOutcome
+
+    # Which execution context produced this. Required, with no default: a
+    # default would be an inference dressed as a fact, and the whole reason
+    # this field exists is that every available inference -- a TradeRecord
+    # appearing, an ExecutionPlan existing, an outcome value -- reads the
+    # consequence and guesses the context backwards. Five of the seven outcomes
+    # produce no trade and no plan in *any* mode, so for those the guess has
+    # nothing to go on at all.
+    mode: ExecutionMode
+
+    # The date the acquisition contract's ranged requests were built from.
+    # Every `start_time` is `trading_date - lookback`, so this is the input
+    # that decided which bars the broker computed over.
+    #
+    # Not `occurred_at`, not `snapshot.captured_at`, and certainly not today.
+    # `captured_at` says when the snapshot was assembled; it answers a
+    # different question and coincides with this only by habit. The exact
+    # input is known at the boundary, so the input is what gets stored.
+    trading_date: date
+
+    # Which pinned request contract produced the inputs behind this decision.
+    # The snapshot records what came back; these record what was asked for, and
+    # without them a replay cannot tell a decision made on 30 bars of RSI
+    # warm-up from the same decision made on 300.
+    #
+    # Required, with no defaults. The *columns* are nullable because rows
+    # written before the contract existed genuinely have none, but this model
+    # describes a NEW write -- and a default here would let a caller omit the
+    # provenance and have the record claim the current contract anyway, which
+    # is precisely the substitution the boundary check exists to prevent.
+    acquisition_profile_ref: str
+    acquisition_config_fingerprint: str
 
     reference_price: Decimal | None = None
     confidence: float = 0.0
@@ -94,7 +126,11 @@ class TradeRecord(BaseModel):
     client_key: str
     symbol: str
     strategy: str
-    mode: str  # "shadow" | "live"
+
+    # Same type as `AuditEntry.mode`, so the two cannot describe one cycle in
+    # two vocabularies. Previously a bare `str`, which admitted "Shadow",
+    # "SHADOW", and typos as distinct modes.
+    mode: ExecutionMode
 
     opened_at: datetime
     entry_price: Decimal
