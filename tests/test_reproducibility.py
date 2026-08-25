@@ -97,6 +97,7 @@ def _audit(**overrides) -> AuditEntry:
         "strategy": "trend_pullback",
         "outcome": CycleOutcome.NO_SIGNAL,
         "mode": ExecutionMode.SHADOW,
+        "trading_date": DAY,
         "acquisition_profile_ref": CURRENT_ACQUISITION.profile_ref,
         "acquisition_config_fingerprint": CURRENT_ACQUISITION.content_fingerprint,
     }
@@ -238,7 +239,7 @@ def test_an_exit_cycle_records_its_mode(tmp_path, bullish_pullback_snapshot,
     )
     result = run_cycle(
         broken, holding, _app_config(tmp_path, risk_config),
-        mode=ExecutionMode.SHADOW, now=broken.captured_at,
+        mode=ExecutionMode.SHADOW, trading_date=DAY, now=broken.captured_at,
     )
 
     assert result.audit is not None
@@ -251,7 +252,7 @@ def test_a_shadow_cycle_can_never_produce_a_live_audit(
     """(S) The invariant, asserted end to end rather than at the model."""
     result = run_cycle(
         bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-        mode=ExecutionMode.SHADOW, now=bullish_pullback_snapshot.captured_at,
+        mode=ExecutionMode.SHADOW, trading_date=DAY, now=bullish_pullback_snapshot.captured_at,
     )
 
     assert result.outcome is CycleOutcome.SHADOW_FILLED
@@ -269,7 +270,7 @@ def test_audit_and_trade_agree_on_mode(
     `ExecutionMode` now; previously `TradeRecord.mode` was a bare str."""
     result = run_cycle(
         bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-        mode=ExecutionMode.SHADOW, now=bullish_pullback_snapshot.captured_at,
+        mode=ExecutionMode.SHADOW, trading_date=DAY, now=bullish_pullback_snapshot.captured_at,
     )
     assert result.audit.mode == result.trade.mode
     assert isinstance(result.trade.mode, ExecutionMode)
@@ -285,7 +286,8 @@ def test_an_unimplemented_mode_is_refused_rather_than_downgraded(
     with pytest.raises(ValueError, match="declared but not"):
         run_cycle(
             bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-            mode=ExecutionMode.APPROVAL, now=bullish_pullback_snapshot.captured_at,
+            mode=ExecutionMode.APPROVAL, trading_date=DAY,
+            now=bullish_pullback_snapshot.captured_at,
         )
 
 
@@ -297,24 +299,110 @@ def test_an_unrecognized_mode_string_is_refused(
     with pytest.raises(ValueError):
         run_cycle(
             bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-            mode="shaddow", now=bullish_pullback_snapshot.captured_at,
+            mode="shaddow", trading_date=DAY, now=bullish_pullback_snapshot.captured_at,
         )
 
 
-def test_a_non_shadow_mode_takes_the_structurally_gated_branch():
-    """The mapping from ExecutionMode to the executor's own vocabulary is
-    written as "shadow, or else live" rather than "live, or else shadow".
+def test_the_plan_mode_mapping_is_total_and_explicit():
+    """Every selectable mode has a declared executor vocabulary, and nothing
+    is chosen by elimination.
 
-    The difference is not cosmetic: a mode added later and matched by name
-    would fall through to "shadow" and past the protection floor, which is the
-    one check no config can reach.
+    The earlier form -- `"shadow" if mode is SHADOW else "live"` -- was
+    fail-closed against the protection floor but fail-*open* against
+    enablement: any mode added to SELECTABLE_EXECUTION_MODES would have
+    received a live plan with no further edit.
     """
-    import inspect
+    from agentic_trader.agents.orchestrator import _PLAN_MODE
 
+    assert _PLAN_MODE == {
+        ExecutionMode.SHADOW: "shadow",
+        ExecutionMode.LIVE: "live",
+    }
+    assert ExecutionMode.APPROVAL not in _PLAN_MODE
+    assert set(SELECTABLE_EXECUTION_MODES) <= set(_PLAN_MODE), (
+        "a mode may not be selectable without a declared plan vocabulary"
+    )
+
+
+def test_shadow_produces_a_shadow_plan_that_cannot_submit(
+    tmp_path, bullish_pullback_snapshot, account, risk_config
+):
+    result = run_cycle(
+        bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
+        mode=ExecutionMode.SHADOW, trading_date=DAY,
+        now=bullish_pullback_snapshot.captured_at,
+    )
+    assert result.plan.mode == "shadow"
+    assert result.should_submit is False
+
+
+def test_live_still_reaches_the_protection_floor(
+    tmp_path, bullish_pullback_snapshot, account, risk_config
+):
+    """LIVE behaviour is unchanged by the new mapping: it takes the non-shadow
+    branch, where an unprotectable fractional position is refused structurally.
+    At this account size every position is fractional, so this is the ordinary
+    outcome rather than an edge case."""
+    result = run_cycle(
+        bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
+        mode=ExecutionMode.LIVE, trading_date=DAY,
+        now=bullish_pullback_snapshot.captured_at,
+    )
+    assert result.outcome is CycleOutcome.REJECTED_BY_RISK
+    assert result.plan is None
+    assert result.should_submit is False
+    assert any("protection" in e.lower() for e in result.errors)
+
+
+def test_making_approval_selectable_alone_cannot_produce_a_live_plan(
+    tmp_path, bullish_pullback_snapshot, account, risk_config, monkeypatch
+):
+    """The regression this mapping exists to prevent, simulated exactly.
+
+    A future developer adds APPROVAL to the selectable set and changes nothing
+    else. Under the old expression that produced a `mode="live"` ExecutionPlan
+    immediately. Now it stops at the mapping, which is a second, independent
+    decision -- enabling a mode and teaching the executor what it means must
+    not be the same edit.
+    """
     from agentic_trader.agents import orchestrator
 
-    source = inspect.getsource(orchestrator.run_cycle)
-    assert '"shadow" if execution_mode is ExecutionMode.SHADOW else "live"' in source
+    monkeypatch.setattr(
+        orchestrator, "SELECTABLE_EXECUTION_MODES",
+        frozenset({ExecutionMode.SHADOW, ExecutionMode.LIVE, ExecutionMode.APPROVAL}),
+    )
+
+    with pytest.raises(NotImplementedError, match="no executor vocabulary"):
+        run_cycle(
+            bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
+            mode=ExecutionMode.APPROVAL, trading_date=DAY,
+            now=bullish_pullback_snapshot.captured_at,
+        )
+
+
+def test_should_submit_requires_both_mode_readings_to_agree(
+    tmp_path, bullish_pullback_snapshot, account, risk_config
+):
+    """`self.mode` is the context asked for; `plan.mode` is what the payload
+    was built under. A disagreement between them -- a mapping bug, a
+    hand-built result -- must resolve to "do not submit" rather than to
+    whichever field a reader happens to check."""
+    result = run_cycle(
+        bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
+        mode=ExecutionMode.SHADOW, trading_date=DAY,
+        now=bullish_pullback_snapshot.captured_at,
+    )
+    assert result.critic is not None and result.critic.approved
+
+    # A live-looking plan smuggled onto a shadow cycle.
+    result.plan.mode = "live"
+    assert result.mode is ExecutionMode.SHADOW
+    assert result.should_submit is False, "plan.mode alone must not authorize"
+
+    # And the converse: a live context whose plan was built as shadow.
+    result.mode = ExecutionMode.LIVE
+    result.plan.mode = "shadow"
+    assert result.should_submit is False
 
 
 def test_a_journal_predating_the_mode_column_migrates(tmp_path):
@@ -504,15 +592,42 @@ def test_a_different_date_moves_every_range():
         )
 
 
-def test_the_request_spec_does_not_read_the_wall_clock():
-    """(P) `start_time` derives from the trading date; `end_time` is omitted
-    entirely. Absent is more deterministic than an explicit "now" — an explicit
-    now would make the same inputs produce a different request every call."""
+def test_the_generated_request_does_not_read_the_wall_clock():
+    """(P) The *request* is wall-clock-independent: `start_time` derives from
+    the trading date, and `end_time` is absent rather than an explicit "now"
+    that would differ on every call.
+
+    Scoped deliberately to the request. The broker's effective upper bound is
+    request-time dependent by construction, so this says nothing about the
+    response -- see the companion test below.
+    """
     plan = CURRENT_ACQUISITION.request_plan("AAPL", DAY)
     for call in [plan["calls"]["historicals"], *plan["calls"]["indicators"].values()]:
         assert "end_time" not in call["params"]
         assert call["params"]["start_time"].endswith("T00:00:00Z")
     assert CURRENT_ACQUISITION.end_time_policy.startswith("omitted")
+
+
+def test_replay_rests_on_the_snapshot_not_on_the_request_being_reissuable():
+    """The boundary of what the acquisition contract proves.
+
+    Omitting `end_time` makes the request reproducible, not the response: the
+    same call issued on two days can return different bars. Historical replay
+    therefore reads the persisted snapshot, and the contract identity explains
+    what that snapshot *is*. Neither substitutes for the other, and the policy
+    string names request time rather than implying the stronger claim.
+    """
+    assert "request_time" in CURRENT_ACQUISITION.end_time_policy
+
+    from agentic_trader.journal.models import AuditEntry as _AE
+
+    required = {n for n, f in _AE.model_fields.items() if f.is_required()}
+    assert {
+        "acquisition_profile_ref",
+        "acquisition_config_fingerprint",
+        "trading_date",
+    } <= required
+    assert "snapshot_json" in _AE.model_fields
 
 
 def test_start_times_are_the_pinned_lookback_before_the_trading_date():
@@ -669,7 +784,7 @@ def test_a_stored_cycle_independently_identifies_its_own_context(
     db = tmp_path / "j.db"
     result = run_cycle(
         bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-        mode=ExecutionMode.SHADOW, cycle_id="reconstruct-1",
+        mode=ExecutionMode.SHADOW, trading_date=DAY, cycle_id="reconstruct-1",
         now=bullish_pullback_snapshot.captured_at,
     )
     assert result.outcome is CycleOutcome.SHADOW_FILLED
@@ -715,7 +830,7 @@ def test_a_reloaded_snapshot_replays_to_the_same_decision(
 
     original = run_cycle(
         bullish_pullback_snapshot, account, config,
-        mode=ExecutionMode.SHADOW, cycle_id="replay-1", now=captured,
+        mode=ExecutionMode.SHADOW, trading_date=DAY, cycle_id="replay-1", now=captured,
     )
     JournalRepository(db).record_audit(original.audit)
 
@@ -726,7 +841,9 @@ def test_a_reloaded_snapshot_replays_to_the_same_decision(
     rehydrated = MarketSnapshot.model_validate(row["snapshot_json"])
     replayed = run_cycle(
         rehydrated, account, config,
-        mode=ExecutionMode(row["mode"]), cycle_id="replay-2",
+        mode=ExecutionMode(row["mode"]),
+        trading_date=date.fromisoformat(row["trading_date"]),
+        cycle_id="replay-2",
         now=rehydrated.captured_at,
     )
 
@@ -810,7 +927,7 @@ def test_the_evaluate_output_reports_mode_without_a_plan(
 
     result = run_cycle(
         bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-        mode=ExecutionMode.SHADOW, now=bullish_pullback_snapshot.captured_at,
+        mode=ExecutionMode.SHADOW, trading_date=DAY, now=bullish_pullback_snapshot.captured_at,
     )
     result.outcome = outcome
     result.plan = None
@@ -843,7 +960,7 @@ def test_this_milestone_enables_no_execution_mode(
 
     result = run_cycle(
         bullish_pullback_snapshot, account, _app_config(tmp_path, risk_config),
-        mode=ExecutionMode.SHADOW, now=bullish_pullback_snapshot.captured_at,
+        mode=ExecutionMode.SHADOW, trading_date=DAY, now=bullish_pullback_snapshot.captured_at,
     )
     assert result.should_submit is False
     assert result.plan.mode == "shadow"
@@ -859,3 +976,253 @@ def test_the_acquisition_module_performs_no_broker_io():
     source = __import__("inspect").getsource(module)
     for banned in ("import requests", "import httpx", "urllib.request", "socket"):
         assert banned not in source
+
+
+# ==========================================================================
+# 6. The agent -> CLI boundary
+#
+# Everything above proves the core records provenance correctly. None of it
+# proves the boundary *demands* provenance -- and the boundary is where a
+# bundle fetched under an older contract would otherwise be evaluated and
+# journalled as though it came from the current one. That is worse than no
+# record at all: read back later, a false provenance claim is indistinguishable
+# from a true one.
+# ==========================================================================
+
+from tests.test_pipeline import HISTORICALS, QUOTE, TEST_ACCOUNT  # noqa: E402
+
+BUNDLE_DATE = "2026-08-13"
+
+_OMIT = object()
+
+
+def _bundle(**overrides) -> dict:
+    """A minimal, complete evaluate bundle. Entirely synthetic."""
+    bundle = {
+        "symbol": "AAPL",
+        "mode": "shadow",
+        "strategy": "trend_pullback",
+        "trading_date": BUNDLE_DATE,
+        "acquisition_profile_ref": CURRENT_ACQUISITION.profile_ref,
+        "acquisition_config_fingerprint": CURRENT_ACQUISITION.content_fingerprint,
+        "account": {
+            "account_number": TEST_ACCOUNT,
+            "is_cash_account": True,
+            "total_value": "100.00",
+            "cash": "100.00",
+            "buying_power": "100.00",
+            "unsettled_funds": "0",
+            "positions": [],
+            "open_order_symbols": [],
+            "realized_pnl_today": "0",
+        },
+        "payloads": {"quote": QUOTE, "historicals": HISTORICALS, "indicators": {}},
+    }
+    for key, value in overrides.items():
+        if value is _OMIT:
+            bundle.pop(key, None)
+        else:
+            bundle[key] = value
+    return bundle
+
+
+def _run_evaluate(tmp_path, bundle) -> int:
+    from agentic_trader.cli import main
+
+    path = tmp_path / "bundle.json"
+    path.write_text(json.dumps(bundle), encoding="utf-8")
+    # No --project-root override: config lives in the repo, and the other CLI
+    # tests resolve it the same way. The journal is redirected to tmp_path, and
+    # these fixtures cannot trip the kill switch (realized_pnl_today is 0), so
+    # nothing is written into the project tree.
+    return main(["--db", str(tmp_path / "j.db"), "evaluate", "--input", str(path)])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "fragment"),
+    [
+        ({"acquisition_profile_ref": _OMIT}, "acquisition_profile_ref"),
+        ({"acquisition_config_fingerprint": _OMIT}, "acquisition_config_fingerprint"),
+        ({"acquisition_profile_ref": None}, "acquisition_profile_ref"),
+        ({"acquisition_config_fingerprint": ""}, "acquisition_config_fingerprint"),
+        (
+            {"acquisition_profile_ref": "agentic-acquisition@v0-2020-01-01"},
+            "contract in force",
+        ),
+        ({"acquisition_config_fingerprint": "0" * 64}, "without a version bump"),
+        ({"trading_date": _OMIT}, "trading_date"),
+        ({"trading_date": "not-a-date"}, "YYYY-MM-DD"),
+    ],
+)
+def test_a_bundle_without_matching_provenance_is_refused(
+    tmp_path, capsys, overrides, fragment
+):
+    """Missing, blank, stale, or wrong -- every one fails closed."""
+    code = _run_evaluate(tmp_path, _bundle(**overrides))
+    assert code != 0
+    assert fragment in capsys.readouterr().out
+
+
+def test_a_refused_bundle_writes_no_audit(tmp_path, capsys):
+    """The half that matters. Refusing to evaluate is only useful if nothing
+    is recorded: an audit row claiming the current contract for payloads
+    fetched under another one is the exact falsehood being prevented."""
+    db = tmp_path / "j.db"
+    code = _run_evaluate(
+        tmp_path, _bundle(acquisition_profile_ref="agentic-acquisition@v0-2020-01-01")
+    )
+    capsys.readouterr()
+    assert code != 0
+    assert not db.exists() or JournalRepository(db).recent_audit() == []
+
+
+def test_a_matching_bundle_evaluates_and_records_the_supplied_identity(tmp_path, capsys):
+    """The positive case, and the round trip: what the bundle declared is what
+    the row carries."""
+    db = tmp_path / "j.db"
+    code = _run_evaluate(tmp_path, _bundle())
+    out = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert out["ok"] is True
+    assert out["mode"] == "shadow"
+    assert out["acquisition_profile_ref"] == ACQUISITION_REF
+    assert out["acquisition_config_fingerprint"] == ACQUISITION_FINGERPRINT
+
+    (row,) = JournalRepository(db).audit_for_cycle(out["cycle_id"])
+    assert row["mode"] == "shadow"
+    assert row["trading_date"] == BUNDLE_DATE
+    assert row["acquisition_profile_ref"] == ACQUISITION_REF
+    assert row["acquisition_config_fingerprint"] == ACQUISITION_FINGERPRINT
+
+
+def test_the_stored_trading_date_is_the_bundle_value_not_the_snapshot_stamp(
+    tmp_path, capsys
+):
+    """`captured_at` says when the snapshot was assembled; `trading_date` says
+    what the ranged requests were built from. They answer different questions
+    and coincide only by habit, so the declared value is stored verbatim."""
+    db = tmp_path / "j.db"
+    code = _run_evaluate(tmp_path, _bundle(trading_date="2026-03-02"))
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+
+    (row,) = JournalRepository(db).audit_for_cycle(out["cycle_id"])
+    assert row["trading_date"] == "2026-03-02"
+    assert row["snapshot_json"]["captured_at"][:10] != "2026-03-02", (
+        "fixture must make the two differ, or this proves nothing"
+    )
+
+
+# ------------------------------------------------- required at construction
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["mode", "trading_date", "acquisition_profile_ref", "acquisition_config_fingerprint"],
+)
+def test_a_new_audit_entry_cannot_omit_its_provenance(missing):
+    """The columns are nullable because legacy rows genuinely lack these. The
+    model describes a NEW write, where a default would let a caller skip the
+    provenance and still have the record assert the current contract."""
+    fields = {
+        "cycle_id": "c",
+        "occurred_at": datetime(2026, 8, 18, tzinfo=UTC),
+        "symbol": "AAPL",
+        "strategy": "trend_pullback",
+        "outcome": CycleOutcome.NO_SIGNAL,
+        "mode": ExecutionMode.SHADOW,
+        "trading_date": DAY,
+        "acquisition_profile_ref": CURRENT_ACQUISITION.profile_ref,
+        "acquisition_config_fingerprint": CURRENT_ACQUISITION.content_fingerprint,
+    }
+    del fields[missing]
+
+    with pytest.raises(Exception) as exc:
+        AuditEntry(**fields)
+    assert missing in str(exc.value)
+
+
+def test_a_legacy_row_reads_back_without_fabricated_provenance(tmp_path):
+    """Reading is not writing. Old rows return NULL through the repository
+    rather than being handed today's contract on the way out."""
+    db = tmp_path / "old.db"
+    dropped = {
+        "mode",
+        "trading_date",
+        "acquisition_profile_ref",
+        "acquisition_config_fingerprint",
+    }
+    _legacy_db(db, "audit", dropped)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """INSERT INTO audit (cycle_id, occurred_at, symbol, strategy, outcome)
+           VALUES ('legacy', '2026-07-01T12:00:00+00:00', 'AAPL',
+                   'trend_pullback', 'no_signal')"""
+    )
+    conn.commit()
+    conn.close()
+
+    (row,) = JournalRepository(db).audit_for_cycle("legacy")
+    assert row["mode"] is None
+    assert row["trading_date"] is None
+    assert row["acquisition_profile_ref"] is None
+    assert row["acquisition_config_fingerprint"] is None
+
+
+# ------------------------------------------------------ regenerating the plan
+
+
+def test_a_stored_row_regenerates_the_request_plan_that_produced_it(tmp_path, capsys):
+    """The success criterion, as an executable check.
+
+    Profile plus symbol plus trading_date, all read back from the row, must
+    rebuild the exact requests that fetched the inputs -- every `start_time`
+    included.
+    """
+    from datetime import timedelta
+
+    db = tmp_path / "j.db"
+    code = _run_evaluate(tmp_path, _bundle())
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+
+    (row,) = JournalRepository(db).audit_for_cycle(out["cycle_id"])
+    assert row["acquisition_profile_ref"] == CURRENT_ACQUISITION.profile_ref
+    assert row["acquisition_config_fingerprint"] == (
+        CURRENT_ACQUISITION.content_fingerprint
+    )
+
+    trading_date = date.fromisoformat(row["trading_date"])
+    regenerated = CURRENT_ACQUISITION.request_plan(row["symbol"], trading_date)
+    assert regenerated == CURRENT_ACQUISITION.request_plan(
+        "AAPL", date.fromisoformat(BUNDLE_DATE)
+    )
+
+    # Spot-check the derived ranges rather than trusting equality alone.
+    for spec in CURRENT_ACQUISITION.indicators:
+        start = regenerated["calls"]["indicators"][spec.key]["params"]["start_time"]
+        due = trading_date - timedelta(days=spec.lookback_calendar_days)
+        assert start == f"{due.isoformat()}T00:00:00Z"
+
+
+def test_regeneration_uses_the_stored_date_not_today(tmp_path, capsys):
+    """If the row's date were ignored in favour of the wall clock, every
+    historical decision would regenerate today's windows and the check above
+    would pass vacuously."""
+    db = tmp_path / "j.db"
+    code = _run_evaluate(tmp_path, _bundle(trading_date="2026-03-02"))
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0
+
+    (row,) = JournalRepository(db).audit_for_cycle(out["cycle_id"])
+    stored = CURRENT_ACQUISITION.request_plan(
+        row["symbol"], date.fromisoformat(row["trading_date"])
+    )
+    today = CURRENT_ACQUISITION.request_plan(row["symbol"], date.today())
+
+    assert row["trading_date"] == "2026-03-02"
+    assert (
+        stored["calls"]["historicals"]["params"]["start_time"]
+        != today["calls"]["historicals"]["params"]["start_time"]
+    )

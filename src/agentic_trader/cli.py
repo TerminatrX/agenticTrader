@@ -16,6 +16,18 @@ The `evaluate` bundle:
       "symbol": "AAPL",
       "mode": "shadow",                  // "shadow" | "live"
       "strategy": "trend_pullback",
+
+      // Required. Copy all three verbatim from `acquisition-spec`, which is
+      // what produced the payloads below. `trading_date` is the date every
+      // start_time was derived from; the other two say which contract was in
+      // force. A bundle whose contract does not match the one in force is
+      // refused rather than re-stamped -- the lookbacks differ, so the
+      // payloads are genuinely not what the current profile would have asked
+      // for, and recording them as such would be a false provenance claim.
+      "trading_date": "2026-08-22",
+      "acquisition_profile_ref": "agentic-acquisition@v1-2026-08-22",
+      "acquisition_config_fingerprint": "de87e98f...",
+
       "account": { ...AccountState... },
       "payloads": {
         "quote":        <get_equity_quotes response>,
@@ -111,6 +123,53 @@ def _default_db(config_root: Path) -> Path:
 # ------------------------------------------------------------------- evaluate
 
 
+def _check_acquisition_provenance(bundle: dict[str, Any]) -> str | None:
+    """Return an error message if the bundle's contract claim is unusable.
+
+    Both halves are checked. The ref alone would accept a profile edited
+    without a version bump; the fingerprint alone would accept a value copied
+    from an unrelated contract. Together they say "these payloads were fetched
+    under exactly this contract", which is the claim the audit row will make.
+    """
+    ref = bundle.get("acquisition_profile_ref")
+    fingerprint = bundle.get("acquisition_config_fingerprint")
+
+    if not ref or not fingerprint:
+        missing = [
+            name
+            for name, value in (
+                ("acquisition_profile_ref", ref),
+                ("acquisition_config_fingerprint", fingerprint),
+            )
+            if not value
+        ]
+        return (
+            f"bundle is missing {' and '.join(missing)} — copy the values "
+            "verbatim from `acquisition-spec`, which is what fetched these "
+            "payloads. Evaluating without them would record a decision whose "
+            "inputs cannot be traced to a contract."
+        )
+
+    if ref != CURRENT_ACQUISITION.profile_ref:
+        return (
+            f"bundle was fetched under acquisition contract {ref!r} but the "
+            f"contract in force is {CURRENT_ACQUISITION.profile_ref!r}. "
+            "Re-fetch with the current profile; the payloads are not "
+            "re-stamped, because the lookbacks that produced them differ."
+        )
+
+    if fingerprint != CURRENT_ACQUISITION.content_fingerprint:
+        return (
+            f"bundle claims contract {ref!r} but carries fingerprint "
+            f"{fingerprint!r}, and the contract in force hashes to "
+            f"{CURRENT_ACQUISITION.content_fingerprint!r}. The profile was "
+            "edited without a version bump, or the value was copied from "
+            "elsewhere. Re-run `acquisition-spec` and re-fetch."
+        )
+
+    return None
+
+
 def cmd_evaluate(args: argparse.Namespace) -> int:
     try:
         bundle = _read_bundle(args.input)
@@ -172,6 +231,37 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     if mode not in ("shadow", "live"):
         return _fail(f"mode must be 'shadow' or 'live', got {mode!r}")
 
+    # --- acquisition provenance -------------------------------------------
+    #
+    # The bundle must state which contract fetched its payloads, and that claim
+    # must match the contract in force. Without this the whole milestone is
+    # decorative: `run_cycle` would fall back to CURRENT_ACQUISITION and a
+    # payload gathered weeks ago under different lookbacks would be journalled
+    # as though it came from today's profile -- a false provenance record,
+    # which is worse than none at all.
+    #
+    # There is deliberately no override flag. Replaying a bundle built under an
+    # older contract means checking out the commit that defined it; a bypass
+    # here would be reached for on exactly the day it should not be.
+    provenance_error = _check_acquisition_provenance(bundle)
+    if provenance_error:
+        return _fail(provenance_error)
+
+    try:
+        trading_date = date.fromisoformat(bundle["trading_date"])
+    except (KeyError, TypeError):
+        return _fail(
+            "bundle is missing 'trading_date' — copy it from the "
+            "acquisition-spec output that produced these payloads. It is the "
+            "date every start_time was derived from, and it is not "
+            "recoverable from the payloads themselves."
+        )
+    except ValueError:
+        return _fail(
+            f"bundle 'trading_date' must be YYYY-MM-DD, got "
+            f"{bundle['trading_date']!r}"
+        )
+
     strategy_name = bundle.get("strategy", args.strategy)
 
     # Journal lookups feed the cooldown gate and duplicate-order guard. A
@@ -213,6 +303,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             config,
             strategy_name=strategy_name,
             mode=mode,
+            trading_date=trading_date,
             known_client_keys=known_keys,
             last_loss_exit=last_loss,
             recent_symbol_trades=recent_trades,

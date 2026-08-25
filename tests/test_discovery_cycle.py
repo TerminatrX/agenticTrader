@@ -42,6 +42,7 @@ from agentic_trader.universe import (
 
 NOW = datetime(2026, 8, 18, 14, 0, tzinfo=UTC)
 DAY = date(2026, 8, 18)
+EVAL_DATE = DAY
 SHARDS = CURRENT_DISCOVERY.expected_shard_ids
 SECTORS = ["Technology", "Financials", "Healthcare", "Energy", "Utilities"]
 
@@ -548,7 +549,7 @@ def test_only_selected_symbols_are_ever_evaluated(tmp_path):
         snap = MarketSnapshot(
             symbol=symbol, captured_at=NOW, last_price=Decimal("50"), quote_as_of=NOW
         )
-        run_cycle(snap, account, config, mode="shadow", now=NOW)
+        run_cycle(snap, account, config, mode="shadow", trading_date=EVAL_DATE, now=NOW)
         evaluated.append(symbol)
 
     assert evaluated == list(selected)

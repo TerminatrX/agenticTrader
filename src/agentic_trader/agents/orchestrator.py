@@ -27,6 +27,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import Literal
 
 from agentic_trader.agents.critic import CriticReport, critique
 from agentic_trader.config import AppConfig
@@ -50,6 +51,20 @@ from agentic_trader.models import (
 from agentic_trader.risk.engine import RiskEngine
 from agentic_trader.strategies.base import StrategyContext, get_strategy
 
+# How an ExecutionMode is expressed in the executor's own vocabulary.
+#
+# Exhaustive and total: a mode absent from this table has no plan mode, and
+# `run_cycle` refuses rather than choosing one. The previous form --
+# `"shadow" if mode is SHADOW else "live"` -- was fail-closed against the
+# protection floor but fail-*open* against enablement: adding APPROVAL to
+# SELECTABLE_EXECUTION_MODES would, with no other edit, have handed it a
+# `mode="live"` plan. That is a one-line accidental go-live, which is exactly
+# the shape of change this project must not leave lying around.
+_PLAN_MODE: dict[ExecutionMode, Literal["live", "shadow"]] = {
+    ExecutionMode.SHADOW: "shadow",
+    ExecutionMode.LIVE: "live",
+}
+
 
 @dataclass
 class CycleResult:
@@ -59,11 +74,12 @@ class CycleResult:
     symbol: str
     strategy: str
     outcome: CycleOutcome
-    # No default. A CycleResult that has not been told its mode must not be
-    # constructible, because `_build_audit` copies this straight onto the
-    # persisted record -- a default here would put an unexamined "shadow" into
-    # the journal for a cycle nobody confirmed was shadow.
+    # Neither has a default. A CycleResult that has not been told its mode or
+    # its acquisition date must not be constructible, because `_build_audit`
+    # copies both straight onto the persisted record -- a default would put an
+    # unexamined value into the journal for a cycle nobody confirmed.
     mode: ExecutionMode
+    trading_date: date
     acquisition: MarketDataAcquisitionProfile = CURRENT_ACQUISITION
 
     signal: Signal | None = None
@@ -86,11 +102,17 @@ class CycleResult:
     def should_submit(self) -> bool:
         """True only when every gate agreed and the mode is live.
 
-        Shadow plans are deliberately excluded: a shadow cycle has already
-        recorded its simulated fill and must never reach the broker.
+        Both mode readings must agree. `self.mode` is the context the caller
+        asked for; `plan.mode` is what the payload was actually built under.
+        Requiring both means a disagreement between them -- a mapping bug, a
+        hand-built CycleResult, a future mode slipping through -- resolves to
+        "do not submit" rather than to whichever field a reader happened to
+        check. Shadow is excluded outright: a shadow cycle has already recorded
+        its simulated fill and must never reach the broker.
         """
         return (
-            self.plan is not None
+            self.mode is ExecutionMode.LIVE
+            and self.plan is not None
             and self.plan.mode == "live"
             and self.critic is not None
             and self.critic.approved
@@ -111,6 +133,7 @@ def run_cycle(
     *,
     strategy_name: str = "trend_pullback",
     mode: ExecutionMode | str = ExecutionMode.SHADOW,
+    trading_date: date,
     cycle_id: str | None = None,
     acquisition: MarketDataAcquisitionProfile = CURRENT_ACQUISITION,
     known_client_keys: set[str] | None = None,
@@ -120,7 +143,13 @@ def run_cycle(
     market_context: MarketContext | None = None,
     now: datetime | None = None,
 ) -> CycleResult:
-    """Evaluate one symbol under one strategy."""
+    """Evaluate one symbol under one strategy.
+
+    `trading_date` is required and has no default. It is the date the
+    acquisition profile built every `start_time` from, so it decided which
+    bars the broker computed the inputs over. Defaulting it to today would
+    make a replayed cycle claim inputs it never had.
+    """
     current = now or datetime.now(UTC)
     cid = cycle_id or uuid.uuid4().hex[:12]
 
@@ -137,12 +166,27 @@ def run_cycle(
             f"{sorted(m.value for m in SELECTABLE_EXECUTION_MODES)}"
         )
 
+    # Resolved here, before anything else happens, so a mode with no executor
+    # vocabulary stops the cycle instead of reaching payload construction and
+    # picking a branch by elimination. Deliberately independent of the check
+    # above: enabling a mode and teaching the executor what it means are two
+    # separate decisions, and neither should imply the other.
+    try:
+        plan_mode = _PLAN_MODE[execution_mode]
+    except KeyError:
+        raise NotImplementedError(
+            f"execution mode {execution_mode.value!r} has no executor "
+            "vocabulary; add it to _PLAN_MODE deliberately, having decided "
+            "what it means for payload construction and the protection floor"
+        ) from None
+
     result = CycleResult(
         cycle_id=cid,
         symbol=snapshot.symbol,
         strategy=strategy_name,
         outcome=CycleOutcome.NO_SIGNAL,
         mode=execution_mode,
+        trading_date=trading_date,
         acquisition=acquisition,
         market_context=market_context,
     )
@@ -242,12 +286,7 @@ def run_cycle(
             max_spread_pct=config.risk.max_spread_pct,
             max_price_drift_pct=config.risk.max_price_drift_pct,
             allow_unprotected_shadow_entries=config.risk.allow_unprotected_shadow_entries,
-            # Anything that is not shadow takes the non-shadow branch, which
-            # is where `build_order_payload` applies the structural protection
-            # floor. Written this way round on purpose: matching LIVE by name
-            # would route a mode added later -- APPROVAL, say -- into "shadow"
-            # and quietly past the one check that has no config override.
-            mode="shadow" if execution_mode is ExecutionMode.SHADOW else "live",
+            mode=plan_mode,
             known_client_keys=known_client_keys,
             now=current,
         )
@@ -303,6 +342,7 @@ def _build_audit(
     market = result.market_context
     return AuditEntry(
         mode=result.mode,
+        trading_date=result.trading_date,
         acquisition_profile_ref=result.acquisition.profile_ref,
         acquisition_config_fingerprint=result.acquisition.content_fingerprint,
         protection_state=plan.protection if plan is not None else None,

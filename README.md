@@ -507,6 +507,7 @@ things are recorded because none of them can be inferred afterwards:
 |---|---|
 | `scan_runs.trading_date` | Selection is seeded by trading date. `started_at` is a UTC instant, and a run starting 01:30 UTC seeds from the *previous* trading date — so deriving it back is wrong in exactly the case worth auditing. |
 | `audit.mode` | Five of seven outcomes produce neither a trade nor an execution plan in *any* mode. There is nothing for an inference to read. |
+| `audit.trading_date` | Every ranged request is `trading_date - lookback`, so this decided which bars the broker computed over. `captured_at` says when the snapshot was assembled - a different question that coincides only by habit. |
 | `audit.acquisition_profile_ref` + fingerprint | Says which pinned request contract produced the inputs. Without it a decision made on 30 bars of RSI warm-up is indistinguishable from the same decision made on 300. |
 
 `market/acquisition.py` pins the request shape — interval, `bounds`,
@@ -524,8 +525,24 @@ of the range, so a short range returns a genuinely different number; SMA is a
 finite window and is immune, which is why the problem stayed invisible until
 three workers fetched 30, 57, and 265 points for one indicator.
 
+`evaluate` **requires** all three in the bundle and refuses one whose contract
+does not match the profile in force - missing, blank, stale, or wrong all fail
+closed, and nothing is journalled. The payloads are never re-stamped: a bundle
+fetched under different lookbacks genuinely is not what the current contract
+would have asked for, and recording it as such would be a false provenance
+claim, which reads back exactly like a true one. There is no override flag,
+because it would be reached for on precisely the day it should not be.
+
+One thing this does *not* buy: omitting `end_time` makes the generated request
+byte-identical on every regeneration, but the broker's effective upper bound is
+request-time dependent, so the same request on two days can return different
+data. Replay rests on the persisted `snapshot_json` - the contract says what
+was asked for, the snapshot says what came back, and neither substitutes for
+the other.
+
 Old journals migrate additively and keep an honest `NULL` in the new columns.
-Back-filling them would assert a mode and a date nobody verified.
+Back-filling them would assert a mode, a date, and a contract nobody
+verified.
 
 ## Next
 

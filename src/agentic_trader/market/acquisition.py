@@ -281,11 +281,25 @@ class MarketDataAcquisitionProfile(CapabilityProfile):
     end_time_policy: str = "omitted_defaults_to_request_time"
     """How `end_time` is handled, fingerprinted because it is a real choice.
 
-    It is omitted. The evaluation needs the current bar, so pinning an end
-    would exclude it and change the decision. Omitting is also the *more*
-    deterministic option for the spec itself: an absent key is identical on
-    every regeneration, whereas an explicit "now" would make the same
-    (symbol, date, profile) produce a different request on every call.
+    It is omitted, and the broker then treats the range as ending at request
+    time. Be precise about what that does and does not buy:
+
+    - **The generated request is deterministic.** The parameter set for a given
+      (symbol, trading_date, profile) is byte-identical on every regeneration.
+      An explicit "now" would not be: it would differ on every call.
+    - **The broker's effective upper bound is not.** It is request-time
+      dependent by construction, so the same request issued on two days can
+      return different data. Omitting `end_time` does not make the *response*
+      wall-clock-independent, and nothing here should be read as claiming it.
+    - **Replay does not depend on either.** Historical decisions replay from
+      the persisted `snapshot_json`, which captures what actually came back.
+      The request spec establishes *what was asked for*; the snapshot
+      establishes what was received. Both are needed, and neither substitutes
+      for the other.
+
+    The evaluation needs the current bar, so pinning an end would exclude it
+    and change the decision. Revisiting that is a deliberate contract change,
+    not a tidy-up.
     """
 
     #: Fields carried for readability that must never reach the fingerprint.

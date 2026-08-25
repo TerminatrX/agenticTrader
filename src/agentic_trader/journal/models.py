@@ -15,7 +15,7 @@ eventually be revised into agreeing with whatever you hoped happened.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -55,15 +55,28 @@ class AuditEntry(BaseModel):
     # nothing to go on at all.
     mode: ExecutionMode
 
+    # The date the acquisition contract's ranged requests were built from.
+    # Every `start_time` is `trading_date - lookback`, so this is the input
+    # that decided which bars the broker computed over.
+    #
+    # Not `occurred_at`, not `snapshot.captured_at`, and certainly not today.
+    # `captured_at` says when the snapshot was assembled; it answers a
+    # different question and coincides with this only by habit. The exact
+    # input is known at the boundary, so the input is what gets stored.
+    trading_date: date
+
     # Which pinned request contract produced the inputs behind this decision.
     # The snapshot records what came back; these record what was asked for, and
     # without them a replay cannot tell a decision made on 30 bars of RSI
     # warm-up from the same decision made on 300.
     #
-    # Optional because rows written before the contract existed genuinely have
-    # none. Every new write carries them.
-    acquisition_profile_ref: str | None = None
-    acquisition_config_fingerprint: str | None = None
+    # Required, with no defaults. The *columns* are nullable because rows
+    # written before the contract existed genuinely have none, but this model
+    # describes a NEW write -- and a default here would let a caller omit the
+    # provenance and have the record claim the current contract anyway, which
+    # is precisely the substitution the boundary check exists to prevent.
+    acquisition_profile_ref: str
+    acquisition_config_fingerprint: str
 
     reference_price: Decimal | None = None
     confidence: float = 0.0

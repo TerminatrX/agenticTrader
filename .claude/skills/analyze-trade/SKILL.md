@@ -73,9 +73,15 @@ Two things worth knowing rather than merely obeying:
   `latest` alone disables that check in silence — the one that separates buying
   a pullback from catching a falling knife.
 
-Record `acquisition_profile_ref` and `acquisition_config_fingerprint` from the
-spec output; `evaluate` journals them so a stored decision names the contract
-its inputs came from.
+Keep the `acquisition-spec` output. Its `trading_date`,
+`acquisition_profile_ref`, and `acquisition_config_fingerprint` go into the
+bundle in step 3 **verbatim** — `evaluate` requires all three and refuses a
+bundle whose contract does not match the one in force.
+
+Do not hand-edit them to make a stale bundle pass. The refusal means the
+payloads were fetched under different lookbacks, so they are genuinely not what
+the current contract would have asked for; re-run `acquisition-spec` and
+re-fetch.
 
 ### 3. Build the bundle
 
@@ -88,6 +94,11 @@ your positions, so they must never be written into the project tree.
   "symbol": "AAPL",
   "mode": "shadow",
   "strategy": "trend_pullback",
+
+  "trading_date": "<--date you passed to acquisition-spec>",
+  "acquisition_profile_ref": "<verbatim from acquisition-spec>",
+  "acquisition_config_fingerprint": "<verbatim from acquisition-spec>",
+
   "account": {
     "account_number": "<from get_accounts, agentic_allowed:true>",
     "is_cash_account": true,

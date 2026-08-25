@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS audit (
     outcome         TEXT NOT NULL,
     -- The execution context, stored rather than inferred. See AuditEntry.mode.
     mode            TEXT,
+    -- The acquisition date every ranged request was built from. Distinct from
+    -- occurred_at, which is when the cycle ran.
+    trading_date    TEXT,
     -- The pinned request contract behind this decision's inputs.
     acquisition_profile_ref TEXT,
     acquisition_config_fingerprint TEXT,
@@ -204,6 +207,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         # 'shadow' would retroactively assert something nobody verified. New
         # writes always carry it -- AuditEntry.mode is required.
         "mode": "TEXT",
+        "trading_date": "TEXT",
         "acquisition_profile_ref": "TEXT",
         "acquisition_config_fingerprint": "TEXT",
         "original_confidence": "REAL",
@@ -282,7 +286,8 @@ class JournalRepository:
             conn.execute(
                 """INSERT INTO audit (
                     cycle_id, occurred_at, symbol, strategy, outcome,
-                    mode, acquisition_profile_ref, acquisition_config_fingerprint,
+                    mode, trading_date,
+                    acquisition_profile_ref, acquisition_config_fingerprint,
                     reference_price, confidence, signal_strength,
                     original_confidence, adjusted_confidence,
                     thesis, invalidation_reason,
@@ -290,7 +295,7 @@ class JournalRepository:
                     market_regime, market_context,
                     reasons, failed_conditions, risk_breaches, critic_notes,
                     snapshot_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     entry.cycle_id,
                     entry.occurred_at.isoformat(),
@@ -298,6 +303,7 @@ class JournalRepository:
                     entry.strategy,
                     entry.outcome.value,
                     entry.mode.value,
+                    entry.trading_date.isoformat(),
                     entry.acquisition_profile_ref,
                     entry.acquisition_config_fingerprint,
                     _s(entry.reference_price),
@@ -667,6 +673,7 @@ def _audit_row(row: sqlite3.Row) -> dict[str, Any]:
         "strategy": row["strategy"],
         "outcome": row["outcome"],
         "mode": row["mode"],
+        "trading_date": row["trading_date"],
         "acquisition_profile_ref": row["acquisition_profile_ref"],
         "acquisition_config_fingerprint": row["acquisition_config_fingerprint"],
         "reference_price": row["reference_price"],
