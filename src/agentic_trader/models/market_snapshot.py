@@ -29,6 +29,38 @@ class Bar(BaseModel):
     interpolated: bool = False
 
 
+class IndicatorSource(StrEnum):
+    """Where a snapshot's indicator values actually came from."""
+
+    BROKER = "broker"
+    """Returned by `get_equity_technical_indicators`, one call per indicator."""
+
+    LOCAL = "local"
+    """Computed here from the authoritative historical bars in this snapshot."""
+
+
+class IndicatorProvenance(BaseModel):
+    """Which contract produced these indicator values.
+
+    Once indicators are derived rather than fetched, "which acquisition version
+    was in force" no longer explains how bars became RSI. The arithmetic, the
+    seed conventions, the per-indicator source windows and the completed-bar
+    rule are all decision-affecting, and they live in a profile of their own --
+    so the snapshot records that profile rather than leaving a reader to infer
+    it from an acquisition version number.
+
+    Carried on `Indicators`, so it lands in `snapshot_json` automatically and
+    needs no journal column. Nothing queries provenance across rows today; when
+    something does, that is the moment to justify an audit column, not before.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    source: IndicatorSource
+    profile_ref: str
+    profile_fingerprint: str
+
+
 class Indicators(BaseModel):
     """Technical state as of the last completed bar.
 
@@ -41,6 +73,11 @@ class Indicators(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     as_of: datetime | None = None
+
+    # `None` on rows written before provenance existed. Deliberately not
+    # defaulted to BROKER: those snapshots predate the distinction, and
+    # stamping them with a source nobody recorded would invent evidence.
+    provenance: IndicatorProvenance | None = None
 
     rsi_14: float | None = None
     rsi_prev: float | None = None
