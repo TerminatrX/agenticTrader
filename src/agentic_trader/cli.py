@@ -44,8 +44,8 @@ The `evaluate` bundle:
       // payloads are genuinely not what the current profile would have asked
       // for, and recording them as such would be a false provenance claim.
       "trading_date": "2026-08-22",
-      "acquisition_profile_ref": "agentic-acquisition@v2-2026-08-24",
-      "acquisition_config_fingerprint": "1c5c71d5...",
+      "acquisition_profile_ref": "agentic-acquisition@v3-2026-08-25",
+      "acquisition_config_fingerprint": "1aeb6fe9...",
 
       "account": { ...AccountState... },
       "payloads": {

@@ -44,9 +44,9 @@ DAY = date(2026, 8, 18)
 
 # Pinned identity. A change to any request semantics must land here as a
 # deliberate edit, in the same commit as the change that caused it.
-ACQUISITION_REF = "agentic-acquisition@v2-2026-08-24"
+ACQUISITION_REF = "agentic-acquisition@v3-2026-08-25"
 ACQUISITION_FINGERPRINT = (
-    "1c5c71d594495a6fc8b69d0a2acfef1a3bfae364477659cdfff971a2e4eedf5c"
+    "1aeb6fe90b857bd862950b3e1b9d1a1a95ffd7e282fe5a1b998fb5a790e52b93"
 )
 
 
@@ -499,6 +499,7 @@ def test_changing_the_derived_point_requirement_changes_the_fingerprint():
         ("adjustment_type", "none"),
         ("lookback_calendar_days", 400),
         ("required_bars", 50),
+        ("derivation_bars", 300),
     ],
 )
 def test_changing_historical_request_semantics_changes_the_fingerprint(field, value):
@@ -899,7 +900,14 @@ def test_a_stored_cycle_independently_identifies_its_own_context(
 def test_a_reloaded_snapshot_replays_using_the_recorded_decision_time(
     tmp_path, bullish_pullback_snapshot, account, risk_config
 ):
-    """(Q, P) Replay from the journal alone -- no broker, no wall clock.
+    """(Q, P) Replay the market-data side of a decision -- no broker, no wall
+    clock -- given the same normalized account and config inputs.
+
+    Scoped deliberately. The journal preserves the snapshot, trading date,
+    acquisition identity, execution mode and decision timestamp; `AccountState`
+    and `AppConfig` are still supplied from outside the row, and both are
+    decision-significant. This is not a standalone event store, and calling it
+    one would overstate what a stored row can answer.
 
     The clock the replay uses is `audit.occurred_at`, because that is the one
     the original cycle used. `run_cycle` threads `now` into the risk gate's

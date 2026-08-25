@@ -95,12 +95,18 @@ Claude owns the loop. Python owns the decisions.
 call can place an order. The only side effects are journal writes.
 
 The Python core is a pure function from (market payloads + account state) to a
-decision. That makes every decision reproducible, from the journal rather than
-from the bundle: the audit entry persists the snapshot (what came back), the
-acquisition contract and trading date (what was requested), and `occurred_at`
-(when it was evaluated). Replay needs all three — `now` feeds quote age, drift
-and the risk gate's `as_of`, so re-running a saved bundle today is evaluated as
-today rather than reproducing the original.
+decision. That makes the market-data side of every decision reproducible, from
+the journal rather than from the bundle: the audit entry persists the snapshot
+(what came back), the acquisition contract and trading date (what was
+requested), and `occurred_at` (when it was evaluated). Replay needs all three —
+`now` feeds quote age, drift and the risk gate's `as_of`, so re-running a saved
+bundle today is evaluated as today rather than reproducing the original.
+
+It is **not** a standalone event store. `AccountState` and `AppConfig` are
+decision-significant — buying power, open positions, realized daily P&L, sector
+exposure, every risk limit — and neither is persisted on the audit row. A
+replay supplies them from outside. Say "replay given the same normalized
+account and config inputs", never "replay from the journal alone".
 
 ### The seam
 
@@ -141,6 +147,8 @@ restate a lookback in prose; point at the profile.
 | `risk/engine.py` | The only path from signal to executable order |
 | `agents/critic.py` | Mechanical re-derivation of the trade |
 | `market/acquisition.py` | `MarketDataAcquisitionProfile` — the pinned request contract. **What to ask for, never what came back** |
+| `market/local_indicators.py` | Deterministic RSI/MACD/SMA/ATR from bars. **Diagnostics only — broker values decide** |
+| `market/indicator_comparison.py` | Local-vs-broker equivalence measurement. **Never consulted by a decision** |
 | `agents/orchestrator.py` | One cycle, as a pure function |
 | `execution/executor.py` | Builds the payload. **Does not submit** |
 | `execution/shadow_executor.py` | Simulated fills with pessimistic slippage |

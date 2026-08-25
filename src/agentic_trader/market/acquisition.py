@@ -134,8 +134,20 @@ class HistoricalsSpec:
     #: takes `bars[-20:]`; the intrabar stop check takes `bars[-1]`.
     required_bars: int
 
+    derivation_bars: int = 0
+    """Bars needed to derive the full indicator set locally, if anything does.
+
+    Kept separate from `required_bars` rather than overloading it, because the
+    two answer different questions and move for different reasons: one is what
+    the strategy reads out of the bar series, the other is what an indicator
+    recurrence needs to converge. Zero means nothing derives from these bars.
+
+    Derived, not chosen -- see `local_indicators.bar_requirements()`, which
+    computes it from the seed-decay arithmetic of each recurrence.
+    """
+
     def minimum_calendar_days(self) -> int:
-        return _required_calendar_days(self.required_bars)
+        return _required_calendar_days(max(self.required_bars, self.derivation_bars))
 
     def request(self, symbol: str, trading_date: date) -> dict[str, Any]:
         return {
@@ -154,6 +166,7 @@ class HistoricalsSpec:
             f"historicals.adjustment_type={self.adjustment_type}",
             f"historicals.lookback_calendar_days={self.lookback_calendar_days}",
             f"historicals.required_bars={self.required_bars}",
+            f"historicals.derivation_bars={self.derivation_bars}",
         )
 
 
@@ -318,7 +331,8 @@ class MarketDataAcquisitionProfile(CapabilityProfile):
       the persisted `snapshot_json`, which captures what actually came back.
       The request spec establishes *what was asked for*; the snapshot
       establishes what was received. Both are needed, and neither substitutes
-      for the other.
+      for the other -- and both together still describe only the market-data
+      side, since account state and risk config are supplied externally.
 
     The evaluation needs the current bar, so pinning an end would exclude it
     and change the decision. Revisiting that is a deliberate contract change,
@@ -454,8 +468,8 @@ _MACD = IndicatorSpec(
 
 CURRENT_ACQUISITION = MarketDataAcquisitionProfile(
     profile_id="agentic-acquisition",
-    version="v2-2026-08-24",
-    as_of=date(2026, 8, 24),
+    version="v3-2026-08-25",
+    as_of=date(2026, 8, 25),
     historicals=HistoricalsSpec(
         tool="get_equity_historicals",
         # Explicit, never omitted -- an omitted interval lets the server pick
@@ -472,7 +486,13 @@ CURRENT_ACQUISITION = MarketDataAcquisitionProfile(
         # systematic mismatch nobody would see.
         adjustment_type="split",
         required_bars=20,
-        lookback_calendar_days=_pinned_lookback(20),
+        # The local-indicator validation milestone derives all six indicators
+        # from these bars, and MACD -- not SMA200, as one might assume -- is the
+        # binding constraint at 277 bars: the signal EMA smooths an
+        # already-smoothed line, so the two seeds compose.
+        # `local_indicators.bar_requirements()` computes it.
+        derivation_bars=277,
+        lookback_calendar_days=_pinned_lookback(277),
     ),
     indicators=(
         _wilder("rsi", "rsi", 14, "last:2", 2),

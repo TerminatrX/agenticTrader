@@ -1,0 +1,181 @@
+{
+  "milestone": "local-indicator-validation",
+  "generated": "2026-08-25",
+  "verdict": "LOCAL_INDICATORS_EQUIVALENT",
+  "scope": "Equivalence measured only. Broker indicators remain the authoritative decision inputs; no local value reaches MarketSnapshot on this branch.",
+  "acquisition_profile_ref": "agentic-acquisition@v3-2026-08-25",
+  "acquisition_config_fingerprint": "1aeb6fe90b857bd862950b3e1b9d1a1a95ffd7e282fe5a1b998fb5a790e52b93",
+  "inputs": {
+    "symbols": [
+      "AAPL",
+      "CAT",
+      "CRWD",
+      "F",
+      "JPM",
+      "KO",
+      "NEE",
+      "NVDA",
+      "PFE",
+      "TSLA",
+      "WMT",
+      "XOM"
+    ],
+    "symbol_count": 12,
+    "bars_per_symbol": 289,
+    "bar_window": "2025-07-01..2026-08-24",
+    "indicator_points_per_symbol": 30,
+    "indicator_window": "2026-07-14..2026-08-24",
+    "interval": "day",
+    "bounds": "regular",
+    "adjustment_type": "split",
+    "note": "Both sides computed over the identical 289-bar regular-session window, so the comparison isolates formula differences from range differences."
+  },
+  "bar_requirements": {
+    "sma_20": {
+      "minimum": 20,
+      "converged": 20,
+      "note": "finite window; no seed to forget"
+    },
+    "sma_50": {
+      "minimum": 50,
+      "converged": 50,
+      "note": "finite window; no seed to forget"
+    },
+    "sma_200": {
+      "minimum": 200,
+      "converged": 200,
+      "note": "finite window; no seed to forget"
+    },
+    "rsi_14": {
+      "minimum": 16,
+      "converged": 203,
+      "note": "Wilder alpha=1/14; seed spent after 187 updates"
+    },
+    "atr_14": {
+      "minimum": 15,
+      "converged": 202,
+      "note": "Wilder alpha=1/14; seed spent after 187 updates"
+    },
+    "macd": {
+      "minimum": 35,
+      "converged": 277,
+      "note": "EMA alpha=2/27 and 2/10; seeds spent after 180 and 62 updates, and they compose because the signal smooths an already-smoothed series"
+    }
+  },
+  "binding_requirement_bars": 277,
+  "numeric": {
+    "atr_14": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.00000001766255300774888551",
+      "median_abs_error": "0.000000000328463771727219876",
+      "max_rel_error": "0.0000000009924154634059698366963536804",
+      "max_abs_error_first_value_seed": "0.00000001766255300774888551",
+      "proposed_tolerance": "0.000001",
+      "result": "PASS"
+    },
+    "macd": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.0000000463023097479422082",
+      "median_abs_error": "0.00000000376557361581282583",
+      "max_rel_error": "0.000002459115038735562282593451092",
+      "max_abs_error_first_value_seed": "0.0000000615650082603297291",
+      "proposed_tolerance": "0.00001",
+      "result": "PASS"
+    },
+    "macd_hist": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.000000021789287594122291093",
+      "median_abs_error": "0.0000000017720297365132843647",
+      "max_rel_error": "0.000001861183666076107767090821137",
+      "max_abs_error_first_value_seed": "0.000000028971733956272173171",
+      "proposed_tolerance": "0.00001",
+      "result": "PASS"
+    },
+    "macd_signal": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.000000068091597312064499293",
+      "median_abs_error": "0.00000000553760336732611019470",
+      "max_rel_error": "0.000001081069621717352586983951397",
+      "max_abs_error_first_value_seed": "0.000000090536742186601902271",
+      "proposed_tolerance": "0.00001",
+      "result": "PASS"
+    },
+    "rsi_14": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.00000012038464308417148490",
+      "median_abs_error": "0.000000012717788540799666365",
+      "max_rel_error": "0.000000001855097910646831248522010162",
+      "max_abs_error_first_value_seed": "0.00000012038464308417148490",
+      "proposed_tolerance": "0.0001",
+      "result": "PASS"
+    },
+    "sma_20": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.0000000000004",
+      "median_abs_error": "0.00000000000005",
+      "max_rel_error": "0.000000000000001722619913486202867890215782",
+      "max_abs_error_first_value_seed": "0.0000000000004",
+      "proposed_tolerance": "0.000001",
+      "result": "PASS"
+    },
+    "sma_200": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.0000000000004",
+      "median_abs_error": "0.00000000000004",
+      "max_rel_error": "0.000000000000002854453146720612561229866031",
+      "max_abs_error_first_value_seed": "0.0000000000004",
+      "proposed_tolerance": "0.000001",
+      "result": "PASS"
+    },
+    "sma_50": {
+      "compared": 360,
+      "missing": 0,
+      "max_abs_error": "0.0000000000004",
+      "median_abs_error": "0.00000000000006",
+      "max_rel_error": "0.000000000000001096330144474387640774430593",
+      "max_abs_error_first_value_seed": "0.0000000000004",
+      "proposed_tolerance": "0.000001",
+      "result": "PASS"
+    }
+  },
+  "decision_equivalence": {
+    "comparisons": 348,
+    "skipped_prev_outside_broker_window": 12,
+    "disagreements": {},
+    "total_disagreements": 0,
+    "result": "PASS",
+    "note": "Flags compared only where both sides could compute the previous bar. An earlier pass counted 24 disagreements; all were the earliest point of each trimmed last:30 series, where the broker has no previous value and the local side does. That was a harness artifact, not a disagreement."
+  },
+  "atr_economics": {
+    "comparisons": 348,
+    "max_stop_price_diff": "0.00",
+    "max_notional_rel_diff": "0",
+    "median_notional_rel_diff": "0",
+    "basis_disagreements": 0,
+    "tradability_disagreements": 0
+  },
+  "seed_convention": {
+    "tested": [
+      "sma",
+      "first_value"
+    ],
+    "decision_disagreements_either_way": 0,
+    "note": "Both conventions agree on every decision flag. SMA seeding is marginally closer numerically (macd max abs 4.6e-8 vs 6.2e-8), which is weak evidence the provider seeds the same way, but the difference is near float64 round-trip and is not conclusive."
+  },
+  "production_lookback_finding": {
+    "issue": "The pinned per-indicator broker lookbacks are shorter than the convergence requirement: RSI and ATR request 180 calendar days (~124 bars) against 203 and 202 needed.",
+    "measured_drift_vs_full_window": {
+      "rsi_points_max": "5.772e-03",
+      "macd_histogram_max": "4.106e-04"
+    },
+    "implication": "Lookback, not formula, is the dominant source of variation -- roughly four orders of magnitude above the local-vs-broker agreement error. Cutover would therefore change values slightly, toward better convergence, and needs before/after decision parity tests."
+  },
+  "conclusion": "All eight fields agree to within float64 round-trip on identical inputs, and all ten decision flags agree on every comparable observation. The residuals are consistent with the provider computing in float64 while this implementation computes in Decimal, not with any formula difference. Equivalence is established for the sampled window; replacement remains a separate reviewed milestone."
+}
