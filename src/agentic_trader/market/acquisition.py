@@ -468,7 +468,7 @@ _MACD = IndicatorSpec(
 
 CURRENT_ACQUISITION = MarketDataAcquisitionProfile(
     profile_id="agentic-acquisition",
-    version="v3-2026-08-25",
+    version="v4-2026-08-25",
     as_of=date(2026, 8, 25),
     historicals=HistoricalsSpec(
         tool="get_equity_historicals",
@@ -486,22 +486,24 @@ CURRENT_ACQUISITION = MarketDataAcquisitionProfile(
         # systematic mismatch nobody would see.
         adjustment_type="split",
         required_bars=20,
-        # The local-indicator validation milestone derives all six indicators
-        # from these bars, and MACD -- not SMA200, as one might assume -- is the
-        # binding constraint at 277 bars: the signal EMA smooths an
-        # already-smoothed line, so the two seeds compose.
-        # `local_indicators.bar_requirements()` computes it.
+        # These bars are now the sole source of every indicator, so the
+        # envelope has to cover every derivation window at once. It is sized by
+        # the converged requirement (MACD at 277 bars -- not SMA200, as one
+        # might assume, because the signal EMA smooths an already-smoothed line
+        # and the two seeds compose) rather than by the legacy windows, which
+        # are shorter. Keeping the larger envelope preserves the capacity a
+        # future convergence milestone would need without changing what the
+        # current derivation reads.
         derivation_bars=277,
         lookback_calendar_days=_pinned_lookback(277),
     ),
-    indicators=(
-        _wilder("rsi", "rsi", 14, "last:2", 2),
-        _MACD,
-        _sma("sma_20", 20),
-        _sma("sma_50", 50),
-        _sma("sma_200", 200),
-        _wilder("atr", "atr", 14, "latest", 1),
-    ),
+    # Empty since v4. All six indicators are derived from the historicals
+    # above by `indicator_derivation`, which reproduces the windows these calls
+    # used to request, so the change is a change of source rather than of
+    # value. The specs are gone rather than disabled: a spec left behind is a
+    # spec somebody re-enables, and two live paths would mean two production
+    # semantics.
+    indicators=(),
     quote=SingleCallSpec(
         label="quote",
         tool="get_equity_quotes",
@@ -551,10 +553,12 @@ every snapshot through `EarningsAssessment.profile_ref`. Folding that ref in
 would couple two contracts that move for different reasons and force an
 acquisition bump every time an earnings claim was refined.
 
-The historicals lookback is sized for what the deterministic core reads today
-(20 bars). The local-indicator milestone will compute SMA200 from these bars
-and will need roughly 200 -- that is a real contract change and should arrive
-as a version bump, not as a quiet widening.
+The historicals lookback is sized for local derivation, not for what the core
+reads directly: since v4 these bars are the sole source of every indicator, and
+the envelope covers the converged requirement (277 bars) even though the
+current derivation windows are shorter. That headroom is deliberate -- it is
+the capacity a future convergence milestone would need, kept without changing
+what today's derivation reads.
 """
 
 __all__ = [

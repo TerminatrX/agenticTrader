@@ -76,7 +76,8 @@ Claude owns the loop. Python owns the decisions.
   Claude (this agent)                    Python core
   ───────────────────                    ───────────
   MCP: fetch quotes, bars,
-       indicators, earnings   ──────►    build_snapshot()
+       fundamentals, earnings ──────►    build_snapshot()
+                                         (indicators derived from bars)
                                               │
                                          strategy.evaluate()   -> Signal
                                               │
@@ -147,7 +148,8 @@ restate a lookback in prose; point at the profile.
 | `risk/engine.py` | The only path from signal to executable order |
 | `agents/critic.py` | Mechanical re-derivation of the trade |
 | `market/acquisition.py` | `MarketDataAcquisitionProfile` — the pinned request contract. **What to ask for, never what came back** |
-| `market/local_indicators.py` | Deterministic RSI/MACD/SMA/ATR from bars. **Diagnostics only — broker values decide** |
+| `market/local_indicators.py` | Deterministic RSI/MACD/SMA/ATR arithmetic |
+| `market/indicator_derivation.py` | Bars → indicators. **The decision inputs since v4** |
 | `market/indicator_comparison.py` | Local-vs-broker equivalence measurement, plus the pinned validation request contract. **Never consulted by a decision** |
 | `agents/orchestrator.py` | One cycle, as a pure function |
 | `execution/executor.py` | Builds the payload. **Does not submit** |

@@ -499,7 +499,7 @@ tests/
   settings.json  wires the hook (tracked, so protection travels with the repo)
 ```
 
-## Local indicators — measured, not adopted
+## Local indicators — now the decision inputs
 
 The six broker indicator endpoints all derive from bars we already fetch, so
 computing them locally would cut roughly two-thirds of the per-symbol calls. The
@@ -511,10 +511,17 @@ formula, and an opaque dependency answers that with another opaque dependency.
 Every seed and recurrence is stated in the docstring and pinned by a
 hand-calculable test whose oracle is arithmetic, never the broker.
 
-**They are diagnostics.** Nothing in `strategies/`, `risk/`, the critic, or
-`build_snapshot` imports them, and a test enforces that. Broker values remain
-the authoritative decision inputs until a separate cutover milestone says
-otherwise.
+**They are the decision inputs as of `agentic-acquisition@v4`.** The six
+`get_equity_technical_indicators` calls are gone; `indicator_derivation` cuts
+each indicator from the bars the snapshot already carries, over the same
+windows those calls used to request. Per symbol that is four market-data calls
+instead of ten.
+
+The cutover was deliberately *semantic-preserving*: it changed where a value
+comes from, not what the value is. Adopting the longer converged windows is a
+separate decision, and the legacy windows are shorter than the convergence
+requirement on purpose — today's values carry that seed dependence, and
+reproducing it is what made the change attributable.
 
 ### How much history a recurrence needs
 

@@ -1,0 +1,359 @@
+{
+  "milestone": "local-indicator-cutover",
+  "generated": "2026-08-25",
+  "verdict": "LOCAL_INDICATOR_CUTOVER_PARITY",
+  "scope": "Semantic-preserving infrastructure change: six broker indicator calls replaced by local derivation from the single authoritative bar payload, over the same windows the broker calls requested. Full-420 converged semantics are deliberately NOT adopted.",
+  "contracts": {
+    "baseline_production": {
+      "ref": "agentic-acquisition@v3-2026-08-25",
+      "fingerprint": "1aeb6fe90b857bd862950b3e1b9d1a1a95ffd7e282fe5a1b998fb5a790e52b93",
+      "role": "what production was before this branch; six indicator calls"
+    },
+    "formula_equivalence_evidence": {
+      "ref": "local-indicator-comparison@v1-2026-08-25",
+      "fingerprint": "43cafd8ad390d7f25cc76d79d25118dff54bf14a5f7c346b3380d6ca194b1486",
+      "role": "prior milestone; one shared long window, answering whether the formulas agree on identical inputs"
+    },
+    "cutover_parity_comparison": {
+      "ref": "local-indicator-cutover-parity@v1-2026-08-25",
+      "fingerprint": "90234ad621e4230bcfb59424b5cc80e5aa6028871ce5570254614627337966ca",
+      "role": "this milestone's evidence; each indicator at its OWN v3 production range, output widened only to expose more comparison points. Output width cannot change a value: the endpoint computes over the range first and trims after.",
+      "semantics": {
+        "rsi": {
+          "lookback_calendar_days": 180,
+          "period": 14
+        },
+        "macd": {
+          "lookback_calendar_days": 210,
+          "fast_period": 12,
+          "slow_period": 26,
+          "signal_period": 9
+        },
+        "sma_20": {
+          "lookback_calendar_days": 90,
+          "period": 20
+        },
+        "sma_50": {
+          "lookback_calendar_days": 90,
+          "period": 50
+        },
+        "sma_200": {
+          "lookback_calendar_days": 330,
+          "period": 200
+        },
+        "atr": {
+          "lookback_calendar_days": 180,
+          "period": 14
+        },
+        "common": {
+          "interval": "day",
+          "bounds": "regular",
+          "adjustment_type": "split",
+          "output": "last:30",
+          "tool": "get_equity_technical_indicators"
+        }
+      },
+      "only_deviation_from_v3": "output widened from ['last:2', 'latest'] to last:30, purely to expose more comparison points; the endpoint computes over the range first and trims afterward, so it cannot change a value",
+      "ranges_source": "read programmatically from local-indicator-derivation rather than duplicated, so a moved window cannot leave this profile describing a run nobody made",
+      "note": "adjustment_type and start_time are not echoed by the endpoint, so they are attested from the pinned request rather than recovered from the response. A response proves what the provider computed, not the literal arguments sent."
+    },
+    "candidate_production": {
+      "ref": "agentic-acquisition@v4-2026-08-25",
+      "fingerprint": "eceedacc620fe4e94e63fbf536d08e0eca28294c1de82d14a989f3bc780467c6",
+      "role": "four market-data calls; no indicator endpoint"
+    },
+    "local_derivation": {
+      "ref": "local-indicator-derivation@v1-2026-08-25",
+      "fingerprint": "45f2d4fd3b7ca091bacf8d7cc61d2ef46758f6b401639381c115f5e81ec3764b",
+      "role": "how bars become indicators, and now the sole record of the legacy windows"
+    }
+  },
+  "completed_bar_policy": {
+    "rule": "exclude_bars_dated_on_or_after_trading_date",
+    "actionable_window": "regular market hours only",
+    "why_not_wall_clock": "build_order_payload sends market_hours=regular_hours unconditionally, and the broker restricts fractional and dollar-denominated orders -- every order this account size can place -- to type=market in regular hours. An indicator advancing after the close could never inform an order placed that day, so clock sensitivity would buy nothing and would make derivation depend on when a cycle ran.",
+    "observations_2026_08_25": [
+      "08:45 ET (pre-market): newest bar and newest indicator point both the prior session",
+      "16:28 ET (28 min after close): both still the prior session"
+    ],
+    "not_observed": "regular-hours behaviour; the in-progress bar case was never seen",
+    "consequence": "The rule is required rather than optional. The historicals guide states the newest close is not the settled one, and absence of a contrary observation is not evidence of absence on a path that feeds entries.",
+    "boundary": "an evening cycle excludes that day's now-final bar, which is what the broker endpoint was still doing 28 minutes after the close",
+    "if_after_hours_is_ever_supported": "needs a bounded post-close observation of when the endpoint advances -- not a guess"
+  },
+  "warm_up_finding": {
+    "problem": "Slicing the superset by timestamp reproduces the request boundary but not the values: the endpoint prepends warm-up before start_time so its first returned point lands AT the requested start. Literal-window RSI(14) on AAPL differed by 2.3e-03 points, 23x the tolerance the formula-equivalence milestone justified.",
+    "measured_effective_bars": {
+      "rsi_14": {
+        "literal": 124,
+        "effective": 139,
+        "prepend": 15,
+        "rule": "period+1"
+      },
+      "atr_14": {
+        "literal": 124,
+        "effective": 138,
+        "prepend": 14,
+        "rule": "period"
+      },
+      "macd": {
+        "literal": 145,
+        "effective": 179,
+        "prepend": 34,
+        "rule": "slow+signal-1"
+      },
+      "sma": {
+        "prepend": 0,
+        "rule": "finite window; unaffected"
+      }
+    },
+    "sma_exemption": "A finite window's last value cannot be moved by bars before its span -- SMA20 matched at 5e-14 with no prepend. Declaring one for consistency made SMA200 unsatisfiable inside the 420-day envelope, needing 199 bars before a boundary only 62 bars from the payload start, which is how the exemption was found.",
+    "status_after_cutover": "These are now OUR pinned semantics, not a live dependency. Production no longer calls the indicator endpoint, so a later change to Robinhood's warm-up policy cannot move a production value. They are empirical legacy-compatibility constants, not universal indicator mathematics."
+  },
+  "numeric_parity": {
+    "symbols": [
+      "AAPL",
+      "CAT",
+      "CRWD",
+      "F",
+      "JPM",
+      "KO",
+      "NEE",
+      "NVDA",
+      "PFE",
+      "TSLA",
+      "WMT",
+      "XOM"
+    ],
+    "symbol_count": 12,
+    "sessions_per_symbol": 30,
+    "comparison": "legacy-window local vs current production broker values",
+    "fields": [
+      {
+        "field": "atr_14",
+        "compared": 360,
+        "missing": 0,
+        "max_abs_error": "0.00000000000002450490548116",
+        "median_abs_error": "0.0000000000000015199109924535",
+        "max_rel_error": "0.000000000000002085314921458607565740793985",
+        "proposed_tolerance": "0.000001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      },
+      {
+        "field": "macd",
+        "compared": 360,
+        "missing": 0,
+        "max_abs_error": "0.0000000000001584354309210",
+        "median_abs_error": "0.00000000000001467815062189",
+        "max_rel_error": "0.000000000009764236722447697665659238655",
+        "proposed_tolerance": "0.00001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      },
+      {
+        "field": "macd_hist",
+        "compared": 360,
+        "missing": 0,
+        "max_abs_error": "0.00000000000012757377091555",
+        "median_abs_error": "0.0000000000000067993315018725",
+        "max_rel_error": "0.000000000006804694862069590944817222212",
+        "proposed_tolerance": "0.00001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      },
+      {
+        "field": "macd_signal",
+        "compared": 360,
+        "missing": 0,
+        "max_abs_error": "0.00000000000011581330469513",
+        "median_abs_error": "0.00000000000001082014245052285",
+        "max_rel_error": "0.0000000000008244490134192358985525218477",
+        "proposed_tolerance": "0.00001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      },
+      {
+        "field": "rsi_14",
+        "compared": 360,
+        "missing": 0,
+        "max_abs_error": "0.00000000000007786095683356",
+        "median_abs_error": "0.00000000000001211106725730",
+        "max_rel_error": "0.000000000000002231425427251252846581134140",
+        "proposed_tolerance": "0.0001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      },
+      {
+        "field": "sma_20",
+        "compared": 360,
+        "missing": 0,
+        "max_abs_error": "0.0000000000006",
+        "median_abs_error": "0.00000000000003",
+        "max_rel_error": "0.0000000000000007748033936388647385452242195",
+        "proposed_tolerance": "0.000001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      },
+      {
+        "field": "sma_200",
+        "compared": 336,
+        "missing": 0,
+        "max_abs_error": "0.0000000000005",
+        "median_abs_error": "0.00000000000007",
+        "max_rel_error": "0.000000000000002402938450447982156660997953",
+        "proposed_tolerance": "0.000001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      },
+      {
+        "field": "sma_50",
+        "compared": 156,
+        "missing": 0,
+        "max_abs_error": "0.00000000000027",
+        "median_abs_error": "0.00000000000003",
+        "max_rel_error": "0.000000000000001088241908921405985067243641",
+        "proposed_tolerance": "0.000001",
+        "tolerance_failures": 0,
+        "result": "PASS"
+      }
+    ],
+    "tolerance_failures": {},
+    "result": "PASS"
+  },
+  "decision_parity": {
+    "flag_comparisons": 144,
+    "flag_disagreements": {},
+    "atr_impact": {
+      "comparisons": 144,
+      "max_stop_price_diff": "0.00",
+      "max_notional_rel_diff": "0",
+      "median_notional_rel_diff": "0",
+      "basis_disagreements": 0,
+      "tradability_disagreements": 0
+    },
+    "harness_note": "Compared only where both sides carry every input; local SMA series are shorter because the provider prepends warm-up to fill its series, while a finite window needs none for its latest value. Production derives one latest value from the full envelope and is unaffected.",
+    "result": "PASS"
+  },
+  "call_reduction": {
+    "scope": "per symbol, market-data calls only",
+    "before": 10,
+    "after": 4,
+    "removed": "six get_equity_technical_indicators calls",
+    "retained": [
+      "get_equity_quotes",
+      "get_equity_historicals",
+      "get_equity_fundamentals",
+      "get_earnings_results"
+    ],
+    "not_counted": "account-level calls (get_accounts, get_portfolio, positions, orders) are unchanged by this milestone"
+  },
+  "not_adopted": {
+    "full_420_converged_semantics": "Deliberately out of scope. The legacy windows are shorter than the convergence requirement (RSI needs ~203 bars, MACD ~277), so the current values carry seed dependence -- the same dependence today's production values carry. Reproducing it is what makes this cutover attributable. Adopting the converged values is a behaviour change for a separate milestone with its own boundary analysis."
+  },
+  "execution_mode": "shadow only; no execution mode enabled by this work",
+  "cutover_parity_profile_ref": "local-indicator-cutover-parity@v1-2026-08-25",
+  "cutover_parity_profile_fingerprint": "90234ad621e4230bcfb59424b5cc80e5aa6028871ce5570254614627337966ca",
+  "acceptance_claim": {
+    "established": "observed production parity over the sampled window",
+    "not_established": "mathematical identity at every possible threshold value. Placed exactly astride a strict comparison and separated by the measured ~1e-13 residual, two implementations reach different conclusions -- that is arithmetic, not a defect. In the 144 measured pairs the closest RSI sat far more than 1e-6 from a band edge, so nothing came near enough for it to matter.",
+    "scope_note": "Observed and synthetic evidence are reported separately and must not be combined into one parity statistic: only the measured pairs speak to broker/local parity."
+  },
+  "session_admission": {
+    "enforced_by": "build_order_payload, structurally, before the protection floor",
+    "applies_to": "BUY and SELL alike -- the protection floor guards entries only",
+    "shadow": "exempt; out-of-hours evaluation is how analysis and replay work",
+    "calendar": "explicit NYSE rules: weekends, nine fixed and floating holidays, Good Friday from Easter, Juneteenth from 2022, and the 13:00 early closes. No new dependency; the DST rule is written out because zoneinfo needs a tz database this platform does not ship.",
+    "not_modelled": "unscheduled closures (weather, days of mourning, circuit-breaker halts). Those make it more permissive than reality, never less, which is part of why live execution still requires human confirmation.",
+    "determinism": "derived from the given instant; a replay with the recorded now agrees forever",
+    "pinned_calendar_years": [
+      2026,
+      2027,
+      2028
+    ],
+    "outside_the_horizon": "SessionStatus.UNSUPPORTED_CALENDAR, which is not open, so live payload construction refuses. The recurrence rules would still produce an answer for 2035; nobody has checked it against a published schedule, and confident extrapolation is the wrong failure mode for a live gate. Extending the horizon is a deliberate edit with its own tests.",
+    "verified_against_published_calendars": [
+      2026,
+      2027,
+      2028
+    ]
+  },
+  "observed_measured_pipeline_parity": {
+    "what_this_is": "144 measured broker/local value pairs -- genuinely different numbers, 0 bitwise identical -- run through the real strategy, risk engine, critic and execution path from otherwise identical inputs.",
+    "measured_pairs": 144,
+    "pairs_bitwise_identical": 0,
+    "no_position_context": {
+      "outcome_distribution": {
+        "no_signal": 106,
+        "watch": 32,
+        "rejected_by_risk": 6
+      },
+      "decision_disagreements": 0,
+      "reason_text_differences": 3
+    },
+    "held_position_context": {
+      "setup": "one share of the row's symbol, active stop at 95% of close",
+      "outcome_distribution": {
+        "no_signal": 78,
+        "rejected_by_critic": 57,
+        "shadow_filled": 9
+      },
+      "decision_disagreements": 0,
+      "reason_text_differences": 0,
+      "note": "nine real exits executed under the measured residual, so the exit path -- which reads SMA50 and RSI -- is genuinely exercised rather than merely reached"
+    },
+    "compared_fields": [
+      "CycleOutcome",
+      "signal strength/side/confidence",
+      "stop",
+      "target",
+      "failed_conditions",
+      "reasons",
+      "risk decision",
+      "approved_notional",
+      "breached_limits",
+      "critic verdict/blocks/concerns",
+      "plan presence",
+      "plan mode/cost/managed stop/managed target",
+      "protection state",
+      "should_submit"
+    ],
+    "reason_text_differences": {
+      "count": 3,
+      "of": 144,
+      "fields": [
+        "signal.reasons",
+        "signal.failed_conditions"
+      ],
+      "cause": "those strings format indicator values to two decimals, so a residual in the thirteenth decimal can round differently at a .xx5 edge -- e.g. SMA20 rendering as 14.31 against 14.30",
+      "decision_effect": "none; every decision field matched on all 144 pairs",
+      "why_reported": "no gate reads them, but the performance review does, so it is a real documented property rather than something to tolerate silently"
+    },
+    "result": "PASS"
+  },
+  "synthetic_threshold_sensitivity": {
+    "what_this_is": "Coverage, NOT broker/local parity. Both sides carry identical values and only provenance varies, or values are placed on a threshold by construction. Kept separate because describing it as parity would overstate the evidence.",
+    "provenance_invariance": {
+      "contexts": [
+        "entry",
+        "held-position exit",
+        "no-signal",
+        "seven boundary cases"
+      ],
+      "boundaries": [
+        "RSI 30",
+        "RSI 45",
+        "RSI 72",
+        "flat MACD histogram",
+        "price on SMA20",
+        "price on SMA200",
+        "ATR at the max-stop ceiling"
+      ],
+      "disagreements": 0
+    },
+    "exact_boundary_residual": {
+      "finding": "Placed exactly astride a strict comparison and separated by the measured ~1e-13 residual, broker and local DO reach different conclusions. That is arithmetic, not a defect -- any two implementations differing in the last bits behave this way.",
+      "why_it_did_not_occur": "no sampled RSI came within 1e-6 of a band edge, against a ~1e-13 residual"
+    }
+  }
+}

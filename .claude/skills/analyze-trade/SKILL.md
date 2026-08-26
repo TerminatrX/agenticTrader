@@ -44,10 +44,15 @@ to the user. Pass the full value to MCP tools and into the bundle unchanged.
 ```
 
 This emits, per symbol, the exact tool and the exact parameters for every call:
-`interval`, `bounds`, `adjustment_type`, `output`, and a `start_time` derived
-from the trading date. Make those calls **verbatim**. Do not round a
-`start_time`, widen a range, drop `bounds`, or substitute `latest` for
-`last:2`.
+`interval`, `bounds`, `adjustment_type`, and a `start_time` derived from the
+trading date. Make those calls **verbatim**. Do not round a `start_time`,
+widen a range, or drop `bounds`.
+
+**There are four market-data calls, not ten.** Since the v4 contract, RSI,
+MACD, SMA20/50/200 and ATR are computed from the historical bars rather than
+fetched — six `get_equity_technical_indicators` calls are gone. Do not call
+that endpoint; its results are not read, and the bundle has no place for
+them.
 
 The specification lives in `src/agentic_trader/market/acquisition.py`
 (`CURRENT_ACQUISITION`) and it is authoritative. This file deliberately does
@@ -58,9 +63,8 @@ start of the range — so those are *different numbers for the same indicator on
 the same day*. The decisions happened to match. That was luck.
 
 **Call exactly what the spec emits — nothing more, nothing less.** It covers
-the quote, historicals, fundamentals, earnings, and all six indicators, each
-with its full parameter set. If you find yourself deciding a parameter, stop:
-that decision belongs in the profile, not here.
+the quote, historicals, fundamentals and earnings. If you find yourself
+deciding a parameter, stop: that decision belongs in the profile, not here.
 
 Two account calls sit outside the market-data contract and are still needed:
 
@@ -68,14 +72,13 @@ Two account calls sit outside the market-data contract and are still needed:
 
 Two things worth knowing rather than merely obeying:
 
-- **ATR sets the stop distance, and the stop sets the position size.** Omitting
-  it does not just lose an input, it silently changes how much the system buys:
-  the strategy falls back to a flat percentage, records `stop_basis: flat_pct`,
-  and the critic penalizes it.
-- **`last:2` on RSI and MACD is load-bearing.** The strategy compares the
-  current bar to the prior one to decide whether momentum is stabilizing.
-  `latest` alone disables that check in silence — the one that separates buying
-  a pullback from catching a falling knife.
+- **The historical range is load-bearing.** Every indicator is cut from it, so
+  a short or reshaped `historicals` response does not merely lose bars — it
+  silently changes RSI, MACD and ATR, and can make SMA200 unavailable outright.
+  Send the range the spec asks for.
+- **ATR sets the stop distance, and the stop sets the position size.** If the
+  bars cannot support it, the strategy falls back to a flat percentage, records
+  `stop_basis: flat_pct`, and the critic penalizes it.
 
 Keep the `acquisition-spec` output. Its `trading_date`,
 `acquisition_profile_ref`, and `acquisition_config_fingerprint` go into the
@@ -115,9 +118,7 @@ your positions, so they must never be written into the project tree.
     "realized_pnl_today": "0"
   },
   "payloads": {
-    "quote": {}, "historicals": {}, "fundamentals": {}, "earnings": {},
-    "indicators": {"rsi": {}, "macd": {}, "sma_20": {}, "sma_50": {},
-                   "sma_200": {}, "atr": {}}
+    "quote": {}, "historicals": {}, "fundamentals": {}, "earnings": {}
   }
 }
 ```
