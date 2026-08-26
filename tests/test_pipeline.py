@@ -81,7 +81,7 @@ def test_snapshot_parses_broker_payloads():
         "aapl",  # lowercase input must normalize
         quote=QUOTE,
         historicals=HISTORICALS,
-        indicators={
+        broker_indicators={
             "rsi": _indicator("rsi", [{"begins_at": "2026-08-11T00:00:00Z", "value": 41.9},
                                       {"begins_at": "2026-08-12T00:00:00Z", "value": 40.2}]),
             "sma_20": _indicator("sma", [{"begins_at": "2026-08-12T00:00:00Z", "value": 321.22}]),

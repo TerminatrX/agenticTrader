@@ -44,9 +44,9 @@ DAY = date(2026, 8, 18)
 
 # Pinned identity. A change to any request semantics must land here as a
 # deliberate edit, in the same commit as the change that caused it.
-ACQUISITION_REF = "agentic-acquisition@v3-2026-08-25"
+ACQUISITION_REF = "agentic-acquisition@v4-2026-08-25"
 ACQUISITION_FINGERPRINT = (
-    "1aeb6fe90b857bd862950b3e1b9d1a1a95ffd7e282fe5a1b998fb5a790e52b93"
+    "eceedacc620fe4e94e63fbf536d08e0eca28294c1de82d14a989f3bc780467c6"
 )
 
 
@@ -448,52 +448,6 @@ def test_the_acquisition_profile_identity_is_pinned():
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("period", 21),                 # (J) RSI length
-        ("bounds", "extended"),         # (K) session semantics
-        ("interval", "week"),           # (L) request granularity
-        ("lookback_calendar_days", 60), # (L) request span
-        ("output", "latest"),           # (K) how many points come back
-        ("adjustment_type", "all"),     # corporate-action convention
-        ("key", "rsi_alt"),             # which snapshot slot it fills
-    ],
-)
-def test_changing_any_request_semantic_changes_the_fingerprint(field, value):
-    """(J, K, L) Every field that alters what is asked for, or what the answer
-    means, is inside the hash."""
-    original = CURRENT_ACQUISITION.spec_for("rsi")
-    assert getattr(original, field) != value, "test would prove nothing"
-
-    mutated = dataclasses.replace(original, **{field: value})
-    altered = dataclasses.replace(
-        CURRENT_ACQUISITION,
-        indicators=tuple(
-            mutated if s.key == "rsi" else s for s in CURRENT_ACQUISITION.indicators
-        ),
-    )
-    assert altered.content_fingerprint != CURRENT_ACQUISITION.content_fingerprint
-
-
-def test_changing_the_derived_point_requirement_changes_the_fingerprint():
-    """The endpoint accepts no point count, so these three are a *derivation*
-    rather than a parameter — but they decide the pinned lookback, so a change
-    to them is a change to the contract."""
-    for field in ("warmup_bars", "required_output_bars", "convergence_bars"):
-        mutated = dataclasses.replace(
-            CURRENT_ACQUISITION.spec_for("macd"),
-            **{field: getattr(CURRENT_ACQUISITION.spec_for("macd"), field) + 1},
-        )
-        altered = dataclasses.replace(
-            CURRENT_ACQUISITION,
-            indicators=tuple(
-                mutated if s.key == "macd" else s for s in CURRENT_ACQUISITION.indicators
-            ),
-        )
-        assert altered.content_fingerprint != CURRENT_ACQUISITION.content_fingerprint, field
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
         ("interval", "week"),
         ("bounds", "extended"),
         ("adjustment_type", "none"),
@@ -570,23 +524,6 @@ def test_the_end_time_policy_is_fingerprinted():
     assert altered.content_fingerprint != CURRENT_ACQUISITION.content_fingerprint
 
 
-def test_adding_or_removing_an_indicator_changes_the_fingerprint():
-    fewer = dataclasses.replace(
-        CURRENT_ACQUISITION,
-        indicators=tuple(s for s in CURRENT_ACQUISITION.indicators if s.key != "atr"),
-    )
-    assert fewer.content_fingerprint != CURRENT_ACQUISITION.content_fingerprint
-
-
-def test_reordering_the_indicator_declarations_does_not_change_the_fingerprint():
-    """Declaration order is not contract. Sorting before hashing keeps a
-    cosmetic edit from reading as a retune — and a retune from hiding as one."""
-    shuffled = dataclasses.replace(
-        CURRENT_ACQUISITION, indicators=tuple(reversed(CURRENT_ACQUISITION.indicators))
-    )
-    assert shuffled.content_fingerprint == CURRENT_ACQUISITION.content_fingerprint
-
-
 def test_prose_notes_do_not_affect_the_fingerprint():
     """Explanations may be improved without invalidating a contract, the same
     rule `capability_items` applies to Capability.note."""
@@ -654,11 +591,6 @@ def test_a_different_date_moves_every_range():
     assert old["calls"]["historicals"]["params"]["start_time"] != (
         new["calls"]["historicals"]["params"]["start_time"]
     )
-    for key in CURRENT_ACQUISITION.indicator_keys:
-        assert (
-            old["calls"]["indicators"][key]["params"]["start_time"]
-            != new["calls"]["indicators"][key]["params"]["start_time"]
-        )
 
 
 def test_the_generated_request_does_not_read_the_wall_clock():
@@ -706,38 +638,13 @@ def test_replay_rests_on_the_snapshot_not_on_the_request_being_reissuable():
     assert "snapshot_json" in _AE.model_fields
 
 
-def test_start_times_are_the_pinned_lookback_before_the_trading_date():
-    plan = CURRENT_ACQUISITION.request_plan("AAPL", DAY)
-    for spec in CURRENT_ACQUISITION.indicators:
-        stamp = plan["calls"]["indicators"][spec.key]["params"]["start_time"]
-        expected = DAY - __import__("datetime").timedelta(days=spec.lookback_calendar_days)
-        assert stamp == f"{expected.isoformat()}T00:00:00Z"
-
-
-def test_every_request_names_only_parameters_its_endpoint_accepts():
-    """The schema rejects a parameter the chosen indicator type does not take,
-    so `period` must not ride along on a MACD request and vice versa."""
-    plan = CURRENT_ACQUISITION.request_plan("AAPL", DAY)
-
-    macd = plan["calls"]["indicators"]["macd"]["params"]
-    assert "period" not in macd
-    assert {"fast_period", "slow_period", "signal_period"} <= macd.keys()
-
-    for key in ("rsi", "sma_20", "sma_50", "sma_200", "atr"):
-        params = plan["calls"]["indicators"][key]["params"]
-        assert "period" in params
-        assert not {"fast_period", "slow_period", "signal_period"} & params.keys()
-        assert {"symbol", "type", "interval", "start_time"} <= params.keys()
-
-
 def test_the_interval_is_always_explicit():
     """Omitting it is not neutral: for historicals the server then picks an
     interval targeting ~2,500 bars across whatever range was asked for, so the
     lookback would silently decide the granularity."""
     plan = CURRENT_ACQUISITION.request_plan("AAPL", DAY)
     assert plan["calls"]["historicals"]["params"]["interval"] == "day"
-    for key in CURRENT_ACQUISITION.indicator_keys:
-        assert plan["calls"]["indicators"][key]["params"]["interval"] == "day"
+    assert plan["calls"]["indicators"] == {}, "v4 requests no indicators"
 
 
 def test_no_acquisition_call_can_touch_an_order():
@@ -753,8 +660,7 @@ def test_no_acquisition_call_can_touch_an_order():
         "get_equity_historicals",
         "get_equity_fundamentals",
         "get_earnings_results",
-        "get_equity_technical_indicators",
-    }
+    }, "v4 no longer calls the indicator endpoint"
     for tool in tools:
         assert tool.startswith("get_")
         for forbidden in ("order", "place", "cancel", "replace", "review"):
@@ -781,67 +687,6 @@ def test_the_acquisition_profile_does_not_restate_earnings_semantics():
 
 
 # --------------------------------------------------------- sufficiency (Phase 5)
-
-
-def test_every_pinned_lookback_covers_its_derived_requirement():
-    """The numbers are derived, not chosen. Each lookback must contain the
-    indicator's warm-up, its convergence allowance, and the trailing points the
-    strategy actually reads — with the trading-day conversion and a holiday
-    buffer on top."""
-    hist = CURRENT_ACQUISITION.historicals
-    assert hist.lookback_calendar_days >= hist.minimum_calendar_days()
-
-    for spec in CURRENT_ACQUISITION.indicators:
-        assert spec.lookback_calendar_days >= spec.minimum_calendar_days(), spec.key
-
-
-def test_the_strategy_reads_two_points_from_exactly_rsi_and_macd():
-    """Tied to what the core actually consumes, so a strategy change that needs
-    a third point fails here instead of silently reading a value that was never
-    fetched."""
-    two_point = {s.key for s in CURRENT_ACQUISITION.indicators if s.required_output_bars >= 2}
-    assert two_point == {"rsi", "macd"}
-    for key in two_point:
-        assert CURRENT_ACQUISITION.spec_for(key).output == "last:2"
-    for key in ("sma_20", "sma_50", "sma_200", "atr"):
-        assert CURRENT_ACQUISITION.spec_for(key).output == "latest"
-
-
-def test_recursive_smoothers_carry_a_convergence_allowance_and_sma_does_not():
-    """RSI, ATR and MACD each depend on the previous value back to a seed, so a
-    short range returns a genuinely different number. A simple moving average
-    is a finite window and is unaffected — which is why an unpinned range looks
-    harmless until it isn't."""
-    for key in ("rsi", "atr", "macd"):
-        assert CURRENT_ACQUISITION.spec_for(key).convergence_bars > 0, key
-    for key in ("sma_20", "sma_50", "sma_200"):
-        assert CURRENT_ACQUISITION.spec_for(key).convergence_bars == 0, key
-
-
-def test_the_sma_200_window_is_the_longest():
-    """200 bars of warm-up before a first value exists — the binding
-    constraint, and the one a 90-day range would silently fail to satisfy."""
-    longest = max(CURRENT_ACQUISITION.indicators, key=lambda s: s.lookback_calendar_days)
-    assert longest.key == "sma_200"
-    assert CURRENT_ACQUISITION.spec_for("sma_200").warmup_bars == 200
-
-
-def test_the_indicator_keys_match_what_the_snapshot_parser_expects():
-    """A response filed under the wrong key is a silent misattribution: an
-    sma_50 landing in the sma_200 slot would still parse."""
-    from agentic_trader.market.snapshot import parse_indicators
-
-    payloads = dict.fromkeys(CURRENT_ACQUISITION.indicator_keys)
-    parse_indicators(payloads)  # must not raise on the exact key set
-
-    assert set(CURRENT_ACQUISITION.indicator_keys) == {
-        "rsi", "macd", "sma_20", "sma_50", "sma_200", "atr",
-    }
-
-
-def test_an_unknown_indicator_key_is_refused():
-    with pytest.raises(KeyError, match="sma_100"):
-        CURRENT_ACQUISITION.spec_for("sma_100")
 
 
 # ==========================================================================

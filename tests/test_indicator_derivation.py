@@ -107,26 +107,42 @@ def test_changing_a_spec_changes_the_fingerprint(key, field, value):
 # ============================================ legacy window fidelity
 
 
-def test_derivation_lookbacks_mirror_the_production_broker_calls():
-    """The cutover reproduces today's semantics, so every derivation window
-    must equal the broker call it replaces. Pinned against v3 itself rather
-    than restated, so the two cannot drift apart."""
-    production = {s.key: s.lookback_calendar_days for s in CURRENT_ACQUISITION.indicators}
-    derivation = {s.key: s.source_lookback_calendar_days for s in CURRENT_DERIVATION.specs}
-    assert derivation == production == {
+def test_derivation_lookbacks_are_the_legacy_broker_windows():
+    """The windows the six broker calls used to request, now the sole record
+    of them.
+
+    Before v4 these could be cross-checked against the acquisition contract.
+    v4 removed those specs, so this profile is where the legacy semantics live
+    and the literal values are pinned here instead. Changing one is a
+    deliberate change to what the indicators mean, not a refactor.
+    """
+    derivation = {
+        s.key: s.source_lookback_calendar_days for s in CURRENT_DERIVATION.specs
+    }
+    assert derivation == {
         "rsi": 180, "macd": 210, "sma_20": 90, "sma_50": 90,
         "sma_200": 330, "atr": 180,
     }
 
 
-def test_the_window_boundary_matches_the_acquisition_start_time():
-    """Slicing must reproduce the request, so the two arithmetics must agree
-    exactly — not merely land on the same day."""
-    plan = CURRENT_ACQUISITION.request_plan("AAPL", TD)
+def test_the_window_boundary_reproduces_the_legacy_request_start():
+    """The boundary the retired broker calls sent, to the second.
+
+    These are the exact `start_time` values v3 issued for trading date
+    2026-08-25; a test asserting them against the live contract would now pass
+    vacuously, since v4 sends no indicator calls at all.
+    """
+    expected = {
+        "rsi": "2026-02-26T00:00:00Z",
+        "atr": "2026-02-26T00:00:00Z",
+        "macd": "2026-01-27T00:00:00Z",
+        "sma_20": "2026-05-27T00:00:00Z",
+        "sma_50": "2026-05-27T00:00:00Z",
+        "sma_200": "2025-09-29T00:00:00Z",
+    }
     for spec in CURRENT_DERIVATION.specs:
-        sent = plan["calls"]["indicators"][spec.key]["params"]["start_time"]
         derived = window_start(TD, spec.source_lookback_calendar_days)
-        assert derived.strftime("%Y-%m-%dT%H:%M:%SZ") == sent, spec.key
+        assert derived.strftime("%Y-%m-%dT%H:%M:%SZ") == expected[spec.key], spec.key
 
 
 def test_slicing_is_by_timestamp_not_by_bar_count():

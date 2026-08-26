@@ -44,8 +44,8 @@ The `evaluate` bundle:
       // payloads are genuinely not what the current profile would have asked
       // for, and recording them as such would be a false provenance claim.
       "trading_date": "2026-08-22",
-      "acquisition_profile_ref": "agentic-acquisition@v3-2026-08-25",
-      "acquisition_config_fingerprint": "1aeb6fe9...",
+      "acquisition_profile_ref": "agentic-acquisition@v4-2026-08-25",
+      "acquisition_config_fingerprint": "eceedacc...",
 
       "account": { ...AccountState... },
       "payloads": {
@@ -53,11 +53,8 @@ The `evaluate` bundle:
         "historicals":  <get_equity_historicals response>,
         "fundamentals": <get_equity_fundamentals response>,
         "earnings":     <get_earnings_results response>,
-        "indicators": {
-          "rsi": <...>, "macd": <...>,
-          "sma_20": <...>, "sma_50": <...>, "sma_200": <...>,
-          "atr": <...>                     // sets the stop, and so the size
-        },
+        // No "indicators" key since v4. RSI, MACD, SMA20/50/200 and ATR are
+        // derived from "historicals" above; sending them changes nothing.
         "market": {                        // optional; recorded, never gated
           "SPY": {"quote": <...>, "indicators": {...}},
           "QQQ": {"quote": <...>, "indicators": {...}}
@@ -211,45 +208,6 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     except Exception as exc:
         return _fail(f"invalid account state: {exc}")
 
-    payloads = bundle.get("payloads", {})
-    try:
-        snapshot = build_snapshot(
-            symbol,
-            quote=payloads.get("quote"),
-            historicals=payloads.get("historicals"),
-            fundamentals=payloads.get("fundamentals"),
-            earnings=payloads.get("earnings"),
-            indicators=payloads.get("indicators", {}),
-        )
-    except SnapshotError as exc:
-        return _fail(f"could not build snapshot: {exc}")
-
-    # Index snapshots for market-regime context. Entirely optional: the bundle
-    # may omit them, and a malformed one must not stop a decision — the regime
-    # is recorded for later analysis and gates nothing.
-    market_context: MarketContext | None = None
-    market_payloads = payloads.get("market") or {}
-    if market_payloads:
-        try:
-            index_snaps = {
-                sym.upper(): build_snapshot(
-                    sym,
-                    quote=data.get("quote"),
-                    historicals=data.get("historicals"),
-                    indicators=data.get("indicators", {}),
-                )
-                for sym, data in market_payloads.items()
-            }
-            market_context = classify_market_regime(
-                index_snaps.get("SPY"), index_snaps.get("QQQ")
-            )
-        except (SnapshotError, AttributeError, TypeError) as exc:
-            print(f"warning: market context unavailable ({exc})", file=sys.stderr)
-
-    mode = bundle.get("mode", args.mode)
-    if mode not in ("shadow", "live"):
-        return _fail(f"mode must be 'shadow' or 'live', got {mode!r}")
-
     # --- acquisition provenance -------------------------------------------
     #
     # The bundle must state which contract fetched its payloads, and that claim
@@ -280,6 +238,49 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             f"bundle 'trading_date' must be YYYY-MM-DD, got "
             f"{bundle['trading_date']!r}"
         )
+
+
+    payloads = bundle.get("payloads", {})
+    try:
+        snapshot = build_snapshot(
+            symbol,
+            quote=payloads.get("quote"),
+            historicals=payloads.get("historicals"),
+            fundamentals=payloads.get("fundamentals"),
+            earnings=payloads.get("earnings"),
+            # Indicators are derived from these bars, not fetched. The trading
+            # date decides which bars are complete and where each window
+            # starts, which is why it is parsed before the snapshot is built.
+            trading_date=trading_date,
+        )
+    except SnapshotError as exc:
+        return _fail(f"could not build snapshot: {exc}")
+
+    # Index snapshots for market-regime context. Entirely optional: the bundle
+    # may omit them, and a malformed one must not stop a decision — the regime
+    # is recorded for later analysis and gates nothing.
+    market_context: MarketContext | None = None
+    market_payloads = payloads.get("market") or {}
+    if market_payloads:
+        try:
+            index_snaps = {
+                sym.upper(): build_snapshot(
+                    sym,
+                    quote=data.get("quote"),
+                    historicals=data.get("historicals"),
+                    trading_date=trading_date,
+                )
+                for sym, data in market_payloads.items()
+            }
+            market_context = classify_market_regime(
+                index_snaps.get("SPY"), index_snaps.get("QQQ")
+            )
+        except (SnapshotError, AttributeError, TypeError) as exc:
+            print(f"warning: market context unavailable ({exc})", file=sys.stderr)
+
+    mode = bundle.get("mode", args.mode)
+    if mode not in ("shadow", "live"):
+        return _fail(f"mode must be 'shadow' or 'live', got {mode!r}")
 
     strategy_name = bundle.get("strategy", args.strategy)
 

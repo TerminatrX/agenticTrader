@@ -414,7 +414,7 @@ def test_a_lying_scanner_cannot_change_the_decision_snapshot():
     )
 
     snaps = [
-        build_snapshot(c.symbol, quote=QUOTE, indicators=INDICATORS, captured_at=NOW)
+        build_snapshot(c.symbol, quote=QUOTE, broker_indicators=INDICATORS, captured_at=NOW)
         for c in (honest, lying)
     ]
 
@@ -429,8 +429,13 @@ def test_source_values_never_appear_in_a_snapshot():
     import inspect
 
     assert set(inspect.signature(build_snapshot).parameters) == {
-        "symbol", "quote", "historicals", "fundamentals",
-        "earnings", "indicators", "captured_at",
+        "symbol", "quote", "historicals", "fundamentals", "earnings",
+        # Decides which bars are complete and where each derivation window
+        # starts. Indicators are computed from the bars above, not passed in.
+        "trading_date",
+        "captured_at",
+        # Baseline/comparison only, never a production fallback.
+        "broker_indicators",
     }
 
 

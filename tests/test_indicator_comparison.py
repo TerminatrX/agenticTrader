@@ -25,6 +25,12 @@ from agentic_trader.market.indicator_comparison import (
 D = Decimal
 TS = datetime(2026, 8, 24, tzinfo=UTC)
 
+# The contract the equivalence evidence was gathered under. Permanently v3:
+# evidence is dated, and restamping it as v4 would claim measurements nobody
+# took under v4.
+BASELINE_REF = "agentic-acquisition@v3-2026-08-25"
+BASELINE_FP = "1aeb6fe90b857bd862950b3e1b9d1a1a95ffd7e282fe5a1b998fb5a790e52b93"
+
 COMPARISON_REF = "local-indicator-comparison@v1-2026-08-25"
 COMPARISON_FINGERPRINT = (
     "43cafd8ad390d7f25cc76d79d25118dff54bf14a5f7c346b3380d6ca194b1486"
@@ -463,7 +469,6 @@ def test_the_validation_report_matches_the_current_contract():
     import json
     import pathlib
 
-    from agentic_trader.market.acquisition import CURRENT_ACQUISITION
     from agentic_trader.market.local_indicators import required_bars
 
     path = (
@@ -472,12 +477,11 @@ def test_the_validation_report_matches_the_current_contract():
     )
     report = json.loads(path.read_text(encoding="utf-8"))
 
-    assert report["production_acquisition_profile_ref"] == (
-        CURRENT_ACQUISITION.profile_ref
-    )
-    assert report["production_acquisition_fingerprint"] == (
-        CURRENT_ACQUISITION.content_fingerprint
-    )
+    # v3, permanently. This report measured evidence under the contract in
+    # force at the time; restamping it as v4 would claim measurements nobody
+    # took under v4.
+    assert report["production_acquisition_profile_ref"] == BASELINE_REF
+    assert report["production_acquisition_fingerprint"] == BASELINE_FP
     assert report["binding_requirement_bars"] == required_bars()
     assert report["verdict"] == "LOCAL_INDICATORS_EQUIVALENT"
     assert report["decision_equivalence"]["total_disagreements"] == 0
@@ -518,13 +522,9 @@ def test_the_comparison_profile_identity_is_pinned():
 
 def test_the_report_names_the_production_contract():
     """(1) Which trading contract this evidence is intended to validate for."""
-    from agentic_trader.market.acquisition import CURRENT_ACQUISITION
-
     report = _report()
-    assert report["production_acquisition_profile_ref"] == CURRENT_ACQUISITION.profile_ref
-    assert report["production_acquisition_fingerprint"] == (
-        CURRENT_ACQUISITION.content_fingerprint
-    )
+    assert report["production_acquisition_profile_ref"] == BASELINE_REF
+    assert report["production_acquisition_fingerprint"] == BASELINE_FP
 
 
 def test_the_report_names_the_contract_the_measurements_were_taken_under():
@@ -649,32 +649,27 @@ def test_every_compared_indicator_shares_one_source_window():
     }
 
 
-def test_production_keeps_its_own_per_indicator_lookbacks():
-    """(7) This branch must not have quietly flattened production onto the
-    validation shape. Production indicator ranges differ from each other and
-    from the comparison window, and that is intended."""
-    from agentic_trader.market.acquisition import CURRENT_ACQUISITION
-    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_COMPARISON
+def test_the_production_contract_no_longer_requests_indicators():
+    """Was: production keeps its own per-indicator lookbacks. v4 removed them.
 
-    lookbacks = {
-        s.key: s.lookback_calendar_days for s in CURRENT_ACQUISITION.indicators
+    The legacy windows did not vanish -- they moved to the derivation profile,
+    which is now the only place they are recorded. Asserted here so the two
+    halves of that migration stay visible together.
+    """
+    from agentic_trader.market.acquisition import CURRENT_ACQUISITION
+    from agentic_trader.market.indicator_derivation import CURRENT_DERIVATION
+
+    assert CURRENT_ACQUISITION.indicators == ()
+    plan = CURRENT_ACQUISITION.request_plan("AAPL", date(2026, 8, 25))
+    assert plan["calls"]["indicators"] == {}
+
+    legacy = {
+        s.key: s.source_lookback_calendar_days for s in CURRENT_DERIVATION.specs
     }
-    assert lookbacks == {
+    assert legacy == {
         "rsi": 180, "macd": 210, "sma_20": 90, "sma_50": 90,
         "sma_200": 330, "atr": 180,
     }
-    assert len(set(lookbacks.values())) > 1, "production is still per-indicator"
-
-    plan = CURRENT_ACQUISITION.request_plan("AAPL", date(2026, 8, 25))
-    starts = {
-        c["params"]["start_time"] for c in plan["calls"]["indicators"].values()
-    }
-    assert len(starts) > 1, "production indicators do not share one window"
-    assert LOCAL_INDICATOR_COMPARISON.common_start_time not in starts
-
-    # And production keeps its narrower trims.
-    outputs = {c["params"]["output"] for c in plan["calls"]["indicators"].values()}
-    assert outputs == {"last:2", "latest"}
 
 
 def test_the_comparison_profile_cannot_reach_a_decision():

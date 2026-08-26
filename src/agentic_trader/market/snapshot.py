@@ -28,6 +28,7 @@ from agentic_trader.market.earnings_capabilities import (
     ROBINHOOD_MCP_EARNINGS,
     EarningsCapabilities,
 )
+from agentic_trader.market.indicator_derivation import derive_indicators
 from agentic_trader.models import (
     Bar,
     EarningsAssessment,
@@ -413,19 +414,40 @@ def build_snapshot(
     historicals: Any = None,
     fundamentals: Any = None,
     earnings: Any = None,
-    indicators: dict[str, Any] | None = None,
+    trading_date: date | None = None,
     captured_at: datetime | None = None,
+    broker_indicators: dict[str, Any] | None = None,
 ) -> MarketSnapshot:
     """Assemble a snapshot from whichever MCP payloads are available.
 
     Only a price is strictly required, and it may come from either the quote or
     the most recent bar.
+
+    **Indicators are derived here, not fetched.** They come from the same
+    historical bars this snapshot already carries, through
+    `indicator_derivation`, which reproduces the windows the six broker
+    indicator calls used to request. `trading_date` decides which bars count as
+    complete and where each window starts, so it is required for indicators to
+    exist at all -- omitting it yields a snapshot with none rather than one
+    computed against an assumed date.
+
+    `broker_indicators` is a **testing and comparison** path only. It exists so
+    a baseline snapshot can be built from the old payloads for parity work, and
+    it is deliberately *not* a fallback: production passes bars and gets local
+    values, or gets nothing. A silent fallback would mean two production
+    semantics and would quietly reintroduce six calls per symbol.
     """
     symbol = symbol.strip().upper()
     now = captured_at or datetime.now(UTC)
 
     bars = parse_bars(historicals, symbol) if historicals else []
-    indicator_state = parse_indicators(indicators or {})
+
+    if broker_indicators is not None:
+        indicator_state = parse_indicators(broker_indicators)
+    elif trading_date is not None:
+        indicator_state = derive_indicators(bars, trading_date).indicators
+    else:
+        indicator_state = Indicators()
 
     last_price: Decimal | None = None
     previous_close: Decimal | None = None

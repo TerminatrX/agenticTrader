@@ -26,6 +26,16 @@ each indicator here is computed over *the same calendar window the production
 broker call requested*, cut from the 420-day superset. Adopting the converged
 420-day values is a later, separately reviewed decision.
 
+Legacy semantics, then ours
+---------------------------
+
+The per-indicator windows and warm-up counts below were measured against the
+broker endpoints this module replaces, so that swapping the source of a value
+does not also change the value. After cutover nothing calls those endpoints and
+these stop being compatibility shims: they are this system's pinned indicator
+semantics, and a later provider change cannot move a production number. Moving
+them becomes a deliberate version bump here.
+
 Slicing by timestamp, never by count
 ------------------------------------
 
@@ -72,17 +82,28 @@ rule rather than trust:
    of absence, and this feeds a hard entry path.
 
 The rule keys on `trading_date` rather than on a clock: a bar dated on or after
-the evaluation date is excluded. That is deterministic without a market
-calendar, handles early closes and unscheduled halts identically (a short
-session is still dated that day), and needs no wall clock — which matters
-because every other date input in this system is explicit for exactly that
-reason.
+the evaluation date is excluded. Deterministic without a market calendar,
+identical for normal and early-close sessions (a short session is still dated
+that day), and free of wall-clock sensitivity, which matters because every
+other date input in this system is explicit for exactly that reason.
 
-Its boundary, stated plainly: a cycle run late in the evening of a trading day
-excludes that day's now-final bar. That matches what the broker indicator
-endpoint was still returning 28 minutes after the close, so it preserves current
-behaviour rather than changing it — and erring one bar short can only ever be
-conservative, where using a partial bar could not.
+**Why no wall-clock rule is needed.** The application's actionable window is
+regular market hours and cannot be anything else: `build_order_payload` sends
+`market_hours="regular_hours"` unconditionally, and the broker restricts
+fractional and dollar-denominated orders -- every order this account size can
+place -- to `type=market` in regular hours. An indicator advancing to today's
+bar after the close could therefore never inform an order placed that day.
+Clock sensitivity would buy nothing and would make the derivation depend on
+when a cycle happened to run.
+
+Its boundary, stated plainly: a cycle run in the evening of a trading day
+excludes that day's now-final bar. That is the same thing the broker indicator
+endpoint was still doing 28 minutes after the close, so it preserves behaviour
+rather than changing it, and erring one bar short is conservative in a way that
+consuming a partial bar could never be.
+
+If the application ever supports acting after hours, this rule needs a bounded
+post-close observation of when the endpoint advances -- not a guess.
 """
 
 
@@ -100,10 +121,17 @@ WARMUP_EVIDENCE = (
 )
 """How the warm-up figures were established, kept next to the numbers.
 
-Reverse-engineered rather than documented, which is a real fragility this
-cutover inherits: if the provider changes its warm-up policy, locally derived
-values would silently stop matching what production used to produce. The
-fingerprint makes the assumption explicit; it cannot make it stable.
+Provenance for a migration, not a live dependency. The figures were
+reverse-engineered from the endpoint being migrated *off*, so that changing
+where a value comes from would not also change the value. Once production stops
+calling that endpoint -- the point of the cutover -- these become this system's
+own pinned semantics, and a later change to Robinhood's warm-up policy cannot
+reach a production number.
+
+They are empirical legacy-compatibility constants, not universal indicator
+mathematics: another provider, or a design starting from scratch, would have no
+reason to choose them. The fingerprint is what makes them a stated contract
+rather than an accident of how they were first obtained.
 """
 
 
@@ -168,18 +196,23 @@ class DerivedIndicatorSpec:
     """
 
     warmup_bars: int = 0
-    """Bars fetched *before* the window start, reproducing provider behaviour.
+    """Completed bars included *before* the window start.
 
-    Not a choice. Measured: the endpoint prepends each indicator's own
-    minimum-history requirement so that its first returned point lands *at* the
-    requested `start_time` rather than one warm-up later. Slicing to the literal
-    window without this reproduces the request boundary but not the values --
-    for RSI(14) on AAPL it shifted the result by 2.3e-03 points, 23x the
-    tolerance the formula-equivalence milestone justified.
+    Originally measured from the provider, now **our own pinned semantics**.
+    The distinction matters: it was derived empirically so the cutover would
+    preserve values rather than silently retune them, but after cutover nothing
+    calls the indicator endpoint, so a later change on Robinhood's side cannot
+    move a production number. What began as compatibility is now simply the
+    definition of this system's indicator windows, fixed by this fingerprint.
 
-    See `WARMUP_EVIDENCE`. This is reverse-engineered provider behaviour, not a
-    documented contract, and it is fingerprinted so a future change to it is a
-    visible contract change rather than a silent drift.
+    The value came from the migration target rather than from indicator
+    mathematics: the endpoint prepended each indicator's own minimum-history
+    requirement so its first returned point landed *at* the requested
+    `start_time`. Slicing to the literal window without it reproduced the
+    request boundary but not the values -- RSI(14) on AAPL moved 2.3e-03
+    points, 23x the tolerance the formula-equivalence milestone justified.
+
+    See `WARMUP_EVIDENCE`.
     """
 
     period: int | None = None
