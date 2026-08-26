@@ -15,42 +15,46 @@
       "role": "prior milestone; one shared long window, answering whether the formulas agree on identical inputs"
     },
     "cutover_parity_comparison": {
-      "ref": "production-range broker calls at v3 lookbacks, output widened to last:30",
+      "ref": "local-indicator-cutover-parity@v1-2026-08-25",
+      "fingerprint": "90234ad621e4230bcfb59424b5cc80e5aa6028871ce5570254614627337966ca",
+      "role": "this milestone's evidence; each indicator at its OWN v3 production range, output widened only to expose more comparison points. Output width cannot change a value: the endpoint computes over the range first and trims after.",
       "semantics": {
         "rsi": {
-          "start_time": "2026-02-26T00:00:00Z",
-          "period": 14
-        },
-        "atr": {
-          "start_time": "2026-02-26T00:00:00Z",
+          "lookback_calendar_days": 180,
           "period": 14
         },
         "macd": {
-          "start_time": "2026-01-27T00:00:00Z",
+          "lookback_calendar_days": 210,
           "fast_period": 12,
           "slow_period": 26,
           "signal_period": 9
         },
         "sma_20": {
-          "start_time": "2026-05-27T00:00:00Z",
+          "lookback_calendar_days": 90,
           "period": 20
         },
         "sma_50": {
-          "start_time": "2026-05-27T00:00:00Z",
+          "lookback_calendar_days": 90,
           "period": 50
         },
         "sma_200": {
-          "start_time": "2025-09-29T00:00:00Z",
+          "lookback_calendar_days": 330,
           "period": 200
+        },
+        "atr": {
+          "lookback_calendar_days": 180,
+          "period": 14
         },
         "common": {
           "interval": "day",
           "bounds": "regular",
           "adjustment_type": "split",
-          "output": "last:30"
+          "output": "last:30",
+          "tool": "get_equity_technical_indicators"
         }
       },
-      "role": "this milestone's evidence; each indicator at its OWN v3 production range, output widened only to expose more comparison points. Output width cannot change a value: the endpoint computes over the range first and trims after.",
+      "only_deviation_from_v3": "output widened from ['last:2', 'latest'] to last:30, purely to expose more comparison points; the endpoint computes over the range first and trims afterward, so it cannot change a value",
+      "ranges_source": "read programmatically from local-indicator-derivation rather than duplicated, so a moved window cannot leave this profile describing a run nobody made",
       "note": "adjustment_type and start_time are not echoed by the endpoint, so they are attested from the pinned request rather than recovered from the response. A response proves what the provider computed, not the literal arguments sent."
     },
     "candidate_production": {
@@ -232,7 +236,7 @@
     "result": "PASS"
   },
   "pipeline_parity": {
-    "method": "identical non-indicator inputs (quote, bars, fundamentals, earnings, account, config, trading_date, now); baseline carries broker-shaped indicators, candidate carries locally derived ones; both run through the real strategy, risk engine, critic and execution path",
+    "method": "144 measured broker/local value pairs from the parity run -- genuinely different numbers, 0 bitwise identical -- run through the real strategy, risk engine, critic and execution path from otherwise identical inputs (same non-indicator snapshot fields, AccountState, AppConfig, trading_date and now). An earlier version of this test copied local values into the broker side, which proved provenance invariance and nothing about parity; that test still exists, renamed for what it does.",
     "contexts": [
       "entry / no position",
       "held position / exit, with an active stop",
@@ -256,7 +260,20 @@
       "should_submit"
     ],
     "disagreements": 0,
-    "result": "PASS"
+    "result": "PASS",
+    "measured_pairs": 144,
+    "pairs_bitwise_identical": 0,
+    "reason_text_differences": {
+      "count": 3,
+      "of": 144,
+      "fields": [
+        "signal.reasons",
+        "signal.failed_conditions"
+      ],
+      "cause": "those strings format indicator values to two decimals, so a residual in the thirteenth decimal can round differently at a .xx5 edge -- e.g. SMA20 rendering as 14.31 against 14.30",
+      "decision_effect": "none; every decision field matched on all 144 pairs",
+      "why_reported": "no gate reads them, but the performance review does, so it is a real documented property rather than something to tolerate silently"
+    }
   },
   "call_reduction": {
     "scope": "per symbol, market-data calls only",
@@ -274,5 +291,19 @@
   "not_adopted": {
     "full_420_converged_semantics": "Deliberately out of scope. The legacy windows are shorter than the convergence requirement (RSI needs ~203 bars, MACD ~277), so the current values carry seed dependence -- the same dependence today's production values carry. Reproducing it is what makes this cutover attributable. Adopting the converged values is a behaviour change for a separate milestone with its own boundary analysis."
   },
-  "execution_mode": "shadow only; no execution mode enabled by this work"
+  "execution_mode": "shadow only; no execution mode enabled by this work",
+  "cutover_parity_profile_ref": "local-indicator-cutover-parity@v1-2026-08-25",
+  "cutover_parity_profile_fingerprint": "90234ad621e4230bcfb59424b5cc80e5aa6028871ce5570254614627337966ca",
+  "acceptance_claim": {
+    "established": "observed production parity over the sampled window",
+    "not_established": "mathematical identity at every possible threshold value. Placed exactly astride a strict comparison and separated by the measured ~1e-13 residual, two implementations reach different conclusions -- that is arithmetic, not a defect. In the 144 measured pairs the closest RSI sat far more than 1e-6 from a band edge, so nothing came near enough for it to matter."
+  },
+  "session_admission": {
+    "enforced_by": "build_order_payload, structurally, before the protection floor",
+    "applies_to": "BUY and SELL alike -- the protection floor guards entries only",
+    "shadow": "exempt; out-of-hours evaluation is how analysis and replay work",
+    "calendar": "explicit NYSE rules: weekends, nine fixed and floating holidays, Good Friday from Easter, Juneteenth from 2022, and the 13:00 early closes. No new dependency; the DST rule is written out because zoneinfo needs a tz database this platform does not ship.",
+    "not_modelled": "unscheduled closures (weather, days of mourning, circuit-breaker halts). Those make it more permissive than reality, never less, which is part of why live execution still requires human confirmation.",
+    "determinism": "derived from the given instant; a replay with the recorded now agrees forever"
+  }
 }

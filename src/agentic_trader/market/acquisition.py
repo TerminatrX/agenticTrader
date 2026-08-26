@@ -553,10 +553,12 @@ every snapshot through `EarningsAssessment.profile_ref`. Folding that ref in
 would couple two contracts that move for different reasons and force an
 acquisition bump every time an earnings claim was refined.
 
-The historicals lookback is sized for what the deterministic core reads today
-(20 bars). The local-indicator milestone will compute SMA200 from these bars
-and will need roughly 200 -- that is a real contract change and should arrive
-as a version bump, not as a quiet widening.
+The historicals lookback is sized for local derivation, not for what the core
+reads directly: since v4 these bars are the sole source of every indicator, and
+the envelope covers the converged requirement (277 bars) even though the
+current derivation windows are shorter. That headroom is deliberate -- it is
+the capacity a future convergence milestone would need, kept without changing
+what today's derivation reads.
 """
 
 __all__ = [

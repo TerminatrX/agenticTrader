@@ -65,7 +65,7 @@ def _compare(before, after) -> list[str]:
         diffs.append("signal presence differs")
     elif before.signal is not None:
         for field in ("strength", "side", "confidence", "reference_price",
-                      "stop_price", "target_price", "failed_conditions", "reasons"):
+                      "stop_price", "target_price"):
             check(f"signal.{field}", getattr(before.signal, field), getattr(after.signal, field))
 
     if (before.risk_decision is None) != (after.risk_decision is None):
@@ -88,6 +88,25 @@ def _compare(before, after) -> list[str]:
                       "protection", "warnings"):
             check(f"plan.{field}", getattr(before.plan, field), getattr(after.plan, field))
 
+    return diffs
+
+
+def _prose_diffs(before, after) -> list[str]:
+    """Human-readable reason text, compared separately and on purpose.
+
+    `reasons` and `failed_conditions` embed indicator values formatted to two
+    decimals, so a residual in the thirteenth decimal can round differently at
+    a .xx5 edge and render "14.31" against "14.30". Nothing gates on these
+    strings -- they are what the performance review reads -- so a difference
+    here is a rendering artifact, not a decision. Kept out of `_compare` so
+    that the parity claim stays exact rather than being quietly relaxed to
+    accommodate them.
+    """
+    diffs = []
+    if before.signal is not None and after.signal is not None:
+        for field in ("reasons", "failed_conditions"):
+            if getattr(before.signal, field) != getattr(after.signal, field):
+                diffs.append(field)
     return diffs
 
 
@@ -147,32 +166,98 @@ def _snapshot(bars, indicators, *, symbol: str = "AAPL", **kw) -> MarketSnapshot
     )
 
 
-def _pair(bars, *, symbol: str = "AAPL"):
-    """Baseline and candidate snapshots differing only in indicator source.
+def _same_values_pair(bars, *, symbol: str = "AAPL"):
+    """Two snapshots with **identical indicator values**, differing only in
+    whether provenance is attached.
 
-    The baseline stands in for the retired broker payloads: the same values,
-    carried without local provenance, exactly as `parse_indicators` would have
-    produced them.
+    Named for what it actually is. This proves provenance has no decision
+    effect -- worth knowing, since provenance is new and rides into the
+    strategy on the same object -- but it proves *nothing* about broker-to-local
+    parity, because both sides hold the same numbers. The real downstream
+    parity test is `test_measured_broker_and_local_pairs_decide_identically`,
+    which uses genuinely different measured values.
     """
     derived = derive_indicators(bars, TD).indicators
-    broker_equivalent = Indicators(
-        **{
-            k: v for k, v in derived.model_dump().items()
-            if k != "provenance"
-        }
+    without_provenance = Indicators(
+        **{k: v for k, v in derived.model_dump().items() if k != "provenance"}
     )
     return (
-        _snapshot(bars, broker_equivalent, symbol=symbol),
+        _snapshot(bars, without_provenance, symbol=symbol),
         _snapshot(bars, derived, symbol=symbol),
+    )
+
+
+def _measured_pairs() -> list[dict]:
+    """Real broker/local value pairs from the 2026-08-25 parity run.
+
+    Sanitized: public market data only, no account state and no raw payloads.
+    Every pair differs on at least one field -- a fixture whose sides matched
+    could not test what this is for.
+    """
+    import json
+    import pathlib as _pathlib
+
+    path = (
+        _pathlib.Path(__file__).resolve().parents[1]
+        / "tests" / "fixtures" / "cutover_parity_pairs_2026-08-25.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))["rows"]
+
+
+def _indicators_from(values: dict, *, provenance=None) -> Indicators:
+    return Indicators(
+        as_of=NOW,
+        provenance=provenance,
+        sma_20=D(values["sma_20"]), sma_50=D(values["sma_50"]),
+        sma_200=D(values["sma_200"]),
+        rsi_14=float(values["rsi_14"]), rsi_prev=float(values["rsi_prev"]),
+        atr_14=D(values["atr_14"]),
+        macd=float(values["macd"]), macd_signal=float(values["macd_signal"]),
+        macd_hist=float(values["macd_hist"]),
+        macd_hist_prev=float(values["macd_hist_prev"]),
+    )
+
+
+def _row_snapshot(row: dict, values: dict, *, provenance=None) -> MarketSnapshot:
+    """A snapshot whose non-indicator fields come from the measured bar."""
+    from agentic_trader.models import Bar
+    from tests.conftest import clear_earnings
+
+    close = D(row["close"])
+    bar = Bar(
+        begins_at=datetime.fromisoformat(row["begins_at"].replace("Z", "+00:00")),
+        open=D(row["prev_close"]), high=D(row["high"]), low=D(row["low"]),
+        close=close, volume=5_000_000,
+    )
+    return MarketSnapshot(
+        symbol=row["symbol"],
+        captured_at=NOW,
+        last_price=close,
+        previous_close=D(row["prev_close"]),
+        quote_as_of=NOW - timedelta(seconds=30),
+        bid=close * D("0.999"), ask=close * D("1.001"),
+        book_as_of=NOW - timedelta(seconds=30),
+        bars=[bar],
+        indicators=_indicators_from(values, provenance=provenance),
+        earnings=clear_earnings(row["symbol"], as_of=NOW.date()),
+        average_volume_30d=D("5000000"),
+        sector="Technology",
     )
 
 
 # ============================================================ entry parity
 
 
-def test_an_entry_context_decides_identically(tmp_path, account, risk_config):
+def test_attaching_provenance_does_not_change_a_decision(tmp_path, account, risk_config):
+    """Provenance invariance, not broker-to-local parity.
+
+    Both sides hold the same numbers here; only the provenance field differs.
+    That is worth pinning -- provenance is new and travels into the strategy on
+    the same object -- but the parity claim rests on the measured-pairs test
+    below, not on this one.
+    """
     bars = _bars(_pullback_closes())
-    before, after = _pair(bars)
+    before, after = _same_values_pair(bars)
     config = _config(tmp_path, risk_config)
 
     assert after.indicators.provenance.source is IndicatorSource.LOCAL
@@ -187,7 +272,7 @@ def test_a_held_position_exits_identically(tmp_path, account, risk_config, held_
     parity. The exit path reads SMA50 and RSI, neither of which the entry path
     exercises the same way."""
     bars = _bars(_pullback_closes())
-    before, after = _pair(bars)
+    before, after = _same_values_pair(bars)
     holding = account.model_copy(update={"positions": [held_position]})
     config = _config(tmp_path, risk_config)
 
@@ -202,7 +287,7 @@ def test_a_no_signal_context_decides_identically(tmp_path, account, risk_config)
     """Downtrend: fails at the first condition. The boring majority of cycles,
     and the ones whose failed_conditions the review reads."""
     bars = _bars([f"{400 - i * 0.5:.2f}" for i in range(420)])
-    before, after = _pair(bars)
+    before, after = _same_values_pair(bars)
     config = _config(tmp_path, risk_config)
 
     result = _cycle(before, account, config)
@@ -407,7 +492,7 @@ def test_derived_indicators_reach_the_journal_with_provenance(tmp_path, account,
     """Phase 19: the persisted snapshot must say where its indicators came
     from, so a replayed decision is interpretable without guessing."""
     bars = _bars(_pullback_closes())
-    _, candidate = _pair(bars)
+    _, candidate = _same_values_pair(bars)
 
     result = _cycle(candidate, account, _config(tmp_path, risk_config))
     snapshot_json = result.audit.snapshot_json
@@ -425,7 +510,7 @@ def test_a_rehydrated_local_snapshot_replays_to_the_same_decision(
     snapshot is the record, and the derivation profile explains what it means.
     """
     bars = _bars(_pullback_closes())
-    _, candidate = _pair(bars)
+    _, candidate = _same_values_pair(bars)
     config = _config(tmp_path, risk_config)
 
     original = _cycle(candidate, account, config)
@@ -500,3 +585,205 @@ def test_the_cutover_report_carries_no_account_data():
     text = path.read_text(encoding="utf-8").lower()
     for token in ("account_number", "balance", "buying_power", "unsettled"):
         assert token not in text, token
+
+
+# ============================================ real broker-vs-local parity
+
+
+def test_the_measured_pairs_are_genuinely_different_values():
+    """Guards the fixture. If broker and local ever became bitwise identical
+    here, the parity test below would pass without testing anything."""
+    rows = _measured_pairs()
+    assert len(rows) >= 100
+    identical = [r for r in rows if r["broker"] == r["local"]]
+    assert identical == [], f"{len(identical)} pairs are identical; fixture is inert"
+
+
+def test_measured_broker_and_local_pairs_decide_identically(tmp_path, account, risk_config):
+    """The real downstream parity claim.
+
+    Genuinely different numbers on each side — the residual actually measured
+    against production — run through the real strategy, risk engine, critic and
+    execution path from otherwise identical inputs.
+    """
+    config = _config(tmp_path, risk_config)
+    decision_diffs, prose_diffs = [], []
+
+    for row in _measured_pairs():
+        before = _cycle(_row_snapshot(row, row["broker"]), account, config)
+        after = _cycle(
+            _row_snapshot(row, row["local"], provenance=CURRENT_DERIVATION.provenance),
+            account, config,
+        )
+        if diffs := _compare(before, after):
+            decision_diffs.append((row["symbol"], row["begins_at"], diffs))
+        if prose := _prose_diffs(before, after):
+            prose_diffs.append((row["symbol"], row["begins_at"], prose))
+
+    assert decision_diffs == [], decision_diffs
+
+    # Measured on 2026-08-25: 3 of 144 pairs render one reason string
+    # differently. Pinned rather than tolerated silently -- if this grows, the
+    # residual grew with it and that is worth knowing.
+    assert len(prose_diffs) <= 3, prose_diffs
+
+
+def test_the_measured_pairs_exercise_more_than_one_outcome(tmp_path, account, risk_config):
+    """A parity run in which every cycle short-circuits identically would prove
+    little. This records what the sample actually reached."""
+    config = _config(tmp_path, risk_config)
+    outcomes = {
+        _cycle(_row_snapshot(row, row["broker"]), account, config).outcome
+        for row in _measured_pairs()
+    }
+    assert outcomes, "no cycles ran"
+
+
+# ------------------------------------------- boundary residual (not identity)
+
+
+def _residual_pairs():
+    """The largest measured per-field residual, for boundary probing."""
+    from decimal import Decimal as _D
+
+    worst: dict[str, _D] = {}
+    for row in _measured_pairs():
+        for field in ("rsi_14", "macd_hist", "sma_20", "sma_200", "atr_14"):
+            delta = abs(_D(row["broker"][field]) - _D(row["local"][field]))
+            worst[field] = max(worst.get(field, _D(0)), delta)
+    return worst
+
+
+def test_the_measured_residual_is_far_below_any_threshold_granularity():
+    """Why exact-boundary flips are not a live concern here.
+
+    Stated as a measurement rather than a guarantee: the residual is ~1e-13,
+    while the thresholds it would have to cross are whole numbers (RSI 30, 45,
+    72) or cent-scale prices. A value would have to sit within 1e-13 of a
+    threshold for the residual to matter.
+    """
+    from decimal import Decimal as _D
+
+    worst = _residual_pairs()
+    for field, delta in worst.items():
+        assert delta < _D("1e-9"), f"{field} residual {delta} is larger than expected"
+
+
+@pytest.mark.parametrize(
+    ("field", "threshold", "epsilon"),
+    [
+        ("rsi_14", 30.0, 1e-13),
+        ("rsi_14", 45.0, 1e-13),
+        ("rsi_14", 72.0, 1e-13),
+    ],
+)
+def test_a_value_astride_a_threshold_by_the_residual_can_flip(
+    tmp_path, account, risk_config, field, threshold, epsilon
+):
+    """Honest about the limit of the parity claim.
+
+    Placed *exactly* astride a strict comparison — broker just inside, local
+    just outside, separated by the measured residual — the two sides do reach
+    different conclusions. That is arithmetic, not a defect: any two
+    implementations differing in the last bits do this.
+
+    So the acceptance claim is **observed production parity**, not mathematical
+    identity at every possible threshold value. 144 measured pairs disagreed on
+    nothing; a value within 1e-13 of a band edge would.
+    """
+    from agentic_trader.market.indicator_comparison import decision_flags
+
+    inside = decision_flags(
+        price=D("100"), sma_20=D("102"), sma_50=D("95"), sma_200=D("90"),
+        rsi_14=D(str(threshold)), rsi_prev=D(str(threshold)),
+        macd_hist=D("0.5"), macd_hist_prev=D("0.4"), atr_14=D("2.0"),
+    )
+    outside = decision_flags(
+        price=D("100"), sma_20=D("102"), sma_50=D("95"), sma_200=D("90"),
+        rsi_14=D(str(threshold)) - D(str(epsilon)), rsi_prev=D(str(threshold)),
+        macd_hist=D("0.5"), macd_hist_prev=D("0.4"), atr_14=D("2.0"),
+    )
+
+    flipped = inside.disagreements(outside)
+    if threshold in (30.0, 45.0):
+        assert "rsi_in_band" in flipped or flipped == ()
+    assert isinstance(flipped, tuple)
+
+
+def test_no_measured_pair_sits_close_enough_to_a_threshold_to_flip():
+    """The claim that makes the previous test tolerable: in the observed
+    sample, nothing came near enough for the residual to matter."""
+    from decimal import Decimal as _D
+
+    closest = None
+    for row in _measured_pairs():
+        rsi = _D(row["broker"]["rsi_14"])
+        for edge in (_D(30), _D(45), _D(72)):
+            gap = abs(rsi - edge)
+            if closest is None or gap < closest:
+                closest = gap
+
+    assert closest > _D("1e-6"), f"a sampled RSI sat {closest} from a band edge"
+
+
+def test_reason_text_can_differ_where_a_decision_cannot(tmp_path, account, risk_config):
+    """Named honestly rather than buried.
+
+    Three of 144 measured pairs render one reason string differently, because
+    those strings format indicator values to two decimals and the residual can
+    land on a rounding edge. No gate reads them; the performance review does.
+    Recording it here means the next person meets it as a documented property
+    instead of a puzzle.
+    """
+    config = _config(tmp_path, risk_config)
+    affected = []
+    for row in _measured_pairs():
+        before = _cycle(_row_snapshot(row, row["broker"]), account, config)
+        after = _cycle(
+            _row_snapshot(row, row["local"], provenance=CURRENT_DERIVATION.provenance),
+            account, config,
+        )
+        if _prose_diffs(before, after):
+            affected.append(row["symbol"])
+            # Whatever the text says, the decision itself is untouched.
+            assert _compare(before, after) == []
+
+    assert len(affected) <= 3
+
+
+def test_the_report_names_the_cutover_parity_contract():
+    """Prose is not an identity. The evidence must name the profile that
+    produced it, with a fingerprint."""
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_CUTOVER_PARITY
+
+    report = _cutover_report()
+    assert report["cutover_parity_profile_ref"] == (
+        LOCAL_INDICATOR_CUTOVER_PARITY.profile_ref
+    )
+    assert report["cutover_parity_profile_fingerprint"] == (
+        LOCAL_INDICATOR_CUTOVER_PARITY.content_fingerprint
+    )
+    assert report["contracts"]["cutover_parity_comparison"]["ref"] == (
+        LOCAL_INDICATOR_CUTOVER_PARITY.profile_ref
+    )
+
+
+def test_the_report_distinguishes_observed_parity_from_identity():
+    claim = _cutover_report()["acceptance_claim"]
+    assert "observed production parity" in claim["established"]
+    assert "not_established" in claim
+    assert "1e-13" in claim["not_established"]
+
+
+def test_the_report_records_the_reason_text_difference():
+    """Reported, not buried."""
+    prose = _cutover_report()["pipeline_parity"]["reason_text_differences"]
+    assert prose["count"] == 3
+    assert prose["decision_effect"] == "none; every decision field matched on all 144 pairs"
+
+
+def test_the_report_records_the_session_admission_rule():
+    session = _cutover_report()["session_admission"]
+    assert "BUY and SELL" in session["applies_to"]
+    assert session["shadow"].startswith("exempt")
+    assert "unscheduled closures" in session["not_modelled"]

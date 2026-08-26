@@ -721,3 +721,157 @@ def test_the_report_records_how_the_unechoed_fields_were_verified():
     assert "matched bit for bit" in provenance["verification_method"]
     assert "recursive" in provenance["verification_method"]
     assert provenance["recovered_from_saved_payloads"]
+
+
+# ==================================================== cutover parity contract
+
+CUTOVER_PARITY_REF = "local-indicator-cutover-parity@v1-2026-08-25"
+CUTOVER_PARITY_FINGERPRINT = (
+    "90234ad621e4230bcfb59424b5cc80e5aa6028871ce5570254614627337966ca"
+)
+
+
+def test_the_cutover_parity_profile_identity_is_pinned():
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_CUTOVER_PARITY
+
+    assert LOCAL_INDICATOR_CUTOVER_PARITY.profile_ref == CUTOVER_PARITY_REF
+    assert LOCAL_INDICATOR_CUTOVER_PARITY.content_fingerprint == (
+        CUTOVER_PARITY_FINGERPRINT
+    )
+
+
+def test_all_three_comparison_identities_stay_distinct():
+    """Three profiles, three questions. Conflating any two is the failure this
+    project has already had to correct once."""
+    from agentic_trader.market.acquisition import CURRENT_ACQUISITION
+    from agentic_trader.market.indicator_comparison import (
+        LOCAL_INDICATOR_COMPARISON,
+        LOCAL_INDICATOR_CUTOVER_PARITY,
+    )
+    from agentic_trader.market.indicator_derivation import CURRENT_DERIVATION
+
+    refs = {
+        CURRENT_ACQUISITION.profile_ref,
+        LOCAL_INDICATOR_COMPARISON.profile_ref,
+        LOCAL_INDICATOR_CUTOVER_PARITY.profile_ref,
+        CURRENT_DERIVATION.profile_ref,
+    }
+    prints = {
+        CURRENT_ACQUISITION.content_fingerprint,
+        LOCAL_INDICATOR_COMPARISON.content_fingerprint,
+        LOCAL_INDICATOR_CUTOVER_PARITY.content_fingerprint,
+        CURRENT_DERIVATION.content_fingerprint,
+    }
+    assert len(refs) == 4
+    assert len(prints) == 4
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("interval", "week"),
+        ("bounds", "extended"),
+        ("adjustment_type", "none"),
+        ("output", "latest"),
+        ("indicator_tool", "something_else"),
+        ("production_output_widths", ("series",)),
+    ],
+)
+def test_changing_a_parity_request_semantic_changes_its_fingerprint(field, value):
+    import dataclasses
+
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_CUTOVER_PARITY
+
+    assert getattr(LOCAL_INDICATOR_CUTOVER_PARITY, field) != value, "proves nothing"
+    altered = dataclasses.replace(LOCAL_INDICATOR_CUTOVER_PARITY, **{field: value})
+    assert altered.content_fingerprint != (
+        LOCAL_INDICATOR_CUTOVER_PARITY.content_fingerprint
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "field", "value"),
+    [
+        ("rsi", "lookback_calendar_days", 200),
+        ("rsi", "period", 21),
+        ("macd", "slow_period", 30),
+        ("macd", "lookback_calendar_days", 300),
+        ("sma_200", "period", 100),
+        ("atr", "period", 20),
+    ],
+)
+def test_changing_a_parity_indicator_semantic_changes_its_fingerprint(key, field, value):
+    import dataclasses
+
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_CUTOVER_PARITY
+
+    original = LOCAL_INDICATOR_CUTOVER_PARITY.spec_for(key)
+    assert getattr(original, field) != value, "proves nothing"
+    altered = dataclasses.replace(
+        LOCAL_INDICATOR_CUTOVER_PARITY,
+        specs=tuple(
+            dataclasses.replace(s, **{field: value}) if s.key == key else s
+            for s in LOCAL_INDICATOR_CUTOVER_PARITY.specs
+        ),
+    )
+    assert altered.content_fingerprint != (
+        LOCAL_INDICATOR_CUTOVER_PARITY.content_fingerprint
+    )
+
+
+def test_the_parity_ranges_are_the_v3_production_ranges():
+    """Read from the derivation profile rather than restated, so a moved window
+    cannot leave the parity profile describing a run nobody made."""
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_CUTOVER_PARITY
+    from agentic_trader.market.indicator_derivation import CURRENT_DERIVATION
+
+    parity = {
+        s.key: (s.lookback_calendar_days, s.period, s.fast_period,
+                s.slow_period, s.signal_period)
+        for s in LOCAL_INDICATOR_CUTOVER_PARITY.specs
+    }
+    derivation = {
+        s.key: (s.source_lookback_calendar_days, s.period, s.fast_period,
+                s.slow_period, s.signal_period)
+        for s in CURRENT_DERIVATION.specs
+    }
+    assert parity == derivation
+
+    lookbacks = {k: v[0] for k, v in parity.items()}
+    assert lookbacks == {
+        "rsi": 180, "macd": 210, "sma_20": 90, "sma_50": 90,
+        "sma_200": 330, "atr": 180,
+    }
+
+
+def test_widening_output_is_the_only_intentional_deviation_from_v3():
+    """Everything else about the request mirrors production. `output` is
+    widened purely to expose more comparison points, and it cannot change a
+    value: the endpoint computes over the range first and trims afterward."""
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_CUTOVER_PARITY as P
+
+    assert P.interval == "day"
+    assert P.bounds == "regular"
+    assert P.adjustment_type == "split"
+    assert P.indicator_tool == "get_equity_technical_indicators"
+
+    assert P.output == "last:30"
+    assert P.output not in P.production_output_widths
+    assert set(P.production_output_widths) == {"last:2", "latest"}
+
+
+def test_the_parity_start_times_match_what_was_actually_requested():
+    """The exact per-indicator starts the parity run issued for 2026-08-25."""
+    from agentic_trader.market.indicator_comparison import LOCAL_INDICATOR_CUTOVER_PARITY
+
+    plan = LOCAL_INDICATOR_CUTOVER_PARITY.request_plan("AAPL", date(2026, 8, 25))
+    starts = {k: v["params"]["start_time"] for k, v in plan["calls"].items()}
+    assert starts == {
+        "rsi": "2026-02-26T00:00:00Z",
+        "atr": "2026-02-26T00:00:00Z",
+        "macd": "2026-01-27T00:00:00Z",
+        "sma_20": "2026-05-27T00:00:00Z",
+        "sma_50": "2026-05-27T00:00:00Z",
+        "sma_200": "2025-09-29T00:00:00Z",
+    }
+    assert all(v["params"]["output"] == "last:30" for v in plan["calls"].values())

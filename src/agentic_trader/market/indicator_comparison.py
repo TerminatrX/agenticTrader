@@ -29,7 +29,7 @@ cross `max_stop_pct` and decline the setup outright.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
 from agentic_trader.models.capabilities import CapabilityProfile
@@ -522,6 +522,172 @@ window matches.
 """
 
 
+@dataclass(frozen=True)
+class CutoverParityIndicatorSpec:
+    """One broker call in the cutover parity run, at its own v3 range."""
+
+    key: str
+    indicator_type: str
+    lookback_calendar_days: int
+    period: int | None = None
+    fast_period: int | None = None
+    slow_period: int | None = None
+    signal_period: int | None = None
+
+    def start_time(self, trading_date: date) -> str:
+        start = trading_date - timedelta(days=self.lookback_calendar_days)
+        return datetime.combine(start, time.min, tzinfo=UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    def params(self, symbol: str, trading_date: date, profile: CutoverParityProfile):
+        out: dict[str, object] = {
+            "symbol": symbol,
+            "type": self.indicator_type,
+            "interval": profile.interval,
+            "bounds": profile.bounds,
+            "adjustment_type": profile.adjustment_type,
+            "output": profile.output,
+            "start_time": self.start_time(trading_date),
+        }
+        for name in ("period", "fast_period", "slow_period", "signal_period"):
+            value = getattr(self, name)
+            if value is not None:
+                out[name] = value
+        return out
+
+    def fingerprint_items(self) -> tuple[str, ...]:
+        items = [
+            f"parity.{self.key}.type={self.indicator_type}",
+            f"parity.{self.key}.lookback_calendar_days={self.lookback_calendar_days}",
+        ]
+        for name in ("period", "fast_period", "slow_period", "signal_period"):
+            value = getattr(self, name)
+            if value is not None:
+                items.append(f"parity.{self.key}.{name}={value}")
+        return tuple(items)
+
+
+@dataclass(frozen=True)
+class CutoverParityProfile(CapabilityProfile):
+    """The broker calls that produced the cutover parity evidence.
+
+    A third identity, distinct from both of the others, because it answers a
+    third question:
+
+        agentic-acquisition        what production requested
+        local-indicator-comparison do the formulas agree on identical inputs?
+        this profile               does legacy-window local computation
+                                   reproduce what production actually returned?
+
+    Unlike `ComparisonProfile`, every indicator keeps **its own** range -- the
+    v3 production lookback it is meant to reproduce -- rather than sharing one
+    long window. That is the whole point: the comparison is against production
+    values, so it has to issue production's ranges.
+
+    The one deliberate difference from a v3 request is `output`, widened to
+    expose more comparison points. It cannot change a value: the endpoint
+    computes the indicator over the full range first and trims afterward.
+    """
+
+    interval: str
+    bounds: str
+    adjustment_type: str
+    output: str
+    indicator_tool: str
+
+    #: The v3 production output widths this profile deviates from, recorded so
+    #: the deviation is stated rather than implied.
+    production_output_widths: tuple[str, ...]
+
+    specs: tuple[CutoverParityIndicatorSpec, ...]
+
+    def spec_for(self, key: str) -> CutoverParityIndicatorSpec:
+        for spec in self.specs:
+            if spec.key == key:
+                return spec
+        raise KeyError(f"no parity spec named {key!r} in {self.profile_ref}")
+
+    def request_plan(self, symbol: str, trading_date: date) -> dict[str, object]:
+        ticker = symbol.upper()
+        return {
+            "symbol": ticker,
+            "trading_date": trading_date.isoformat(),
+            "cutover_parity_profile_ref": self.profile_ref,
+            "cutover_parity_profile_fingerprint": self.content_fingerprint,
+            "calls": {
+                spec.key: {
+                    "tool": self.indicator_tool,
+                    "params": spec.params(ticker, trading_date, self),
+                }
+                for spec in self.specs
+            },
+        }
+
+    def fingerprint_items(self) -> tuple[str, ...]:
+        items = [
+            f"profile_id={self.profile_id}",
+            f"version={self.version}",
+            f"interval={self.interval}",
+            f"bounds={self.bounds}",
+            f"adjustment_type={self.adjustment_type}",
+            f"output={self.output}",
+            f"indicator_tool={self.indicator_tool}",
+            f"production_output_widths={','.join(sorted(self.production_output_widths))}",
+        ]
+        for spec in sorted(self.specs, key=lambda s: s.key):
+            items.extend(spec.fingerprint_items())
+        return tuple(items)
+
+
+def _parity_specs() -> tuple[CutoverParityIndicatorSpec, ...]:
+    """Built from the derivation profile rather than restated.
+
+    v4 removed the v3 indicator specs from the acquisition contract, so the
+    legacy ranges and periods now live in `CURRENT_DERIVATION`. Reading them
+    from there keeps one source: if a derivation window ever moves, the parity
+    profile that is supposed to mirror it moves with it, and its fingerprint
+    changes rather than silently describing a run nobody made.
+    """
+    from agentic_trader.market.indicator_derivation import CURRENT_DERIVATION
+
+    return tuple(
+        CutoverParityIndicatorSpec(
+            key=spec.key,
+            indicator_type=spec.kind,
+            lookback_calendar_days=spec.source_lookback_calendar_days,
+            period=spec.period,
+            fast_period=spec.fast_period,
+            slow_period=spec.slow_period,
+            signal_period=spec.signal_period,
+        )
+        for spec in CURRENT_DERIVATION.specs
+    )
+
+
+LOCAL_INDICATOR_CUTOVER_PARITY = CutoverParityProfile(
+    profile_id="local-indicator-cutover-parity",
+    version="v1-2026-08-25",
+    as_of=date(2026, 8, 25),
+    interval="day",
+    bounds="regular",
+    adjustment_type="split",
+    # The single intentional deviation from a v3 request.
+    output="last:30",
+    indicator_tool="get_equity_technical_indicators",
+    production_output_widths=("last:2", "latest"),
+    specs=_parity_specs(),
+)
+"""The contract the 2026-08-25 cutover parity measurements were taken under.
+
+Its per-indicator ranges are the v3 production ranges, read from the derivation
+profile rather than duplicated. `adjustment_type` and `start_time` are not
+echoed by the endpoint, so they are attested from this pinned request rather
+than recovered from the responses: a response proves what the provider
+computed, never the literal arguments sent.
+"""
+
+
 # --------------------------------------------------------------- tolerances
 
 PROPOSED_TOLERANCES: dict[str, Decimal] = {
@@ -585,10 +751,13 @@ def within_tolerance(delta: ValueDelta) -> bool | None:
 
 __all__ = [
     "LOCAL_INDICATOR_COMPARISON",
+    "LOCAL_INDICATOR_CUTOVER_PARITY",
     "PROPOSED_TOLERANCES",
     "REQUIRED_DECISION_AGREEMENT",
     "ComparisonIndicatorSpec",
     "ComparisonProfile",
+    "CutoverParityIndicatorSpec",
+    "CutoverParityProfile",
     "DecisionFlags",
     "FieldSummary",
     "StopImpact",

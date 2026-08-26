@@ -36,6 +36,7 @@ from decimal import Decimal
 from typing import Any, Literal
 
 from agentic_trader.execution.capabilities import ROBINHOOD_MCP, BrokerCapabilities
+from agentic_trader.execution.market_session import describe, session_status
 from agentic_trader.models import (
     LIVE_PERMITTED_PROTECTION,
     MarketSnapshot,
@@ -237,6 +238,29 @@ def build_order_payload(
     )
     intent = decision.intent
     assert intent is not None  # preflight guarantees this
+    current = now or datetime.now(UTC)
+
+    # Regular-session admission, before anything else structural.
+    #
+    # Applies to BUY and SELL alike, which is the point: the protection floor
+    # below only guards entries, so an exit built at 20:00 would otherwise face
+    # no check at all. `market_hours="regular_hours"` on the payload is an
+    # instruction to the broker, not evidence about when this process ran, and
+    # a queued open-next-session order is exactly what a market order sized off
+    # a stale indicator should not become.
+    #
+    # Shadow is deliberately exempt: evaluating out of hours is how analysis
+    # and replay work, and a shadow fill reaches nothing.
+    if mode != "shadow":
+        status = session_status(current)
+        if not status.is_open:
+            raise PreflightError(
+                f"outside the regular session ({describe(current)}) — refusing "
+                f"to build a live {intent.side.value.upper()} payload. The "
+                "broker would queue it for an open this decision was not made "
+                "against."
+            )
+        notes.append(f"session {describe(current)}")
 
     protection, protection_note = assess_protection(intent, capabilities=capabilities)
 
