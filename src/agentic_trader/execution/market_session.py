@@ -77,6 +77,23 @@ def to_eastern(instant: datetime) -> datetime:
     in_dst = start.astimezone(UTC) <= utc < end.astimezone(UTC)
     return utc.astimezone(EDT if in_dst else EST)
 
+PINNED_SESSION_YEARS = frozenset({2026, 2027, 2028})
+"""Years whose schedule has been checked against a published NYSE calendar.
+
+The rules below *extrapolate* -- give them 2035 and they will confidently
+produce a holiday set nobody has verified, and the exchange does move dates
+(Juneteenth was added in 2022; special closures are announced ad hoc). For a
+gate that admits live orders, confident extrapolation is the wrong failure
+mode.
+
+So live admission trusts only these years. Outside them the answer is
+`UNSUPPORTED_CALENDAR`, which is not open, so payload construction refuses.
+Extending the horizon is a deliberate edit: check the published schedule, add
+the year, add its cases to the tests.
+
+Shadow is unaffected -- analysis and replay over any period stay possible.
+"""
+
 REGULAR_OPEN = time(9, 30)
 REGULAR_CLOSE = time(16, 0)
 EARLY_CLOSE = time(13, 0)
@@ -90,6 +107,10 @@ class SessionStatus(StrEnum):
     AFTER_CLOSE = "after_close"
     WEEKEND = "weekend"
     HOLIDAY = "holiday"
+
+    UNSUPPORTED_CALENDAR = "unsupported_calendar"
+    """Outside the verified horizon. The recurrence rules would still produce
+    an answer; it just would not be one anybody checked."""
 
     @property
     def is_open(self) -> bool:
@@ -203,6 +224,8 @@ def session_status(instant: datetime) -> SessionStatus:
     local = to_eastern(instant)
     day = local.date()
 
+    if day.year not in PINNED_SESSION_YEARS:
+        return SessionStatus.UNSUPPORTED_CALENDAR
     if day.weekday() >= 5:
         return SessionStatus.WEEKEND
     if day in market_holidays(day.year):
@@ -222,6 +245,11 @@ def describe(instant: datetime) -> str:
     local = to_eastern(instant)
     if status is SessionStatus.OPEN:
         return f"regular session open ({local:%Y-%m-%d %H:%M %Z})"
+    if status is SessionStatus.UNSUPPORTED_CALENDAR:
+        return (
+            f"{local:%Y} is outside the verified session calendar "
+            f"({min(PINNED_SESSION_YEARS)}-{max(PINNED_SESSION_YEARS)})"
+        )
     close = session_close(local.date())
     window = (
         f"; session runs {REGULAR_OPEN:%H:%M}-{close:%H:%M} ET" if close else ""
@@ -231,6 +259,7 @@ def describe(instant: datetime) -> str:
 
 __all__ = [
     "EARLY_CLOSE",
+    "PINNED_SESSION_YEARS",
     "EDT",
     "EST",
     "REGULAR_CLOSE",

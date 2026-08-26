@@ -238,3 +238,124 @@ def test_a_live_payload_builds_inside_the_session(
     )
     with pytest.raises(PreflightError, match="not provably protected"):
         _live_plan(approved, fresh, risk_config, now=instant)
+
+
+# ======================================================= calendar horizon
+
+
+def test_the_pinned_horizon_is_explicit():
+    from agentic_trader.execution.market_session import PINNED_SESSION_YEARS
+
+    assert frozenset({2026, 2027, 2028}) == PINNED_SESSION_YEARS
+
+
+@pytest.mark.parametrize(
+    ("day", "name"),
+    [
+        (date(2027, 1, 1), "New Year's Day 2027"),
+        (date(2027, 3, 26), "Good Friday 2027"),
+        (date(2027, 6, 18), "Juneteenth observed (19th is a Saturday)"),
+        (date(2027, 7, 5), "Independence observed (4th is a Sunday)"),
+        (date(2027, 11, 25), "Thanksgiving 2027"),
+        (date(2027, 12, 24), "Christmas observed (25th is a Saturday)"),
+        (date(2028, 1, 17), "MLK Day 2028"),
+        (date(2028, 4, 14), "Good Friday 2028"),
+        (date(2028, 6, 19), "Juneteenth 2028"),
+        (date(2028, 7, 4), "Independence Day 2028"),
+        (date(2028, 11, 23), "Thanksgiving 2028"),
+        (date(2028, 12, 25), "Christmas 2028"),
+    ],
+)
+def test_published_2027_and_2028_holidays(day, name):
+    assert day in market_holidays(day.year), name
+
+
+@pytest.mark.parametrize(
+    "day", [date(2027, 11, 26), date(2028, 7, 3), date(2028, 11, 24)]
+)
+def test_published_2027_and_2028_early_closes(day):
+    assert day in early_closes(day.year)
+    assert session_close(day).hour == 13
+
+
+def test_a_saturday_new_year_is_not_observed_on_the_prior_year_end():
+    """1 January 2028 is a Saturday. The exchange does not close 31 December
+    2027 for it, and asserting otherwise would mark a full session closed."""
+    assert date(2027, 12, 31) not in market_holidays(2027)
+    assert date(2028, 1, 1) not in market_holidays(2028)
+
+
+def test_christmas_eve_2027_is_a_holiday_not_an_early_close():
+    assert date(2027, 12, 24) in market_holidays(2027)
+    assert date(2027, 12, 24) not in early_closes(2027)
+
+
+def test_an_unpinned_year_is_unsupported_even_mid_session():
+    """A 2029 Wednesday at 13:00 ET looks like a textbook open session. The
+    rules would happily produce an answer; nobody has checked it against a
+    published schedule, so the gate refuses instead."""
+    instant = _et(2029, 8, 15, 13, 0)
+    assert instant.astimezone(UTC).weekday() < 5
+    assert session_status(instant) is SessionStatus.UNSUPPORTED_CALENDAR
+    assert not session_status(instant).is_open
+
+
+@pytest.mark.parametrize("year", [2025, 2029, 2035])
+def test_years_outside_the_horizon_are_all_unsupported(year):
+    assert session_status(_et(year, 6, 17, 13, 0)) is (
+        SessionStatus.UNSUPPORTED_CALENDAR
+    )
+
+
+def test_a_live_buy_is_refused_in_an_unpinned_year(
+    approved, bullish_pullback_snapshot, risk_config
+):
+    instant = _et(2029, 8, 15, 13, 0)
+    stale = bullish_pullback_snapshot.model_copy(
+        update={"captured_at": instant, "quote_as_of": instant}
+    )
+    with pytest.raises(PreflightError, match="outside the regular session"):
+        _live_plan(approved, stale, risk_config, now=instant)
+
+
+def test_a_live_sell_is_refused_in_an_unpinned_year(
+    bullish_pullback_snapshot, account, risk_config, held_position
+):
+    from agentic_trader.models import Side, Signal, SignalStrength
+    from agentic_trader.risk.engine import RiskEngine
+
+    holding = account.model_copy(update={"positions": [held_position]})
+    decision = RiskEngine(risk_config).evaluate(
+        Signal(
+            symbol="AAPL", strategy="trend_pullback", strength=SignalStrength.EXIT,
+            side=Side.SELL, confidence=1.0,
+            reference_price=bullish_pullback_snapshot.reference_price,
+            reasons=["lost the 50-day"],
+        ),
+        bullish_pullback_snapshot, holding,
+        as_of=bullish_pullback_snapshot.captured_at.date(),
+    )
+    instant = _et(2029, 8, 15, 13, 0)
+    stale = bullish_pullback_snapshot.model_copy(
+        update={"captured_at": instant, "quote_as_of": instant}
+    )
+    with pytest.raises(PreflightError, match="outside the regular session"):
+        _live_plan(decision, stale, risk_config, now=instant)
+
+
+def test_shadow_still_works_in_an_unpinned_year(
+    approved, bullish_pullback_snapshot, risk_config
+):
+    """Analysis and replay over any period must stay possible."""
+    instant = _et(2029, 8, 15, 13, 0)
+    stale = bullish_pullback_snapshot.model_copy(
+        update={"captured_at": instant, "quote_as_of": instant}
+    )
+    plan = _live_plan(approved, stale, risk_config, now=instant, mode="shadow")
+    assert plan.mode == "shadow"
+
+
+def test_the_refusal_message_names_the_horizon():
+    from agentic_trader.execution.market_session import describe
+
+    assert "outside the verified session calendar" in describe(_et(2029, 8, 15, 13, 0))

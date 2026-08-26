@@ -267,10 +267,15 @@ def test_attaching_provenance_does_not_change_a_decision(tmp_path, account, risk
     assert diffs == [], diffs
 
 
-def test_a_held_position_exits_identically(tmp_path, account, risk_config, held_position):
-    """An indicator cutover that preserves entries but moves exits is not
-    parity. The exit path reads SMA50 and RSI, neither of which the entry path
-    exercises the same way."""
+def test_attaching_provenance_does_not_change_an_exit(
+    tmp_path, account, risk_config, held_position
+):
+    """Provenance invariance on the exit path. **Not** broker-to-local parity:
+    both sides hold identical numbers here.
+
+    Measured exit parity is
+    `test_measured_pairs_decide_identically_while_holding_a_position`.
+    """
     bars = _bars(_pullback_closes())
     before, after = _same_values_pair(bars)
     holding = account.model_copy(update={"positions": [held_position]})
@@ -283,9 +288,11 @@ def test_a_held_position_exits_identically(tmp_path, account, risk_config, held_
     assert diffs == [], diffs
 
 
-def test_a_no_signal_context_decides_identically(tmp_path, account, risk_config):
-    """Downtrend: fails at the first condition. The boring majority of cycles,
-    and the ones whose failed_conditions the review reads."""
+def test_attaching_provenance_does_not_change_a_no_signal_cycle(
+    tmp_path, account, risk_config
+):
+    """Provenance invariance again, on the path most cycles take. Identical
+    values on both sides; not a parity claim."""
     bars = _bars([f"{400 - i * 0.5:.2f}" for i in range(420)])
     before, after = _same_values_pair(bars)
     config = _config(tmp_path, risk_config)
@@ -311,10 +318,17 @@ def test_a_no_signal_context_decides_identically(tmp_path, account, risk_config)
         ("atr_ceiling", "atr"),
     ],
 )
-def test_a_boundary_case_decides_identically(tmp_path, account, risk_config, label, shift):
-    """Every live symbol sat far from a threshold, so agreement there proves
-    little about the cases that matter. These place a value exactly on a
-    comparison boundary, where a difference of any size would show.
+def test_a_synthetic_boundary_is_stable_under_provenance(
+    tmp_path, account, risk_config, label, shift
+):
+    """**Synthetic coverage, not measured parity.** Both sides carry the same
+    value; what varies is provenance.
+
+    This shows the pipeline behaves consistently with a value sitting exactly
+    on a comparison boundary -- useful, because no live symbol sat there. It
+    says nothing about broker-versus-local, which
+    `test_a_value_astride_a_threshold_by_the_residual_can_flip` addresses
+    directly and honestly.
     """
     bars = _bars(_pullback_closes())
     derived = derive_indicators(bars, TD).indicators
@@ -560,7 +574,9 @@ def test_the_cutover_report_records_zero_disagreements():
     assert report["verdict"] == "LOCAL_INDICATOR_CUTOVER_PARITY"
     assert report["numeric_parity"]["tolerance_failures"] == {}
     assert report["decision_parity"]["flag_disagreements"] == {}
-    assert report["pipeline_parity"]["disagreements"] == 0
+    observed = report["observed_measured_pipeline_parity"]
+    assert observed["no_position_context"]["decision_disagreements"] == 0
+    assert observed["held_position_context"]["decision_disagreements"] == 0
     assert report["call_reduction"] == {
         **report["call_reduction"], "before": 10, "after": 4,
     }
@@ -628,15 +644,102 @@ def test_measured_broker_and_local_pairs_decide_identically(tmp_path, account, r
     assert len(prose_diffs) <= 3, prose_diffs
 
 
-def test_the_measured_pairs_exercise_more_than_one_outcome(tmp_path, account, risk_config):
-    """A parity run in which every cycle short-circuits identically would prove
-    little. This records what the sample actually reached."""
+def test_the_measured_pairs_reach_three_outcomes_without_a_position(
+    tmp_path, account, risk_config
+):
+    """A parity run where every cycle short-circuits the same way proves
+    little, so the distribution is measured and pinned rather than assumed.
+
+    Observed 2026-08-25 over 144 pairs: no_signal 106, watch 32,
+    rejected_by_risk 6. Pinned as counts because a shift means the fixture
+    stopped exercising what it used to.
+    """
+    from collections import Counter
+
     config = _config(tmp_path, risk_config)
-    outcomes = {
-        _cycle(_row_snapshot(row, row["broker"]), account, config).outcome
+    outcomes = Counter(
+        _cycle(_row_snapshot(row, row["broker"]), account, config).outcome.value
         for row in _measured_pairs()
+    )
+    assert len(outcomes) >= 2
+    assert dict(outcomes) == {"no_signal": 106, "watch": 32, "rejected_by_risk": 6}
+
+
+def _held_account(account, row):
+    """The same account carrying one share of the row's symbol."""
+    from agentic_trader.models import Position
+
+    return account.model_copy(
+        update={
+            "positions": [
+                Position(
+                    symbol=row["symbol"], quantity=D("1"),
+                    average_cost=D(row["close"]), market_value=D(row["close"]),
+                    sector="Technology",
+                )
+            ]
+        }
+    )
+
+
+def test_measured_pairs_decide_identically_while_holding_a_position(
+    tmp_path, account, risk_config
+):
+    """The exit path, under the *measured* residual rather than copied values.
+
+    This is what the held-position coverage was missing: the previous exit test
+    used identical numbers on both sides, so it could not have detected an exit
+    disagreement. Here broker and local differ exactly as they do in
+    production, and the strategy reads SMA50 and RSI to decide whether the
+    thesis has broken.
+    """
+    config = _config(tmp_path, risk_config)
+    decision_diffs, prose_diffs = [], []
+
+    for row in _measured_pairs():
+        held = _held_account(account, row)
+        stop = (D(row["close"]) * D("0.95")).quantize(D("0.01"))
+        before = _cycle(
+            _row_snapshot(row, row["broker"]), held, config, active_stop=stop
+        )
+        after = _cycle(
+            _row_snapshot(row, row["local"], provenance=CURRENT_DERIVATION.provenance),
+            held, config, active_stop=stop,
+        )
+        if diffs := _compare(before, after):
+            decision_diffs.append((row["symbol"], row["begins_at"], diffs))
+        if prose := _prose_diffs(before, after):
+            prose_diffs.append((row["symbol"], row["begins_at"], prose))
+
+    assert decision_diffs == [], decision_diffs
+    assert prose_diffs == [], prose_diffs
+
+
+def test_the_held_position_pairs_reach_three_outcomes_including_exits(
+    tmp_path, account, risk_config
+):
+    """Held-position coverage is only meaningful if exits actually execute.
+
+    Observed 2026-08-25: no_signal 78, rejected_by_critic 57,
+    shadow_filled 9 -- nine real exits taken under the measured residual.
+    """
+    from collections import Counter
+
+    config = _config(tmp_path, risk_config)
+    outcomes = Counter()
+    for row in _measured_pairs():
+        held = _held_account(account, row)
+        stop = (D(row["close"]) * D("0.95")).quantize(D("0.01"))
+        outcomes[
+            _cycle(
+                _row_snapshot(row, row["broker"]), held, config, active_stop=stop
+            ).outcome.value
+        ] += 1
+
+    assert dict(outcomes) == {
+        "no_signal": 78, "rejected_by_critic": 57, "shadow_filled": 9,
     }
-    assert outcomes, "no cycles ran"
+    assert outcomes["shadow_filled"] > 0, "no exit was actually taken"
 
 
 # ------------------------------------------- boundary residual (not identity)
@@ -777,7 +880,9 @@ def test_the_report_distinguishes_observed_parity_from_identity():
 
 def test_the_report_records_the_reason_text_difference():
     """Reported, not buried."""
-    prose = _cutover_report()["pipeline_parity"]["reason_text_differences"]
+    prose = _cutover_report()["observed_measured_pipeline_parity"][
+        "reason_text_differences"
+    ]
     assert prose["count"] == 3
     assert prose["decision_effect"] == "none; every decision field matched on all 144 pairs"
 
@@ -787,3 +892,35 @@ def test_the_report_records_the_session_admission_rule():
     assert "BUY and SELL" in session["applies_to"]
     assert session["shadow"].startswith("exempt")
     assert "unscheduled closures" in session["not_modelled"]
+
+
+def test_the_report_keeps_observed_and_synthetic_evidence_apart():
+    """Combining them would overstate the parity claim: only the measured
+    pairs speak to broker-versus-local."""
+    report = _cutover_report()
+
+    observed = report["observed_measured_pipeline_parity"]
+    assert observed["measured_pairs"] == 144
+    assert observed["pairs_bitwise_identical"] == 0
+    assert observed["no_position_context"]["outcome_distribution"] == {
+        "no_signal": 106, "watch": 32, "rejected_by_risk": 6,
+    }
+    assert observed["held_position_context"]["outcome_distribution"] == {
+        "no_signal": 78, "rejected_by_critic": 57, "shadow_filled": 9,
+    }
+
+    synthetic = report["synthetic_threshold_sensitivity"]
+    assert "NOT broker/local parity" in synthetic["what_this_is"]
+    assert "DO reach different conclusions" in (
+        synthetic["exact_boundary_residual"]["finding"]
+    )
+    assert "pipeline_parity" not in report, "the combined statistic must be gone"
+
+
+def test_the_report_records_the_pinned_calendar_horizon():
+    from agentic_trader.execution.market_session import PINNED_SESSION_YEARS
+
+    session = _cutover_report()["session_admission"]
+    assert session["pinned_calendar_years"] == sorted(PINNED_SESSION_YEARS)
+    assert "UNSUPPORTED_CALENDAR" in session["outside_the_horizon"]
+    assert session["verified_against_published_calendars"] == [2026, 2027, 2028]

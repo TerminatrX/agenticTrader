@@ -235,46 +235,6 @@
     "harness_note": "Compared only where both sides carry every input; local SMA series are shorter because the provider prepends warm-up to fill its series, while a finite window needs none for its latest value. Production derives one latest value from the full envelope and is unaffected.",
     "result": "PASS"
   },
-  "pipeline_parity": {
-    "method": "144 measured broker/local value pairs from the parity run -- genuinely different numbers, 0 bitwise identical -- run through the real strategy, risk engine, critic and execution path from otherwise identical inputs (same non-indicator snapshot fields, AccountState, AppConfig, trading_date and now). An earlier version of this test copied local values into the broker side, which proved provenance invariance and nothing about parity; that test still exists, renamed for what it does.",
-    "contexts": [
-      "entry / no position",
-      "held position / exit, with an active stop",
-      "no-signal downtrend",
-      "synthetic boundaries: RSI 30, RSI 45, RSI 72, flat MACD histogram, price on SMA20, price on SMA200, ATR at the max-stop ceiling"
-    ],
-    "compared": [
-      "CycleOutcome",
-      "signal strength/side/confidence",
-      "stop",
-      "target",
-      "failed_conditions",
-      "reasons",
-      "risk decision",
-      "approved_notional",
-      "breached_limits",
-      "critic verdict/blocks/concerns",
-      "plan presence",
-      "plan mode/cost/managed stop/managed target",
-      "protection state",
-      "should_submit"
-    ],
-    "disagreements": 0,
-    "result": "PASS",
-    "measured_pairs": 144,
-    "pairs_bitwise_identical": 0,
-    "reason_text_differences": {
-      "count": 3,
-      "of": 144,
-      "fields": [
-        "signal.reasons",
-        "signal.failed_conditions"
-      ],
-      "cause": "those strings format indicator values to two decimals, so a residual in the thirteenth decimal can round differently at a .xx5 edge -- e.g. SMA20 rendering as 14.31 against 14.30",
-      "decision_effect": "none; every decision field matched on all 144 pairs",
-      "why_reported": "no gate reads them, but the performance review does, so it is a real documented property rather than something to tolerate silently"
-    }
-  },
   "call_reduction": {
     "scope": "per symbol, market-data calls only",
     "before": 10,
@@ -296,7 +256,8 @@
   "cutover_parity_profile_fingerprint": "90234ad621e4230bcfb59424b5cc80e5aa6028871ce5570254614627337966ca",
   "acceptance_claim": {
     "established": "observed production parity over the sampled window",
-    "not_established": "mathematical identity at every possible threshold value. Placed exactly astride a strict comparison and separated by the measured ~1e-13 residual, two implementations reach different conclusions -- that is arithmetic, not a defect. In the 144 measured pairs the closest RSI sat far more than 1e-6 from a band edge, so nothing came near enough for it to matter."
+    "not_established": "mathematical identity at every possible threshold value. Placed exactly astride a strict comparison and separated by the measured ~1e-13 residual, two implementations reach different conclusions -- that is arithmetic, not a defect. In the 144 measured pairs the closest RSI sat far more than 1e-6 from a band edge, so nothing came near enough for it to matter.",
+    "scope_note": "Observed and synthetic evidence are reported separately and must not be combined into one parity statistic: only the measured pairs speak to broker/local parity."
   },
   "session_admission": {
     "enforced_by": "build_order_payload, structurally, before the protection floor",
@@ -304,6 +265,95 @@
     "shadow": "exempt; out-of-hours evaluation is how analysis and replay work",
     "calendar": "explicit NYSE rules: weekends, nine fixed and floating holidays, Good Friday from Easter, Juneteenth from 2022, and the 13:00 early closes. No new dependency; the DST rule is written out because zoneinfo needs a tz database this platform does not ship.",
     "not_modelled": "unscheduled closures (weather, days of mourning, circuit-breaker halts). Those make it more permissive than reality, never less, which is part of why live execution still requires human confirmation.",
-    "determinism": "derived from the given instant; a replay with the recorded now agrees forever"
+    "determinism": "derived from the given instant; a replay with the recorded now agrees forever",
+    "pinned_calendar_years": [
+      2026,
+      2027,
+      2028
+    ],
+    "outside_the_horizon": "SessionStatus.UNSUPPORTED_CALENDAR, which is not open, so live payload construction refuses. The recurrence rules would still produce an answer for 2035; nobody has checked it against a published schedule, and confident extrapolation is the wrong failure mode for a live gate. Extending the horizon is a deliberate edit with its own tests.",
+    "verified_against_published_calendars": [
+      2026,
+      2027,
+      2028
+    ]
+  },
+  "observed_measured_pipeline_parity": {
+    "what_this_is": "144 measured broker/local value pairs -- genuinely different numbers, 0 bitwise identical -- run through the real strategy, risk engine, critic and execution path from otherwise identical inputs.",
+    "measured_pairs": 144,
+    "pairs_bitwise_identical": 0,
+    "no_position_context": {
+      "outcome_distribution": {
+        "no_signal": 106,
+        "watch": 32,
+        "rejected_by_risk": 6
+      },
+      "decision_disagreements": 0,
+      "reason_text_differences": 3
+    },
+    "held_position_context": {
+      "setup": "one share of the row's symbol, active stop at 95% of close",
+      "outcome_distribution": {
+        "no_signal": 78,
+        "rejected_by_critic": 57,
+        "shadow_filled": 9
+      },
+      "decision_disagreements": 0,
+      "reason_text_differences": 0,
+      "note": "nine real exits executed under the measured residual, so the exit path -- which reads SMA50 and RSI -- is genuinely exercised rather than merely reached"
+    },
+    "compared_fields": [
+      "CycleOutcome",
+      "signal strength/side/confidence",
+      "stop",
+      "target",
+      "failed_conditions",
+      "reasons",
+      "risk decision",
+      "approved_notional",
+      "breached_limits",
+      "critic verdict/blocks/concerns",
+      "plan presence",
+      "plan mode/cost/managed stop/managed target",
+      "protection state",
+      "should_submit"
+    ],
+    "reason_text_differences": {
+      "count": 3,
+      "of": 144,
+      "fields": [
+        "signal.reasons",
+        "signal.failed_conditions"
+      ],
+      "cause": "those strings format indicator values to two decimals, so a residual in the thirteenth decimal can round differently at a .xx5 edge -- e.g. SMA20 rendering as 14.31 against 14.30",
+      "decision_effect": "none; every decision field matched on all 144 pairs",
+      "why_reported": "no gate reads them, but the performance review does, so it is a real documented property rather than something to tolerate silently"
+    },
+    "result": "PASS"
+  },
+  "synthetic_threshold_sensitivity": {
+    "what_this_is": "Coverage, NOT broker/local parity. Both sides carry identical values and only provenance varies, or values are placed on a threshold by construction. Kept separate because describing it as parity would overstate the evidence.",
+    "provenance_invariance": {
+      "contexts": [
+        "entry",
+        "held-position exit",
+        "no-signal",
+        "seven boundary cases"
+      ],
+      "boundaries": [
+        "RSI 30",
+        "RSI 45",
+        "RSI 72",
+        "flat MACD histogram",
+        "price on SMA20",
+        "price on SMA200",
+        "ATR at the max-stop ceiling"
+      ],
+      "disagreements": 0
+    },
+    "exact_boundary_residual": {
+      "finding": "Placed exactly astride a strict comparison and separated by the measured ~1e-13 residual, broker and local DO reach different conclusions. That is arithmetic, not a defect -- any two implementations differing in the last bits behave this way.",
+      "why_it_did_not_occur": "no sampled RSI came within 1e-6 of a band edge, against a ~1e-13 residual"
+    }
   }
 }
