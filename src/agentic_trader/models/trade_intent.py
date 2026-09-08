@@ -66,18 +66,33 @@ class ProtectionState(StrEnum):
     but **protection has not been established**.
 
     PENDING does *not* mean an order was submitted, and does not mean the broker
-    holds a stop. Nothing has been sent. In the current build every whole-share
-    entry lands here, because stop submission is not implemented at all.
+    holds a stop. Nothing has been sent — this is the state of a position whose
+    stop *could* be placed but for which nothing has been asked of the broker.
 
-    When the lifecycle is built, the moment of "request attempted" deserves its
-    own state rather than being folded in here — the difference between "we have
-    not asked" and "we asked and do not yet know" matters during recovery. Until
-    then, read PENDING as strictly *unprotected*. The live allowlist enforces
-    that reading: PENDING cannot trade outside shadow."""
+    Read PENDING as strictly *unprotected*. The live allowlist enforces that
+    reading: PENDING cannot trade outside shadow."""
+
+    SUBMITTED = "submitted"
+    """A stop order was sent to the broker and the outcome is not yet known.
+
+    Separate from PENDING because the difference between "we have not asked" and
+    "we asked and do not yet know" is the question restart recovery has to
+    answer. Collapsing them loses the only evidence that an order may be resting
+    at the broker that this system does not know about — the state in which
+    placing a second stop would double the exit.
+
+    Not protection. A submission that was never confirmed may have been
+    rejected, and the live allowlist excludes this state for that reason: it
+    describes our uncertainty, not the broker's book. Recovery resolves it by
+    reading the broker, never by assuming."""
 
     PROTECTED = "protected"
     """The broker accepted a resting stop order. The only state that means the
-    position is actually covered while nothing is watching it."""
+    position is actually covered while nothing is watching it.
+
+    Reachable only from a broker-supplied order id. Nothing in this system may
+    infer PROTECTED from having built a payload, from a submission that returned
+    no id, or from the passage of time."""
 
     FAILED = "failed"
     """Submission was attempted and rejected. An incident, unlike UNAVAILABLE."""

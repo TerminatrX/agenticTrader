@@ -96,6 +96,12 @@ CREATE INDEX IF NOT EXISTS idx_trades_open   ON trades(closed_at);
 CREATE TABLE IF NOT EXISTS protective_orders (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     trade_client_key    TEXT NOT NULL,
+    -- Our own `ref_id` for this stop, derived deterministically from the entry
+    -- key plus the stop's price and quantity. Stored because it is the only
+    -- identifier that exists *before* the broker replies: a submission that
+    -- times out leaves no broker_order_id, and without this column that row
+    -- could never be matched to the order it may have created.
+    client_key          TEXT,
     broker_order_id     TEXT,
     state               TEXT NOT NULL,
     stop_price          TEXT,
@@ -194,6 +200,11 @@ CREATE INDEX IF NOT EXISTS idx_protective_trade ON protective_orders(trade_clien
 CREATE INDEX IF NOT EXISTS idx_protective_state ON protective_orders(state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_protective_broker_order
     ON protective_orders(broker_order_id) WHERE broker_order_id IS NOT NULL;
+-- Unique for the same reason the broker treats ref_id as an idempotency key:
+-- two rows with one client_key would mean we asked for the same stop twice and
+-- recorded both as distinct protection.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_protective_client_key
+    ON protective_orders(client_key) WHERE client_key IS NOT NULL;
 """
 
 
@@ -246,6 +257,13 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "capability_profile": "TEXT",
         "market_regime": "TEXT",
         "stop_basis": "TEXT",
+    },
+    # `protective_orders` shipped empty, ahead of the lifecycle that fills it.
+    # Nullable because a row written before this column existed cannot know the
+    # key it was submitted under, and inventing one would defeat the dedupe the
+    # column exists to provide.
+    "protective_orders": {
+        "client_key": "TEXT",
     },
 }
 
@@ -426,6 +444,157 @@ class JournalRepository:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM trades WHERE closed_at IS NULL").fetchall()
         return [_trade_from_row(r) for r in rows]
+
+    # --------------------------------------------------- protective stops
+
+    def record_protection_submitted(
+        self,
+        *,
+        trade_client_key: str,
+        client_key: str,
+        stop_price: Decimal,
+        requested_quantity: Decimal,
+        capability_profile: str,
+        submitted_at: datetime,
+    ) -> int:
+        """Record that a stop is about to be sent, before sending it.
+
+        Written *before* the broker call, which is the whole point. A
+        submission that times out, crashes, or loses its reply may still have
+        created a resting order, and a journal that only records stops it saw
+        succeed cannot distinguish that from one never sent. Recovery needs the
+        difference: re-placing a stop that already rests leaves two sell orders
+        on a position that can only be sold once.
+
+        Returns the row id so a caller holding it can resolve the outcome
+        without re-deriving the key.
+        """
+        with self._connect() as conn:
+            try:
+                cursor = conn.execute(
+                    """INSERT INTO protective_orders (
+                        trade_client_key, client_key, state, stop_price,
+                        requested_quantity, capability_profile,
+                        submitted_at, updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        trade_client_key,
+                        client_key,
+                        ProtectionState.SUBMITTED.value,
+                        _s(stop_price),
+                        _s(requested_quantity),
+                        capability_profile,
+                        submitted_at.isoformat(),
+                        submitted_at.isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"protective order {client_key} already recorded — this stop "
+                    "was already submitted; resolve the existing row rather than "
+                    "placing a second one"
+                ) from exc
+            return int(cursor.lastrowid or 0)
+
+    def record_protection_accepted(
+        self,
+        *,
+        client_key: str,
+        broker_order_id: str,
+        accepted_quantity: Decimal,
+        accepted_at: datetime,
+    ) -> None:
+        """Promote a submitted stop to PROTECTED, on the broker's evidence alone.
+
+        `broker_order_id` is required and must be non-empty. PROTECTED is the
+        only state asserting that a resting order exists, and the order id is
+        the only evidence of that which does not originate inside this system.
+        Without it the claim would be our own inference wearing the broker's
+        authority.
+
+        Promotes only from SUBMITTED. A row that already failed or was
+        cancelled describes an order that is not resting, and moving it to
+        PROTECTED would manufacture protection out of a stale confirmation.
+        """
+        if not broker_order_id.strip():
+            raise ValueError(
+                "broker_order_id is required to mark a stop PROTECTED — without "
+                "the broker's own id there is no evidence the order rests"
+            )
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """UPDATE protective_orders
+                      SET state = ?, broker_order_id = ?, accepted_quantity = ?,
+                          accepted_at = ?, updated_at = ?, last_reconciled_at = ?
+                    WHERE client_key = ? AND state = ?""",
+                (
+                    ProtectionState.PROTECTED.value,
+                    broker_order_id,
+                    _s(accepted_quantity),
+                    accepted_at.isoformat(),
+                    accepted_at.isoformat(),
+                    accepted_at.isoformat(),
+                    client_key,
+                    ProtectionState.SUBMITTED.value,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(
+                    f"no submitted protective order with client_key {client_key} — "
+                    "it was never recorded as submitted, or has already been resolved"
+                )
+
+    def record_protection_failed(
+        self, *, client_key: str, reason: str, failed_at: datetime
+    ) -> None:
+        """Record that the broker refused the stop. An incident, not a property.
+
+        Distinct from UNAVAILABLE, which says the position's shape can never be
+        protected. FAILED says this attempt was rejected, so the position is
+        open and uncovered right now and somebody has to decide what to do.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """UPDATE protective_orders
+                      SET state = ?, failure_reason = ?, updated_at = ?
+                    WHERE client_key = ? AND state = ?""",
+                (
+                    ProtectionState.FAILED.value,
+                    reason,
+                    failed_at.isoformat(),
+                    client_key,
+                    ProtectionState.SUBMITTED.value,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(
+                    f"no submitted protective order with client_key {client_key}"
+                )
+
+    def unconfirmed_protection(self) -> list[dict[str, Any]]:
+        """Stops that were sent and never resolved. The first query a restart runs.
+
+        Every row here is a position that may or may not have a resting stop at
+        the broker. The answer cannot be derived locally — it requires reading
+        the broker's open orders — and until it is read, neither placing a new
+        stop nor assuming the old one holds is safe.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM protective_orders WHERE state = ? ORDER BY submitted_at",
+                (ProtectionState.SUBMITTED.value,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def protective_orders_for(self, trade_client_key: str) -> list[dict[str, Any]]:
+        """Every protective order ever raised for one entry, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM protective_orders
+                    WHERE trade_client_key = ? ORDER BY id""",
+                (trade_client_key,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ----------------------------------------------------------- discovery
 

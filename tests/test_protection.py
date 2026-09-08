@@ -29,13 +29,15 @@ from agentic_trader.execution.capabilities import (
 )
 from agentic_trader.execution.executor import (
     PreflightError,
+    ProtectionNotPlaceable,
     assess_protection,
     build_order_payload,
+    build_protective_stop_payload,
 )
 from agentic_trader.execution.shadow_executor import SHADOW_PRODUCIBLE_STATES, ShadowExecutor
 from agentic_trader.journal import JournalRepository
 from agentic_trader.journal.models import TradeRecord
-from agentic_trader.models import ProtectionState, Side
+from agentic_trader.models import LIVE_PERMITTED_PROTECTION, ProtectionState, Side
 from agentic_trader.risk.engine import RiskEngine
 
 NOW = datetime(2026, 8, 13, 17, 44, tzinfo=UTC)
@@ -365,11 +367,11 @@ def test_rows_predating_protection_tracking_do_not_read_as_protected(tmp_path):
 
 
 def test_protective_orders_table_carries_the_lifecycle_columns(tmp_path):
-    """Schema only in this pass — no rows are written yet.
+    """The shape the lifecycle writes into.
 
-    Asserted so the deferred lifecycle lands as inserts rather than as a
-    migration against live trading history, and so the table cannot quietly
-    drift out of shape while nothing uses it.
+    Kept as its own assertion after the lifecycle landed: the columns below are
+    the ones recovery reads, and a rename that only broke reconciliation would
+    otherwise show up as a passing suite and an unprotected position.
     """
     JournalRepository(tmp_path / "j.db")
     with sqlite3.connect(tmp_path / "j.db") as conn:
@@ -381,3 +383,199 @@ def test_protective_orders_table_carries_the_lifecycle_columns(tmp_path):
         "submitted_at", "accepted_at", "triggered_at", "cancelled_at",
         "updated_at", "last_reconciled_at", "supersedes_protective_order_id",
     } <= columns
+
+
+# --------------------------------------------------------- the stop lifecycle
+#
+# The states below are the ones a live position's safety actually turns on.
+# Each test breaks exactly one condition, because a refusal no test can
+# provoke is a refusal nobody has evidence works.
+
+
+def test_submitted_is_not_permission_to_trade_live():
+    """"We asked and do not know" must gate exactly as "we never asked" does.
+
+    The allowlist is what makes this true by construction — a state added later
+    is excluded until somebody deliberately admits it — so this asserts the
+    property rather than the membership test that currently provides it.
+    """
+    assert ProtectionState.SUBMITTED not in LIVE_PERMITTED_PROTECTION
+    assert ProtectionState.PENDING not in LIVE_PERMITTED_PROTECTION
+    assert ProtectionState.FAILED not in LIVE_PERMITTED_PROTECTION
+
+
+def _stop_payload(**overrides):
+    kwargs = {
+        "account_number": "123456789",
+        "symbol": "F",
+        "quantity": Decimal("3"),
+        "stop_price": Decimal("11.40"),
+        "fill_price": Decimal("12.00"),
+        "entry_client_key": "2f1d7a6e-0000-5000-8000-000000000001",
+    }
+    kwargs.update(overrides)
+    return build_protective_stop_payload(**kwargs)
+
+
+def test_the_resting_stop_is_gtc_and_regular_hours():
+    """A day order would expire at the close and uncover the position overnight."""
+    payload = _stop_payload()
+
+    assert payload["type"] == "stop_market"
+    assert payload["side"] == "sell"
+    assert payload["time_in_force"] == "gtc"
+    assert payload["market_hours"] == "regular_hours"
+    assert payload["quantity"] == "3"
+    assert payload["stop_price"] == "11.40"
+
+
+@pytest.mark.parametrize("quantity", [Decimal("0.5"), Decimal("1.5"), Decimal("0.000001")])
+def test_a_fractional_quantity_gets_no_stop_payload(quantity):
+    """The restriction that makes every position at this account size unprotectable."""
+    with pytest.raises(ProtectionNotPlaceable, match="fractional"):
+        _stop_payload(quantity=quantity)
+
+
+@pytest.mark.parametrize("quantity", [Decimal("0"), Decimal("-1")])
+def test_a_non_positive_quantity_gets_no_stop_payload(quantity):
+    with pytest.raises(ProtectionNotPlaceable, match="not positive"):
+        _stop_payload(quantity=quantity)
+
+
+@pytest.mark.parametrize("stop", [Decimal("12.00"), Decimal("12.01")])
+def test_a_stop_at_or_above_the_fill_is_refused(stop):
+    """Such a stop triggers on placement and exits the position it protects.
+
+    The broker would accept it — the schema has no opinion about where a stop
+    sits relative to the market — so refusing it has to happen here.
+    """
+    with pytest.raises(ProtectionNotPlaceable, match="at or above"):
+        _stop_payload(stop_price=stop, fill_price=Decimal("12.00"))
+
+
+def test_rounding_a_stop_can_only_tighten_it():
+    """A stop rounded away from the fill would raise realized risk by accident."""
+    payload = _stop_payload(stop_price=Decimal("11.4501"), fill_price=Decimal("12.00"))
+
+    # 11.4501 -> 11.46, never 11.45: the rounded stop sits closer to the fill,
+    # so the loss it caps is no larger than the one the position was sized to.
+    assert payload["stop_price"] == "11.46"
+    assert Decimal(payload["stop_price"]) >= Decimal("11.4501")
+
+
+def test_an_identical_resubmission_reuses_the_broker_idempotency_key():
+    """A retry must collide at the broker rather than rest a second stop."""
+    assert _stop_payload()["ref_id"] == _stop_payload()["ref_id"]
+
+
+def test_a_moved_stop_is_a_different_order():
+    """This broker cannot modify a resting order, so a move is a new placement."""
+    original = _stop_payload(stop_price=Decimal("11.40"))
+    moved = _stop_payload(stop_price=Decimal("11.60"))
+    resized = _stop_payload(quantity=Decimal("2"))
+
+    assert original["ref_id"] != moved["ref_id"]
+    assert original["ref_id"] != resized["ref_id"]
+
+
+def _submit(repo, client_key="stop-key-1", trade_key="entry-key-1"):
+    repo.record_protection_submitted(
+        trade_client_key=trade_key,
+        client_key=client_key,
+        stop_price=Decimal("11.40"),
+        requested_quantity=Decimal("3"),
+        capability_profile=ROBINHOOD_MCP.profile_ref,
+        submitted_at=datetime(2026, 9, 4, 14, 30, tzinfo=UTC),
+    )
+
+
+def test_a_submitted_stop_is_recorded_before_it_is_protection(tmp_path):
+    """The row exists so a crashed submission is not invisible."""
+    repo = JournalRepository(tmp_path / "j.db")
+    _submit(repo)
+
+    (row,) = repo.protective_orders_for("entry-key-1")
+    assert row["state"] == ProtectionState.SUBMITTED.value
+    assert row["broker_order_id"] is None
+
+
+def test_promoting_to_protected_requires_a_broker_order_id(tmp_path):
+    """PROTECTED is the one claim that may not originate inside this system."""
+    repo = JournalRepository(tmp_path / "j.db")
+    _submit(repo)
+
+    with pytest.raises(ValueError, match="broker_order_id is required"):
+        repo.record_protection_accepted(
+            client_key="stop-key-1",
+            broker_order_id="   ",
+            accepted_quantity=Decimal("3"),
+            accepted_at=datetime(2026, 9, 4, 14, 31, tzinfo=UTC),
+        )
+
+    (row,) = repo.protective_orders_for("entry-key-1")
+    assert row["state"] == ProtectionState.SUBMITTED.value
+
+
+def test_a_broker_confirmation_is_what_makes_a_position_protected(tmp_path):
+    repo = JournalRepository(tmp_path / "j.db")
+    _submit(repo)
+
+    repo.record_protection_accepted(
+        client_key="stop-key-1",
+        broker_order_id="rh-order-abc",
+        accepted_quantity=Decimal("3"),
+        accepted_at=datetime(2026, 9, 4, 14, 31, tzinfo=UTC),
+    )
+
+    (row,) = repo.protective_orders_for("entry-key-1")
+    assert row["state"] == ProtectionState.PROTECTED.value
+    assert row["broker_order_id"] == "rh-order-abc"
+    assert row["last_reconciled_at"] is not None
+
+
+def test_a_rejected_stop_cannot_later_be_called_protected(tmp_path):
+    """A stale confirmation must not manufacture protection for a dead order."""
+    repo = JournalRepository(tmp_path / "j.db")
+    _submit(repo)
+    repo.record_protection_failed(
+        client_key="stop-key-1",
+        reason="insufficient shares",
+        failed_at=datetime(2026, 9, 4, 14, 31, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="no submitted protective order"):
+        repo.record_protection_accepted(
+            client_key="stop-key-1",
+            broker_order_id="rh-order-abc",
+            accepted_quantity=Decimal("3"),
+            accepted_at=datetime(2026, 9, 4, 14, 32, tzinfo=UTC),
+        )
+
+    (row,) = repo.protective_orders_for("entry-key-1")
+    assert row["state"] == ProtectionState.FAILED.value
+
+
+def test_the_same_stop_cannot_be_submitted_twice(tmp_path):
+    """Two rows for one key would mean two resting stops on one position."""
+    repo = JournalRepository(tmp_path / "j.db")
+    _submit(repo)
+
+    with pytest.raises(ValueError, match="already recorded"):
+        _submit(repo)
+
+
+def test_an_unresolved_submission_is_what_recovery_looks_for(tmp_path):
+    """The restart question: which positions might have a stop we never confirmed?"""
+    repo = JournalRepository(tmp_path / "j.db")
+    _submit(repo, client_key="stop-key-1", trade_key="entry-key-1")
+    _submit(repo, client_key="stop-key-2", trade_key="entry-key-2")
+    repo.record_protection_accepted(
+        client_key="stop-key-2",
+        broker_order_id="rh-order-xyz",
+        accepted_quantity=Decimal("3"),
+        accepted_at=datetime(2026, 9, 4, 14, 31, tzinfo=UTC),
+    )
+
+    unresolved = repo.unconfirmed_protection()
+
+    assert [r["client_key"] for r in unresolved] == ["stop-key-1"]

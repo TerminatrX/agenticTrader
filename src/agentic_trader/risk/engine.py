@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from agentic_trader.config import RiskConfig
 from agentic_trader.market.earnings_capabilities import (
@@ -61,6 +62,30 @@ def build_client_key(
     means the broker's own deduplication and ours key off the same string.
     """
     material = f"{account_number}|{symbol}|{side.value}|{strategy}|{session.isoformat()}"
+    return str(uuid.uuid5(_ORDER_NAMESPACE, material))
+
+
+def build_protective_client_key(
+    entry_client_key: str,
+    stop_price: Decimal,
+    quantity: Decimal,
+) -> str:
+    """Deterministic `ref_id` for the resting stop that covers one entry.
+
+    Derived from the entry's key so the protective order is traceable to the
+    position it covers, and so a retry of the *same* stop — a crashed run
+    resumed, a duplicated confirmation — dedupes at the broker instead of
+    stacking a second stop on one position. Two resting stops on a position
+    that can only be sold once means the second becomes a naked short the
+    moment the first fills.
+
+    Price and quantity are in the material because this broker cannot modify a
+    resting order: `replace_orders` is unsupported, so moving a stop is a
+    cancel followed by a new placement. A moved stop is genuinely a different
+    order and must not collide with the one it replaces, while an identical
+    re-submission must.
+    """
+    material = f"{entry_client_key}|protective_stop|{stop_price:f}|{quantity:f}"
     return str(uuid.uuid5(_ORDER_NAMESPACE, material))
 
 

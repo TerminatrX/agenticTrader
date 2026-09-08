@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 from typing import Any, Literal
 
 from agentic_trader.execution.capabilities import ROBINHOOD_MCP, BrokerCapabilities
@@ -45,6 +45,7 @@ from agentic_trader.models import (
     Side,
     TradeIntent,
 )
+from agentic_trader.risk.engine import build_protective_client_key
 
 MAX_FRACTIONAL_DP = Decimal("0.000001")  # Broker allows 6 decimal places.
 
@@ -117,6 +118,91 @@ def assess_protection(
     # protection is not protection, and it must gate exactly as a known-absent
     # capability does.
     return ProtectionState.UNAVAILABLE, feasibility.reason
+
+
+class ProtectionNotPlaceable(RuntimeError):
+    """Raised when a protective stop must not be constructed for a position.
+
+    Separate from `PreflightError`, which refuses an *entry*. This refuses the
+    order that would cover one, and the caller's correct response is different:
+    an entry that cannot be built is simply not taken, while a fill that cannot
+    be protected is a position already open and now known to be uncovered.
+    """
+
+
+def build_protective_stop_payload(
+    *,
+    account_number: str,
+    symbol: str,
+    quantity: Decimal,
+    stop_price: Decimal,
+    fill_price: Decimal,
+    entry_client_key: str,
+    capabilities: BrokerCapabilities = ROBINHOOD_MCP,
+) -> OrderPayload:
+    """Build the resting `stop_market` sell that covers a filled long entry.
+
+    Like every other function here this returns a payload and submits nothing.
+    `quantity` is the quantity actually filled, not the quantity intended: a
+    partial fill protected at the requested size would rest a stop for shares
+    the account does not hold, and the surplus becomes a short when it trips.
+
+    Four refusals, all structural. None is reachable by configuration, because
+    each one describes an order that would damage the position it claims to
+    protect rather than a preference about when to place it.
+    """
+    if quantity <= 0:
+        raise ProtectionNotPlaceable(f"filled quantity {quantity} is not positive")
+
+    if stop_price <= 0:
+        raise ProtectionNotPlaceable(f"stop price {stop_price} is not positive")
+
+    # A sell stop at or above the market triggers on placement, converting the
+    # protective order into an immediate market exit of a position taken
+    # seconds earlier. The broker would accept it; the schema has no opinion on
+    # whether a stop makes sense relative to the current price.
+    if stop_price >= fill_price:
+        raise ProtectionNotPlaceable(
+            f"stop {stop_price} is at or above the fill price {fill_price}; a sell "
+            "stop there triggers immediately and exits the position it was meant "
+            "to protect"
+        )
+
+    # Delegated rather than re-derived. `protection_feasibility` already owns
+    # the integrality rule and the broker's fractional-stop restriction, and a
+    # second implementation here would be free to drift out of agreement with
+    # the one `assess_protection` gates on.
+    feasibility = capabilities.protection_feasibility(quantity)
+    if feasibility.protectable is not True:
+        raise ProtectionNotPlaceable(feasibility.reason)
+
+    # Rounding can only tighten. Half a cent either way is immaterial to the
+    # thesis, but a stop rounded *away* from the fill would let a rounding
+    # artefact raise realized risk above the budget the position was sized to,
+    # and risk that grows by accident is the failure this codebase exists to
+    # prevent.
+    resting_stop = stop_price.quantize(Decimal("0.01"), rounding=ROUND_UP)
+
+    return {
+        "account_number": account_number,
+        "symbol": symbol,
+        "side": "sell",
+        "type": "stop_market",
+        "stop_price": f"{resting_stop:.2f}",
+        # Whole shares, guaranteed by the feasibility check above. Formatted as
+        # an integer because a fractional-looking quantity on a stop order is
+        # exactly what the broker rejects.
+        "quantity": f"{quantity.to_integral_value():f}",
+        # GTC so the stop rests across sessions. A day order would silently
+        # expire at the close and leave the position uncovered overnight —
+        # precisely the gap a resting stop exists to close.
+        "time_in_force": "gtc",
+        # Stops are regular-hours-only at this broker; one placed outside them
+        # queues for the next open. Stated rather than defaulted so the
+        # queueing is a recorded property of the order, not a surprise.
+        "market_hours": "regular_hours",
+        "ref_id": build_protective_client_key(entry_client_key, resting_stop, quantity),
+    }
 
 
 def preflight(
