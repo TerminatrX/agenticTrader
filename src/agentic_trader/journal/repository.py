@@ -586,6 +586,55 @@ class JournalRepository:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def update_trade_protection(self, client_key: str, state: ProtectionState) -> None:
+        """Bring the trade row's protection state in line with the stop's.
+
+        `protective_orders` is authoritative for the guard, which reads it
+        directly. This exists so the *trade* record does not keep asserting
+        COMMITTED for a position whose stop was confirmed hours earlier — the
+        performance review reads trades, and a review that misreports whether
+        stops were ever real is worse than one that says nothing.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE trades SET protection_state = ? WHERE client_key = ?",
+                (state.value, client_key),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"no trade with client_key {client_key}")
+
+    def unprotected_live_positions(self) -> list[str]:
+        """Open live positions with no confirmed resting stop. The entry blocker.
+
+        A live entry necessarily opens a window between the fill and its stop,
+        because protection cannot be established before there is a position to
+        protect. This query is how that window is proven closed: anything still
+        listed here is a real position carrying real risk that nothing is
+        watching between cycles.
+
+        Deliberately keyed on the *absence* of a PROTECTED row rather than on
+        any state written at entry time. SUBMITTED, FAILED, a missing row, a
+        stop that was cancelled and never replaced — every one of them means
+        unprotected, and enumerating the bad states would leave the next one
+        added silently safe.
+
+        Shadow is excluded because a shadow position is a record, not risk.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT t.client_key FROM trades t
+                    WHERE t.closed_at IS NULL
+                      AND t.mode = 'live'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM protective_orders p
+                           WHERE p.trade_client_key = t.client_key
+                             AND p.state = ?
+                      )
+                    ORDER BY t.opened_at""",
+                (ProtectionState.PROTECTED.value,),
+            ).fetchall()
+        return [r["client_key"] for r in rows]
+
     def protective_orders_for(self, trade_client_key: str) -> list[dict[str, Any]]:
         """Every protective order ever raised for one entry, oldest first."""
         with self._connect() as conn:

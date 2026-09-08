@@ -86,12 +86,20 @@ from agentic_trader.config import (
     risk_fingerprint,
     write_risk_lock,
 )
+from agentic_trader.execution.capabilities import ROBINHOOD_MCP
+from agentic_trader.execution.executor import (
+    ProtectionNotPlaceable,
+    build_flatten_payload,
+    build_protective_stop_payload,
+)
 from agentic_trader.journal import JournalRepository
+from agentic_trader.journal.models import TradeRecord
 from agentic_trader.market.acquisition import CURRENT_ACQUISITION
 from agentic_trader.market.market_regime import MarketContext, classify_market_regime
 from agentic_trader.market.snapshot import SnapshotError, build_snapshot
 from agentic_trader.market.symbol_regime import classify_symbol_regime
-from agentic_trader.models import AccountState
+from agentic_trader.models import AccountState, ExecutionMode, ProtectionState
+from agentic_trader.risk.sizing import max_whole_share_price
 from agentic_trader.strategies.base import available_strategies
 from agentic_trader.universe import CURRENT_DISCOVERY
 
@@ -530,6 +538,335 @@ def _render_result(result: CycleResult, *, symbol_regime: str) -> dict[str, Any]
 # --------------------------------------------------------------------- report
 
 
+# --------------------------------------------------------- the stop lifecycle
+#
+# Four commands covering the window between a live entry filling and its stop
+# resting at the broker. That window cannot be removed — a stop needs a position
+# to attach to — so these exist to make it short, observable, and terminating.
+#
+# The order is not advisory. `protect` writes SUBMITTED *before* emitting the
+# payload, so a crash between emitting and placing leaves a row saying "we may
+# have placed a stop" rather than nothing at all. Reversing it would make a
+# lost reply indistinguishable from an order never sent, and the recovery
+# question — is there already a stop resting? — unanswerable without guessing.
+
+
+def _repo_for(args: argparse.Namespace) -> tuple[JournalRepository, Path] | int:
+    try:
+        config = load_config(Path(args.project_root) if args.project_root else None)
+    except ConfigError as exc:
+        return _fail(str(exc))
+    return JournalRepository(args.db or _default_db(config.project_root)), config.project_root
+
+
+def cmd_record_fill(args: argparse.Namespace) -> int:
+    """Record a live entry that actually filled.
+
+    Nothing else writes a live position to the journal — `run_cycle` builds the
+    payload and stops. Until this runs, the position exists at the broker and
+    not in the record, which means `unprotected_live_positions` cannot see it
+    and the entry guard cannot fire. Skipping this step does not just lose an
+    audit row; it disarms the check that would otherwise notice the next
+    unprotected entry.
+    """
+    resolved = _repo_for(args)
+    if isinstance(resolved, int):
+        return resolved
+    repo, _ = resolved
+
+    try:
+        fill = _read_bundle(args.input)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return _fail(str(exc))
+
+    required = ("client_key", "symbol", "strategy", "fill_price", "quantity")
+    missing = [k for k in required if not fill.get(k)]
+    if missing:
+        return _fail(f"fill is missing required field(s): {', '.join(missing)}")
+
+    try:
+        quantity = Decimal(str(fill["quantity"]))
+        fill_price = Decimal(str(fill["fill_price"]))
+        stop_price = Decimal(str(fill["stop_price"])) if fill.get("stop_price") else None
+        target_price = Decimal(str(fill["target_price"])) if fill.get("target_price") else None
+        notional = Decimal(str(fill["notional"])) if fill.get("notional") else quantity * fill_price
+        opened_at = (
+            datetime.fromisoformat(fill["opened_at"])
+            if fill.get("opened_at")
+            else datetime.now(UTC)
+        )
+    except (ArithmeticError, ValueError) as exc:
+        return _fail(f"unparseable fill value: {exc}")
+
+    # COMMITTED, not PROTECTED. The position is live and uncovered at this
+    # instant; the state records what the caller is bound to do next, and the
+    # entry guard treats it as unprotected until a broker id says otherwise.
+    record = TradeRecord(
+        client_key=str(fill["client_key"]),
+        symbol=str(fill["symbol"]).upper(),
+        strategy=str(fill["strategy"]),
+        mode=ExecutionMode.LIVE,
+        opened_at=opened_at,
+        entry_price=fill_price,
+        quantity=quantity,
+        notional=notional,
+        stop_price=stop_price,
+        target_price=target_price,
+        entry_rationale=list(fill.get("entry_rationale") or []),
+        thesis=fill.get("thesis"),
+        invalidation_reason=fill.get("invalidation_reason"),
+        sector=fill.get("sector"),
+        protection_state=(
+            ProtectionState.COMMITTED if stop_price is not None else ProtectionState.NOT_REQUIRED
+        ),
+        capability_profile=fill.get("capability_profile") or ROBINHOOD_MCP.profile_ref,
+        market_regime=fill.get("market_regime"),
+        stop_basis=fill.get("stop_basis"),
+    )
+
+    try:
+        repo.record_trade(record)
+    except ValueError as exc:
+        return _fail(str(exc))
+
+    _emit(
+        {
+            "ok": True,
+            "recorded": record.client_key,
+            "symbol": record.symbol,
+            "quantity": record.quantity,
+            "protection_state": record.protection_state,
+            "next": (
+                "protect" if stop_price is not None else "none: this position carries no stop"
+            ),
+        }
+    )
+    return EXIT_OK
+
+
+def cmd_protect(args: argparse.Namespace) -> int:
+    """Build the resting stop for a filled position, and record it as submitted.
+
+    Emits the payload to place. The SUBMITTED row is written first, on purpose
+    — see the note above this section.
+    """
+    resolved = _repo_for(args)
+    if isinstance(resolved, int):
+        return resolved
+    repo, _ = resolved
+
+    open_trades = {t.client_key: t for t in repo.open_trades()}
+    trade = open_trades.get(args.client_key)
+    if trade is None:
+        return _fail(f"no open trade with client_key {args.client_key}")
+    if trade.stop_price is None:
+        return _fail(f"trade {args.client_key} carries no stop level; nothing to place")
+
+    # The filled quantity, not the intended one. A partial fill protected at
+    # the requested size rests a stop for shares the account does not hold.
+    quantity = Decimal(args.filled_quantity) if args.filled_quantity else trade.quantity
+    fill_price = Decimal(args.fill_price) if args.fill_price else trade.entry_price
+
+    try:
+        payload = build_protective_stop_payload(
+            account_number=args.account_number,
+            symbol=trade.symbol,
+            quantity=quantity,
+            stop_price=trade.stop_price,
+            fill_price=fill_price,
+            entry_client_key=trade.client_key,
+        )
+    except ProtectionNotPlaceable as exc:
+        # Not an error to swallow: the position is open and cannot be covered.
+        # The flatten payload is emitted with the refusal so the caller is never
+        # left holding an uncoverable position with no next move.
+        _emit(
+            {
+                "ok": False,
+                "error": str(exc),
+                "position_is_unprotected": True,
+                "flatten_payload": build_flatten_payload(
+                    account_number=args.account_number,
+                    symbol=trade.symbol,
+                    quantity=quantity,
+                    entry_client_key=trade.client_key,
+                ),
+                "next": "place flatten_payload to close the position, then record-exit",
+            }
+        )
+        return EXIT_BAD_INPUT
+
+    try:
+        repo.record_protection_submitted(
+            trade_client_key=trade.client_key,
+            client_key=payload["ref_id"],
+            stop_price=Decimal(payload["stop_price"]),
+            requested_quantity=quantity,
+            capability_profile=ROBINHOOD_MCP.profile_ref,
+            submitted_at=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return _fail(str(exc))
+
+    _emit(
+        {
+            "ok": True,
+            "protective_client_key": payload["ref_id"],
+            "state": ProtectionState.SUBMITTED,
+            "order_payload": payload,
+            "next": (
+                "place order_payload, then `protect-resolve` with the broker order id "
+                "— or with --failed if it was rejected"
+            ),
+        }
+    )
+    return EXIT_OK
+
+
+def cmd_protect_resolve(args: argparse.Namespace) -> int:
+    """Close the uncertainty a submitted stop opened, in one direction or the other.
+
+    Accepting requires the broker's own order id, because PROTECTED is the only
+    state asserting that a resting order exists and the id is the only evidence
+    of it that does not originate here.
+    """
+    resolved = _repo_for(args)
+    if isinstance(resolved, int):
+        return resolved
+    repo, _ = resolved
+
+    if args.failed:
+        try:
+            repo.record_protection_failed(
+                client_key=args.client_key,
+                reason=args.failed,
+                failed_at=datetime.now(UTC),
+            )
+        except ValueError as exc:
+            return _fail(str(exc))
+
+        rows = [
+            r
+            for r in repo.protective_orders_for(args.trade_client_key)
+            if r["client_key"] == args.client_key
+        ]
+        quantity = Decimal(rows[0]["requested_quantity"]) if rows else Decimal(args.quantity or "0")
+        _emit(
+            {
+                "ok": True,
+                "state": ProtectionState.FAILED,
+                "position_is_unprotected": True,
+                "flatten_payload": build_flatten_payload(
+                    account_number=args.account_number,
+                    symbol=args.symbol,
+                    quantity=quantity,
+                    entry_client_key=args.trade_client_key,
+                ),
+                "next": "place flatten_payload — the position is open and uncovered",
+            }
+        )
+        return EXIT_OK
+
+    if not args.accepted_order_id:
+        return _fail("pass --accepted-order-id or --failed")
+
+    try:
+        repo.record_protection_accepted(
+            client_key=args.client_key,
+            broker_order_id=args.accepted_order_id,
+            accepted_quantity=Decimal(args.quantity) if args.quantity else Decimal("0"),
+            accepted_at=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return _fail(str(exc))
+
+    # The trade row too, so a later review does not read COMMITTED for a
+    # position whose stop was confirmed. The guard does not depend on this.
+    try:
+        repo.update_trade_protection(args.trade_client_key, ProtectionState.PROTECTED)
+    except ValueError as exc:
+        return _fail(str(exc))
+
+    _emit(
+        {
+            "ok": True,
+            "state": ProtectionState.PROTECTED,
+            "broker_order_id": args.accepted_order_id,
+            "next": "none: the position is covered",
+        }
+    )
+    return EXIT_OK
+
+
+def cmd_record_exit(args: argparse.Namespace) -> int:
+    """Close a position in the journal after its exit filled.
+
+    Required to finish a flatten, and not merely for tidiness: an uncovered
+    live position blocks every subsequent live entry, and the block is keyed on
+    the trade being open. A position sold at the broker but left open here
+    stops the system permanently, for a position that no longer exists.
+    """
+    resolved = _repo_for(args)
+    if isinstance(resolved, int):
+        return resolved
+    repo, _ = resolved
+
+    try:
+        repo.close_trade(
+            client_key=args.client_key,
+            exit_price=Decimal(args.exit_price),
+            closed_at=datetime.now(UTC),
+            exit_reason=args.reason,
+        )
+    except (ArithmeticError, ValueError) as exc:
+        return _fail(str(exc))
+
+    _emit(
+        {
+            "ok": True,
+            "closed": args.client_key,
+            "exit_price": args.exit_price,
+            "reason": args.reason,
+            "live_entries_blocked": bool(repo.unprotected_live_positions()),
+        }
+    )
+    return EXIT_OK
+
+
+def cmd_protection_status(args: argparse.Namespace) -> int:
+    """What is open, what is uncovered, and what was never resolved.
+
+    The first command a session should run. `unconfirmed` is the dangerous
+    list: each row is a stop that may or may not be resting at the broker, and
+    the answer is only obtainable by reading the broker's open orders. Placing
+    a replacement without checking risks two resting stops on one position,
+    where the second becomes a short the moment the first fills.
+    """
+    resolved = _repo_for(args)
+    if isinstance(resolved, int):
+        return resolved
+    repo, _ = resolved
+
+    uncovered = repo.unprotected_live_positions()
+    _emit(
+        {
+            "ok": True,
+            "unprotected_live_positions": uncovered,
+            "unconfirmed": [
+                {
+                    "client_key": r["client_key"],
+                    "trade_client_key": r["trade_client_key"],
+                    "stop_price": r["stop_price"],
+                    "submitted_at": r["submitted_at"],
+                }
+                for r in repo.unconfirmed_protection()
+            ],
+            "live_entries_blocked": bool(uncovered),
+        }
+    )
+    return EXIT_OK
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     try:
         config = load_config(Path(args.project_root) if args.project_root else None)
@@ -633,9 +970,59 @@ def cmd_config_check(args: argparse.Namespace) -> int:
             "risk": config.risk.model_dump(mode="json"),
             "enabled_strategies": config.strategies.enabled_names(),
             "registered_strategies": available_strategies(),
+            **_whole_share_reach(config.risk, args.account_value),
         }
     )
     return EXIT_OK
+
+
+def _whole_share_reach(risk: Any, account_value: str | None) -> dict[str, Any]:
+    """What price range this account can hold as whole shares, by stop width.
+
+    Surfaced here because it is the constraint that decides whether live
+    trading is possible at all, and it is otherwise only discoverable one
+    rejected symbol at a time. Above these prices a position is fractional,
+    fractional positions cannot carry a resting stop, and unprotected positions
+    cannot be held live.
+    """
+    if not account_value:
+        return {}
+
+    try:
+        total = Decimal(account_value)
+    except ArithmeticError:
+        return {"whole_share_reach": {"error": f"unparseable account value {account_value!r}"}}
+
+    account = AccountState(
+        account_number="unused",
+        is_cash_account=True,
+        total_value=total,
+        cash=total,
+        # Buying power set to the full value on purpose: this is an upper
+        # bound, and a lower figure would understate reach for an account whose
+        # cash is merely unsettled today.
+        buying_power=total,
+        unsettled_funds=Decimal("0"),
+    )
+    return {
+        "whole_share_reach": {
+            "account_value": total,
+            "note": (
+                "Highest share price holdable as a whole share, so the highest "
+                "price a live position can exist at. Upper bound: sector "
+                "headroom and confidence below 1.0 lower it further."
+            ),
+            "by_stop_distance": {
+                f"{pct}": {
+                    "confidence_1.0": max_whole_share_price(account, risk, Decimal(pct)),
+                    "confidence_0.6": max_whole_share_price(
+                        account, risk, Decimal(pct), confidence=Decimal("0.6")
+                    ),
+                }
+                for pct in ("0.02", "0.05", "0.08", "0.12")
+            },
+        }
+    }
 
 
 def cmd_strategies(args: argparse.Namespace) -> int:
@@ -754,12 +1141,65 @@ def build_parser() -> argparse.ArgumentParser:
     )
     aq.set_defaults(func=cmd_acquisition_spec)
 
+    rf = sub.add_parser(
+        "record-fill",
+        help="Record a live entry that filled. Nothing else writes a live position.",
+    )
+    rf.add_argument("--input", help="Fill JSON (default: stdin).")
+    rf.set_defaults(func=cmd_record_fill)
+
+    pr = sub.add_parser(
+        "protect",
+        help="Build and record the resting stop for a filled position.",
+    )
+    pr.add_argument("--client-key", required=True, help="The entry's client_key.")
+    pr.add_argument("--account-number", required=True)
+    pr.add_argument(
+        "--filled-quantity",
+        help="Quantity actually filled. Defaults to the recorded quantity; pass it "
+        "explicitly after a partial fill.",
+    )
+    pr.add_argument("--fill-price", help="Actual fill price. Defaults to the recorded entry.")
+    pr.set_defaults(func=cmd_protect)
+
+    pv = sub.add_parser(
+        "protect-resolve",
+        help="Record whether the broker accepted the stop. Emits a flatten payload if not.",
+    )
+    pv.add_argument("--client-key", required=True, help="The protective order's client_key.")
+    pv.add_argument("--trade-client-key", required=True, help="The entry's client_key.")
+    pv.add_argument("--account-number", required=True)
+    pv.add_argument("--symbol", required=True)
+    pv.add_argument("--accepted-order-id", help="Broker order id. Required to mark PROTECTED.")
+    pv.add_argument("--failed", help="Rejection reason. Emits the flatten payload.")
+    pv.add_argument("--quantity", help="Accepted quantity.")
+    pv.set_defaults(func=cmd_protect_resolve)
+
+    rx = sub.add_parser(
+        "record-exit",
+        help="Close a position after its exit filled. Required to finish a flatten.",
+    )
+    rx.add_argument("--client-key", required=True, help="The entry's client_key.")
+    rx.add_argument("--exit-price", required=True)
+    rx.add_argument("--reason", required=True, help="Why the position was closed.")
+    rx.set_defaults(func=cmd_record_exit)
+
+    ps = sub.add_parser(
+        "protection-status",
+        help="Uncovered live positions and unresolved stop submissions. Run this first.",
+    )
+    ps.set_defaults(func=cmd_protection_status)
+
     rp = sub.add_parser("report", help="Performance and audit summary.")
     rp.add_argument("--strategy", help="Limit to one strategy.")
     rp.add_argument("--limit", type=int, default=20)
     rp.set_defaults(func=cmd_report)
 
     cc = sub.add_parser("config-check", help="Validate configuration and show effective values.")
+    cc.add_argument(
+        "--account-value",
+        help="Account value, to report the price range holdable as whole shares.",
+    )
     cc.set_defaults(func=cmd_config_check)
 
     st = sub.add_parser("strategies", help="List registered strategies.")

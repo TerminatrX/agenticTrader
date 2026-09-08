@@ -30,6 +30,7 @@ those are what tell you later whether the filters were working.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -147,6 +148,14 @@ def run_cycle(
     recent_symbol_trades: int = 0,
     active_stop: Decimal | None = None,
     market_context: MarketContext | None = None,
+    # Both default to the safe answer, so a caller that has not thought about
+    # protection gets the behaviour that existed before it was implemented.
+    # `unprotected_live_positions` comes from the journal
+    # (`unprotected_live_positions()`); passing an empty list while the journal
+    # holds uncovered live positions asserts something this function cannot
+    # check, and the assertion would be wrong exactly when it matters.
+    unprotected_live_positions: Sequence[str] = (),
+    post_fill_protection: bool = False,
     now: datetime | None = None,
 ) -> CycleResult:
     """Evaluate one symbol under one strategy.
@@ -295,6 +304,8 @@ def run_cycle(
             mode=plan_mode,
             known_client_keys=known_client_keys,
             now=current,
+            unprotected_live_positions=unprotected_live_positions,
+            post_fill_protection=post_fill_protection,
         )
     except PreflightError as exc:
         result.errors.append(str(exc))

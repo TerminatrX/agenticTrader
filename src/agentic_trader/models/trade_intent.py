@@ -72,6 +72,24 @@ class ProtectionState(StrEnum):
     Read PENDING as strictly *unprotected*. The live allowlist enforces that
     reading: PENDING cannot trade outside shadow."""
 
+    COMMITTED = "committed"
+    """The position is protectable and the caller is bound to protect it.
+
+    A plan-time state, and the only one that admits a live entry without a stop
+    already resting — which it must, because no stop can rest before there is a
+    position to attach it to. Every live entry opens that window; pretending
+    otherwise would just move the window somewhere less visible.
+
+    What makes this a claim rather than a hope is what happens when it is
+    broken. A caller reaching COMMITTED must place the stop immediately after
+    the fill and flatten the position if it cannot, and a position left
+    uncovered past its cycle blocks every subsequent live entry until a human
+    resolves it. The commitment is enforced after the fact, by consequence,
+    rather than asserted beforehand by a flag.
+
+    It does *not* say a stop exists. Nothing may read COMMITTED as protection,
+    and a position sitting in this state at rest is unprotected."""
+
     SUBMITTED = "submitted"
     """A stop order was sent to the broker and the outcome is not yet known.
 
@@ -153,11 +171,26 @@ making.
 
 
 # The only states under which a position may be carried outside shadow mode.
-# Everything else — UNAVAILABLE, PENDING, FAILED, and any state added later —
-# fails closed. Written as an allowlist rather than a denylist so a new state
-# defaults to blocking rather than to trading.
+# Everything else — UNAVAILABLE, PENDING, SUBMITTED, FAILED, and any state
+# added later — fails closed. Written as an allowlist rather than a denylist so
+# a new state defaults to blocking rather than to trading.
+#
+# COMMITTED is here because a live entry cannot be gated on a stop that
+# physically cannot exist yet, and refusing it outright does not make the
+# position safer — it makes live entries impossible, which is a different
+# decision wearing a safety argument. What keeps it honest is that COMMITTED is
+# only reachable when the caller declares the post-fill protocol, and a
+# position that ends a cycle uncovered blocks every later live entry.
+#
+# SUBMITTED is deliberately absent. "We asked and do not know" is the state
+# recovery exists to resolve, and treating it as permission would let an
+# unconfirmed order stand in for a confirmed one.
 LIVE_PERMITTED_PROTECTION = frozenset(
-    {ProtectionState.NOT_REQUIRED, ProtectionState.PROTECTED}
+    {
+        ProtectionState.NOT_REQUIRED,
+        ProtectionState.COMMITTED,
+        ProtectionState.PROTECTED,
+    }
 )
 
 

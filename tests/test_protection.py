@@ -15,6 +15,7 @@ live may not, and no configuration value can change that.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -31,14 +32,21 @@ from agentic_trader.execution.executor import (
     PreflightError,
     ProtectionNotPlaceable,
     assess_protection,
+    build_flatten_payload,
     build_order_payload,
     build_protective_stop_payload,
 )
 from agentic_trader.execution.shadow_executor import SHADOW_PRODUCIBLE_STATES, ShadowExecutor
 from agentic_trader.journal import JournalRepository
 from agentic_trader.journal.models import TradeRecord
-from agentic_trader.models import LIVE_PERMITTED_PROTECTION, ProtectionState, Side
+from agentic_trader.models import (
+    LIVE_PERMITTED_PROTECTION,
+    AccountState,
+    ProtectionState,
+    Side,
+)
 from agentic_trader.risk.engine import RiskEngine
+from agentic_trader.risk.sizing import max_whole_share_price
 
 NOW = datetime(2026, 8, 13, 17, 44, tzinfo=UTC)
 
@@ -195,9 +203,10 @@ def test_a_whole_share_entry_is_pending_not_protected(
 ):
     """Placeable is not placed.
 
-    Nothing submits the stop yet, so a position that *could* be protected still
-    is not. Calling it PROTECTED would be the exact false assurance this
-    tracking exists to prevent.
+    The default answer, for every caller that has not declared it will run the
+    stop lifecycle. A position that *could* be protected still is not, and
+    calling it PROTECTED would be the exact false assurance this tracking
+    exists to prevent.
     """
     decision = _entry_intent(entry_signal, bullish_pullback_snapshot, account, risk_config)
     whole = decision.intent.model_copy(
@@ -206,7 +215,7 @@ def test_a_whole_share_entry_is_pending_not_protected(
     state, note = assess_protection(whole)
 
     assert state is ProtectionState.PENDING
-    assert "not implemented" in note
+    assert "no post-fill protection was declared" in note
 
 
 def test_exits_and_stopless_intents_need_no_protection(
@@ -465,7 +474,10 @@ def test_rounding_a_stop_can_only_tighten_it():
 
 def test_an_identical_resubmission_reuses_the_broker_idempotency_key():
     """A retry must collide at the broker rather than rest a second stop."""
-    assert _stop_payload()["ref_id"] == _stop_payload()["ref_id"]
+    first = _stop_payload()
+    retry = _stop_payload()
+
+    assert first["ref_id"] == retry["ref_id"]
 
 
 def test_a_moved_stop_is_a_different_order():
@@ -579,3 +591,440 @@ def test_an_unresolved_submission_is_what_recovery_looks_for(tmp_path):
     unresolved = repo.unconfirmed_protection()
 
     assert [r["client_key"] for r in unresolved] == ["stop-key-1"]
+
+
+# ------------------------------------------------- flatten, commit, and teeth
+#
+# These three are one mechanism. COMMITTED admits a live entry whose stop
+# cannot exist yet; the flatten payload is how that entry ends if the stop
+# never arrives; the uncovered-position guard is what happens when neither
+# occurred. Testing any of them alone would miss the point.
+
+
+def test_a_fractional_position_can_still_be_flattened():
+    """The asymmetry that makes the commitment keepable.
+
+    A position too fractional to protect is not too fractional to close —
+    selling a long is not a short sale, so `fractional_market_orders` covers it.
+    Without this, an unprotectable fill would have no exit but a manual one.
+    """
+    payload = build_flatten_payload(
+        account_number="123456789",
+        symbol="AAPL",
+        quantity=Decimal("0.066225"),
+        entry_client_key="2f1d7a6e-0000-5000-8000-000000000001",
+    )
+
+    assert payload["side"] == "sell"
+    assert payload["type"] == "market"
+    assert payload["quantity"] == "0.066225"
+    assert payload["market_hours"] == "regular_hours"
+
+
+def test_flattening_the_same_position_twice_dedupes():
+    """A repeated flatten is one order. Selling twice would open a short."""
+    args = {
+        "account_number": "123456789",
+        "symbol": "AAPL",
+        "quantity": Decimal("1"),
+        "entry_client_key": "2f1d7a6e-0000-5000-8000-000000000001",
+    }
+    first = build_flatten_payload(**args)
+    retry = build_flatten_payload(**args)
+
+    assert first["ref_id"] == retry["ref_id"]
+
+
+def test_a_flatten_and_its_stop_are_never_the_same_order():
+    """Distinct keys, or one would silently suppress the other at the broker."""
+    flatten = build_flatten_payload(
+        account_number="123456789",
+        symbol="F",
+        quantity=Decimal("3"),
+        entry_client_key="2f1d7a6e-0000-5000-8000-000000000001",
+    )
+
+    assert flatten["ref_id"] != _stop_payload()["ref_id"]
+
+
+def test_committed_is_only_reachable_by_declaring_the_protocol(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """The default must be the unprotected answer, for callers who never thought about it."""
+    decision = _entry_intent(entry_signal, bullish_pullback_snapshot, account, risk_config)
+    whole = decision.intent.model_copy(
+        update={"notional": Decimal("302.25"), "reference_price": Decimal("302.25")}
+    )
+
+    assert assess_protection(whole)[0] is ProtectionState.PENDING
+    assert (
+        assess_protection(whole, post_fill_protection=True)[0] is ProtectionState.COMMITTED
+    )
+
+
+def test_declaring_the_protocol_cannot_rescue_an_unprotectable_position(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """A promise does not make a fractional position protectable.
+
+    This is the failure that would matter most: a caller setting the flag to
+    unlock live and getting it on positions the broker can never cover.
+    """
+    decision = _entry_intent(entry_signal, bullish_pullback_snapshot, account, risk_config)
+    state, note = assess_protection(decision.intent, post_fill_protection=True)
+
+    assert state is ProtectionState.UNAVAILABLE
+    assert "fractional" in note
+
+
+def test_committed_admits_a_live_entry_and_pending_does_not():
+    """The allowlist is the whole gate, so assert both sides of it."""
+    assert ProtectionState.COMMITTED in LIVE_PERMITTED_PROTECTION
+    assert ProtectionState.PENDING not in LIVE_PERMITTED_PROTECTION
+    assert ProtectionState.SUBMITTED not in LIVE_PERMITTED_PROTECTION
+    assert ProtectionState.UNAVAILABLE not in LIVE_PERMITTED_PROTECTION
+
+
+def test_an_uncovered_live_position_blocks_the_next_live_entry(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """The teeth behind COMMITTED.
+
+    If the lifecycle silently stops running, this is what notices. Without it,
+    COMMITTED would be a promise nothing ever checks.
+    """
+    decision = _entry_intent(entry_signal, bullish_pullback_snapshot, account, risk_config)
+
+    with pytest.raises(PreflightError, match="no confirmed protective stop"):
+        build_order_payload(
+            decision,
+            bullish_pullback_snapshot,
+            "123456789",
+            mode="live",
+            post_fill_protection=True,
+            unprotected_live_positions=["entry-key-1"],
+            now=NOW,
+        )
+
+
+def test_an_uncovered_position_does_not_block_shadow(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """Shadow carries no risk to compound, and blocking it would stall analysis."""
+    decision = _entry_intent(entry_signal, bullish_pullback_snapshot, account, risk_config)
+
+    plan = build_order_payload(
+        decision,
+        bullish_pullback_snapshot,
+        "123456789",
+        mode="shadow",
+        unprotected_live_positions=["entry-key-1"],
+        now=NOW,
+    )
+
+    assert plan.mode == "shadow"
+
+
+def test_only_a_protected_row_clears_a_live_position(tmp_path):
+    """Every other state means unprotected, including states added later.
+
+    Keyed on the absence of PROTECTED rather than a list of bad states, so a
+    new state does not arrive silently safe.
+    """
+    repo = JournalRepository(tmp_path / "j.db")
+    repo.record_trade(
+        TradeRecord(
+            client_key="entry-key-1",
+            symbol="F",
+            strategy="trend_pullback",
+            mode="live",
+            opened_at=datetime(2026, 9, 8, 15, 0, tzinfo=UTC),
+            entry_price=Decimal("12.00"),
+            quantity=Decimal("3"),
+            notional=Decimal("36.00"),
+        )
+    )
+
+    assert repo.unprotected_live_positions() == ["entry-key-1"]
+
+    _submit(repo, client_key="stop-key-1", trade_key="entry-key-1")
+    assert repo.unprotected_live_positions() == ["entry-key-1"]  # submitted is not covered
+
+    repo.record_protection_accepted(
+        client_key="stop-key-1",
+        broker_order_id="rh-order-abc",
+        accepted_quantity=Decimal("3"),
+        accepted_at=datetime(2026, 9, 8, 15, 1, tzinfo=UTC),
+    )
+    assert repo.unprotected_live_positions() == []
+
+
+def test_a_shadow_position_is_a_record_not_exposure(tmp_path):
+    """Shadow positions must never trip the live-entry blocker."""
+    repo = JournalRepository(tmp_path / "j.db")
+    repo.record_trade(
+        TradeRecord(
+            client_key="shadow-key-1",
+            symbol="F",
+            strategy="trend_pullback",
+            mode="shadow",
+            opened_at=datetime(2026, 9, 8, 15, 0, tzinfo=UTC),
+            entry_price=Decimal("12.00"),
+            quantity=Decimal("3"),
+            notional=Decimal("36.00"),
+        )
+    )
+
+    assert repo.unprotected_live_positions() == []
+
+
+def test_a_committed_whole_share_entry_builds_a_live_payload(
+    entry_signal, bullish_pullback_snapshot, account, risk_config
+):
+    """The acceptance test for the whole mechanism: live becomes reachable.
+
+    Every other test here asserts a refusal. If none asserts a success, the
+    gate could be closed permanently and the suite would still be green — the
+    failure mode where safety work quietly removes the feature it was meant to
+    make safe.
+    """
+    decision = _entry_intent(entry_signal, bullish_pullback_snapshot, account, risk_config)
+    whole = decision.intent.model_copy(
+        update={"notional": Decimal("302.25"), "reference_price": Decimal("302.25")}
+    )
+    decision = decision.model_copy(update={"intent": whole})
+
+    plan = build_order_payload(
+        decision, bullish_pullback_snapshot, account.account_number,
+        mode="live",
+        post_fill_protection=True,
+        unprotected_live_positions=[],
+        now=NOW,
+    )
+
+    assert plan.mode == "live"
+    assert plan.protection is ProtectionState.COMMITTED
+    # The entry still carries no broker-native stop. That is the window the
+    # lifecycle closes, and the warning must survive the gate opening.
+    assert any("MANAGED" in w for w in plan.warnings)
+
+
+# ---------------------------------------------------- the lifecycle, end to end
+#
+# The CLI is the only surface that actually drives protection, so these test the
+# commands rather than the functions beneath them. The property under test is
+# the sequence: each step must leave the journal in a state the next step can
+# read, and a position must not be able to slip out of the guard by any route
+# other than a confirmed stop or a closed trade.
+
+
+def _cli(tmp_path, *argv) -> tuple[int, dict]:
+    import io
+    from contextlib import redirect_stdout
+
+    from agentic_trader.cli import main
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        code = main(["--db", str(tmp_path / "j.db"), *argv])
+    return code, json.loads(buf.getvalue())
+
+
+def _record_live_fill(tmp_path, quantity="3", stop="11.40"):
+    fill = tmp_path / "fill.json"
+    fill.write_text(
+        json.dumps(
+            {
+                "client_key": "11111111-2222-5333-8444-555555555555",
+                "symbol": "F",
+                "strategy": "trend_pullback",
+                "fill_price": "12.00",
+                "quantity": quantity,
+                "stop_price": stop,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return _cli(tmp_path, "record-fill", "--input", str(fill))
+
+
+def test_a_recorded_live_fill_immediately_blocks_further_entries(tmp_path):
+    """The guard arms the moment the position exists, not when the stop fails."""
+    code, out = _record_live_fill(tmp_path)
+    assert code == 0
+    assert out["protection_state"] == ProtectionState.COMMITTED.value
+
+    _, status = _cli(tmp_path, "protection-status")
+    assert status["live_entries_blocked"] is True
+
+
+def test_a_submitted_stop_does_not_unblock_entries(tmp_path):
+    """Only a broker confirmation clears the guard — asking is not covering."""
+    _record_live_fill(tmp_path)
+    code, out = _cli(
+        tmp_path, "protect",
+        "--client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+    )
+    assert code == 0
+    assert out["state"] == ProtectionState.SUBMITTED.value
+
+    _, status = _cli(tmp_path, "protection-status")
+    assert status["live_entries_blocked"] is True
+    assert len(status["unconfirmed"]) == 1
+
+
+def test_a_confirmed_stop_clears_the_guard(tmp_path):
+    _record_live_fill(tmp_path)
+    _, submitted = _cli(
+        tmp_path, "protect",
+        "--client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+    )
+
+    code, _ = _cli(
+        tmp_path, "protect-resolve",
+        "--client-key", submitted["protective_client_key"],
+        "--trade-client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+        "--symbol", "F",
+        "--accepted-order-id", "rh-order-abc",
+        "--quantity", "3",
+    )
+    assert code == 0
+
+    _, status = _cli(tmp_path, "protection-status")
+    assert status["live_entries_blocked"] is False
+
+
+def test_an_unprotectable_fill_is_handed_its_own_exit(tmp_path):
+    """A refusal that leaves the caller stranded is worse than no refusal.
+
+    The position is already open at this point, so `protect` failing has to
+    come with the way out rather than only the reason.
+    """
+    _record_live_fill(tmp_path, quantity="0.066225", stop="11.40")
+    code, out = _cli(
+        tmp_path, "protect",
+        "--client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+    )
+
+    assert code != 0
+    assert out["position_is_unprotected"] is True
+    assert out["flatten_payload"]["side"] == "sell"
+    assert out["flatten_payload"]["type"] == "market"
+    assert out["flatten_payload"]["quantity"] == "0.066225"
+
+
+def test_a_rejected_stop_is_handed_its_own_exit(tmp_path):
+    _record_live_fill(tmp_path)
+    _, submitted = _cli(
+        tmp_path, "protect",
+        "--client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+    )
+
+    code, out = _cli(
+        tmp_path, "protect-resolve",
+        "--client-key", submitted["protective_client_key"],
+        "--trade-client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+        "--symbol", "F",
+        "--failed", "insufficient shares held",
+    )
+
+    assert code == 0
+    assert out["state"] == ProtectionState.FAILED.value
+    assert out["flatten_payload"]["quantity"] == "3.000000"
+
+
+def test_a_flattened_position_must_be_closed_to_unblock_trading(tmp_path):
+    """The failure this test exists for: selling at the broker and not here.
+
+    The guard keys on the trade being open, so a position flattened at the
+    broker but left open in the journal blocks the system permanently — for a
+    position that no longer exists.
+    """
+    _record_live_fill(tmp_path, quantity="0.066225")
+    _cli(
+        tmp_path, "protect",
+        "--client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+    )
+
+    _, before = _cli(tmp_path, "protection-status")
+    assert before["live_entries_blocked"] is True
+
+    code, out = _cli(
+        tmp_path, "record-exit",
+        "--client-key", "11111111-2222-5333-8444-555555555555",
+        "--exit-price", "302.10",
+        "--reason", "flattened: could not be protected",
+    )
+
+    assert code == 0
+    assert out["live_entries_blocked"] is False
+
+
+def test_the_same_stop_cannot_be_submitted_twice_through_the_cli(tmp_path):
+    """Two resting stops on one position means the second sells shares it lacks."""
+    _record_live_fill(tmp_path)
+    args = (
+        "protect",
+        "--client-key", "11111111-2222-5333-8444-555555555555",
+        "--account-number", "123456789",
+    )
+    first, _ = _cli(tmp_path, *args)
+    second, out = _cli(tmp_path, *args)
+
+    assert first == 0
+    assert second != 0
+    assert "already submitted" in out["error"]
+
+
+def test_the_whole_share_ceiling_is_an_upper_bound_not_a_promise(risk_config):
+    """Above this price no live position can exist at all.
+
+    An upper bound on purpose: sector headroom and sub-1.0 confidence only
+    lower it. A ceiling that overstated reach would tell an operator a symbol
+    was takeable when it was not; understating it would hide symbols that are.
+    """
+    account = AccountState(
+        account_number="unused",
+        is_cash_account=True,
+        total_value=Decimal("100"),
+        cash=Decimal("100"),
+        buying_power=Decimal("100"),
+        unsettled_funds=Decimal("0"),
+    )
+
+    # A wider stop buys less: the same risk budget spread over more movement.
+    wide = max_whole_share_price(account, risk_config, Decimal("0.12"))
+    narrow = max_whole_share_price(account, risk_config, Decimal("0.05"))
+    assert wide < narrow
+
+    # Confidence can only shrink it.
+    assert (
+        max_whole_share_price(account, risk_config, Decimal("0.05"), confidence=Decimal("0.6"))
+        < narrow
+    )
+
+    # max_order_notional is a hard ceiling no stop width can exceed.
+    assert (
+        max_whole_share_price(account, risk_config, Decimal("0.001"))
+        <= risk_config.max_order_notional
+    )
+
+
+def test_a_stopless_signal_has_no_whole_share_reach(risk_config):
+    """Guards the divide-by-zero rather than returning a nonsense ceiling."""
+    account = AccountState(
+        account_number="unused",
+        is_cash_account=True,
+        total_value=Decimal("100"),
+        cash=Decimal("100"),
+        buying_power=Decimal("100"),
+        unsettled_funds=Decimal("0"),
+    )
+    assert max_whole_share_price(account, risk_config, Decimal("0")) == Decimal("0")
