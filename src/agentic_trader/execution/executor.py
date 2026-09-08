@@ -30,6 +30,7 @@ the tool schema rather than assumed:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_UP, Decimal
@@ -45,7 +46,10 @@ from agentic_trader.models import (
     Side,
     TradeIntent,
 )
-from agentic_trader.risk.engine import build_protective_client_key
+from agentic_trader.risk.engine import (
+    build_flatten_client_key,
+    build_protective_client_key,
+)
 
 MAX_FRACTIONAL_DP = Decimal("0.000001")  # Broker allows 6 decimal places.
 
@@ -90,11 +94,21 @@ def assess_protection(
     intent: TradeIntent,
     *,
     capabilities: BrokerCapabilities = ROBINHOOD_MCP,
+    post_fill_protection: bool = False,
 ) -> tuple[ProtectionState, str]:
     """Decide whether this order's position can be covered by a resting stop.
 
     Returns the state and the reason, never raising — the caller decides what
     the state is permitted to mean, which differs between shadow and live.
+
+    `post_fill_protection` is a caller declaring it will run the stop lifecycle
+    the moment this order fills, and flatten the position if the stop cannot be
+    placed. It defaults to False so that every caller who has not thought about
+    it gets the unprotected answer. Passing True on a caller that does not
+    actually do those things produces a live entry with nothing behind it, and
+    no check inside this function can detect that — the enforcement is the
+    uncovered-position guard in `build_order_payload`, which stops the *next*
+    entry rather than this one.
     """
     if intent.side is not Side.BUY or intent.stop_price is None:
         return (
@@ -105,13 +119,19 @@ def assess_protection(
     feasibility = capabilities.protection_feasibility(intent.estimated_quantity)
 
     if feasibility.protectable is True:
-        # Reachable, but nothing submits it yet: the stop lifecycle is not
-        # implemented. PENDING rather than PROTECTED, because a position whose
-        # stop was never placed is not protected however placeable it was.
+        if post_fill_protection:
+            return (
+                ProtectionState.COMMITTED,
+                f"{feasibility.reason}; caller runs the stop lifecycle on fill and "
+                "flattens if it cannot be placed",
+            )
+        # Placeable is not placed. Without a caller committed to the lifecycle,
+        # a whole-share position is exactly as uncovered as a fractional one —
+        # the difference is that this one had a choice.
         return (
             ProtectionState.PENDING,
-            f"{feasibility.reason}; stop placement is not implemented, so the "
-            "position is not yet covered",
+            f"{feasibility.reason}; no post-fill protection was declared, so the "
+            "position would not be covered",
         )
 
     # `None` (capability unknown) lands here with FALSE, deliberately. Unknown
@@ -202,6 +222,46 @@ def build_protective_stop_payload(
         # queueing is a recorded property of the order, not a surprise.
         "market_hours": "regular_hours",
         "ref_id": build_protective_client_key(entry_client_key, resting_stop, quantity),
+    }
+
+
+def build_flatten_payload(
+    *,
+    account_number: str,
+    symbol: str,
+    quantity: Decimal,
+    entry_client_key: str,
+) -> OrderPayload:
+    """Build the market sell that unwinds a fill which could not be protected.
+
+    This is the counterpart that makes a live entry defensible. Protection can
+    only be established *after* a fill, so there is always a window in which the
+    position exists and its stop does not. The window is acceptable only if
+    failing to close it has a defined ending, and this is that ending: sell the
+    position back rather than carry it uncovered.
+
+    Deliberately a market order. A limit flatten can sit unfilled precisely when
+    the market is moving hard enough to make protection urgent, which converts
+    an exit into a worse version of the problem it was called to solve.
+
+    Fractional quantities are permitted here, unlike on the stop: selling a long
+    position is not a short sale, and `fractional_market_orders` covers exactly
+    this shape. That asymmetry is the point — a position too fractional to
+    protect can still be closed.
+    """
+    if quantity <= 0:
+        raise ProtectionNotPlaceable(f"cannot flatten a non-positive quantity {quantity}")
+
+    sellable = quantity.quantize(MAX_FRACTIONAL_DP)
+    return {
+        "account_number": account_number,
+        "symbol": symbol,
+        "side": "sell",
+        "type": "market",
+        "market_hours": "regular_hours",
+        "time_in_force": "gfd",
+        "quantity": f"{sellable:f}",
+        "ref_id": build_flatten_client_key(entry_client_key, sellable),
     }
 
 
@@ -306,6 +366,8 @@ def build_order_payload(
     allow_unprotected_shadow_entries: bool = True,
     capabilities: BrokerCapabilities = ROBINHOOD_MCP,
     now: datetime | None = None,
+    unprotected_live_positions: Sequence[str] = (),
+    post_fill_protection: bool = False,
 ) -> ExecutionPlan:
     """Build the `place_equity_order` arguments for an approved decision.
 
@@ -348,7 +410,30 @@ def build_order_payload(
             )
         notes.append(f"session {describe(current)}")
 
-    protection, protection_note = assess_protection(intent, capabilities=capabilities)
+    # An uncovered live position stops the system taking new ones.
+    #
+    # This is the safety net that makes a post-fill protection window
+    # defensible. Protection cannot exist before a fill, so every live entry
+    # opens a gap between the position and its stop. That gap is tolerable only
+    # while it is guaranteed to close — and the proof that it closed is a
+    # PROTECTED row. A position still uncovered after its cycle ended means the
+    # guarantee failed, and the correct response is to stop opening new risk
+    # until a human has looked, not to keep trading around it.
+    #
+    # Entries only. An exit must stay reachable, because flattening is how an
+    # unprotected position gets resolved; blocking sells here would trap the
+    # position this check exists to complain about.
+    if mode != "shadow" and intent.side is Side.BUY and unprotected_live_positions:
+        raise PreflightError(
+            f"{len(unprotected_live_positions)} live position(s) carry no confirmed "
+            f"protective stop ({', '.join(sorted(unprotected_live_positions))}) — "
+            "refusing to open another. Resolve them first: confirm the stop rests "
+            "at the broker, or flatten the position."
+        )
+
+    protection, protection_note = assess_protection(
+        intent, capabilities=capabilities, post_fill_protection=post_fill_protection
+    )
 
     # Two gates, and the order matters. The structural one comes first and no
     # configuration reaches it: outside shadow, a position that is not provably

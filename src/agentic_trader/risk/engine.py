@@ -89,6 +89,18 @@ def build_protective_client_key(
     return str(uuid.uuid5(_ORDER_NAMESPACE, material))
 
 
+def build_flatten_client_key(entry_client_key: str, quantity: Decimal) -> str:
+    """Deterministic `ref_id` for the order that unwinds an unprotectable fill.
+
+    Quantity is in the material because a partial flatten followed by a second
+    attempt at the remainder is two genuinely different orders; repeating the
+    *same* attempt is one, and must dedupe rather than sell the position twice.
+    Selling twice is not a duplicate here — the second sale is a short.
+    """
+    material = f"{entry_client_key}|flatten|{quantity:f}"
+    return str(uuid.uuid5(_ORDER_NAMESPACE, material))
+
+
 class RiskEngine:
     """Stateless evaluator. Construct per cycle; hold no memory between calls."""
 

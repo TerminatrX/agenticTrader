@@ -47,6 +47,49 @@ class SizingResult:
         return lambda price: (self.notional / price) if price else Decimal("0")
 
 
+def max_whole_share_price(
+    account: AccountState,
+    config: RiskConfig,
+    stop_distance: Decimal,
+    *,
+    confidence: Decimal = Decimal("1"),
+) -> Decimal:
+    """Highest share price at which this account can hold a *whole* share.
+
+    The notional a position would be sized to is also the most expensive single
+    share it can buy outright, so this returns that notional. Its purpose is to
+    make a constraint visible that is otherwise discovered one symbol at a time:
+    above this price every position is fractional, and a fractional position
+    cannot carry a resting stop, so it can never be held live.
+
+    Deliberately an **upper bound**. Sector headroom and any confidence below
+    1.0 only shrink the result, so a symbol priced under this number *may* be
+    takeable while one priced above it definitely is not. Reporting the
+    optimistic figure is the honest direction for a ceiling — it never claims a
+    symbol is out of reach when it is not.
+
+    Not a gate. Nothing calls this to refuse a trade: `assess_protection` still
+    decides that, from the quantity actually sized against a real quote. This
+    answers the operator's question — what can this account trade at all? —
+    without becoming a second, drifting copy of the sizing rules.
+    """
+    if stop_distance <= 0:
+        return Decimal("0")
+
+    risk_budget = (account.total_value * config.risk_per_trade_pct).quantize(CENTS)
+    ceiling = risk_budget / stop_distance
+
+    if confidence > 0:
+        ceiling = min(ceiling, ceiling * confidence)
+
+    ceiling = min(ceiling, account.total_value * config.max_position_pct)
+    if config.max_order_notional is not None:
+        ceiling = min(ceiling, config.max_order_notional)
+    ceiling = min(ceiling, account.buying_power)
+
+    return ceiling.quantize(CENTS, rounding=ROUND_DOWN)
+
+
 def size_position(
     signal: Signal,
     account: AccountState,
